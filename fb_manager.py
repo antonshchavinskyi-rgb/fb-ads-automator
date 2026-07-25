@@ -9,11 +9,11 @@ from datetime import datetime, timezone, timedelta
 ACCESS_TOKEN = os.environ.get('FB_ACCESS_TOKEN')
 
 ACCOUNTS = {
-    '1271459967771680': 'USD',  # 1
+   # '1271459967771680': 'USD',  # 1
     '746852230541150': 'USD',   # 2
-    '269403135857791': 'USD',   # 3
+   # '269403135857791': 'USD',   # 3
     '1732457457319086': 'PLN',  # 4
-    '1117620796468102': 'USD',  # 5
+   # '1117620796468102': 'USD',  # 5
 }
 
 OFFERS = {
