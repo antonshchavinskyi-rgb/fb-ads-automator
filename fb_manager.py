@@ -33,6 +33,7 @@ def fetch_data(endpoint, params):
     
     results = []
     while url:
+        time.sleep(0.2) # Невелика затримка для захисту від блокувань
         try:
             req = urllib.request.Request(url)
             with urllib.request.urlopen(req) as response:
@@ -41,7 +42,12 @@ def fetch_data(endpoint, params):
                 url = data.get('paging', {}).get('next') if 'paging' in data else None
         except urllib.error.HTTPError as e:
             error_body = e.read().decode('utf-8')
-            print(f" ❌ Помилка API Meta ({e.code}): {error_body}")
+            if 'User request limit reached' in error_body or '"code":17' in error_body:
+                print(" ⏳ Ліміт запитів Meta (Code 17). Коротка пауза 15 сек...")
+                time.sleep(15)
+                continue
+            else:
+                print(f" ❌ Помилка API Meta ({e.code}): {error_body}")
             break
         except Exception as e:
             print(f" ⚠️ Помилка з'єднання: {e}")
@@ -55,6 +61,7 @@ def get_leads(actions_list):
     return 0
 
 def change_entity_status(entity_id, new_status):
+    time.sleep(0.2)
     url = f"https://graph.facebook.com/{API_VER}/{entity_id}"
     data = urllib.parse.urlencode({'status': new_status, 'access_token': ACCESS_TOKEN}).encode('utf-8')
     try:
