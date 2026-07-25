@@ -1,0 +1,25 @@
+name: FB Ads Manager Auto-Checker
+
+on:
+  schedule:
+    # Запуск кожні 30 хвилин
+    - cron: '*/30 * * * *'
+  workflow_dispatch: # Дозволяє запускати перевірку вручну кнопкою
+
+jobs:
+  run-fb-manager:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Run FB Manager Script
+        env:
+          FB_ACCESS_TOKEN: ${{ secrets.FB_ACCESS_TOKEN }}
+        run: python fb_manager.py
