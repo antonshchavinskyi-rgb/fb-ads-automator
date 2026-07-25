@@ -4,7 +4,8 @@ import urllib.parse
 import urllib.error
 import json
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 ACCESS_TOKEN = os.environ.get('FB_ACCESS_TOKEN')
 
@@ -17,6 +18,7 @@ ACCOUNTS = {
 }
 
 API_VER = "v25.0"
+POLAND_TZ = ZoneInfo("Europe/Warsaw")
 
 def fetch_data(endpoint, params):
     params['access_token'] = ACCESS_TOKEN
@@ -52,8 +54,11 @@ def change_entity_status(entity_id, new_status):
     data = urllib.parse.urlencode({'status': new_status, 'access_token': ACCESS_TOKEN}).encode('utf-8')
     try:
         req = urllib.request.Request(url, data=data)
-        with urllib.request.urlopen(req) as res:
+        with urllib.request.urlopen(req):
             return True
+    except urllib.error.HTTPError as e:
+        print(f" ❌ HTTP {e.code} при зміні статусу ID {entity_id}: {e.read().decode('utf-8')}", flush=True)
+        return False
     except Exception as e:
         print(f" ❌ Помилка зміни статусу ID {entity_id}: {e}", flush=True)
         return False
@@ -71,7 +76,14 @@ def process_hygiene_logic(acc_id):
     adsets_endpoint = f"https://graph.facebook.com/{API_VER}/act_{acc_id}/adsets"
     raw_adsets = fetch_data(adsets_endpoint, {'fields': 'id,name,effective_status,created_time', 'limit': 250})
     
-    active_adsets = {a['id']: a['name'] for a in raw_adsets if a.get('effective_status') == 'ACTIVE' and a.get('created_time') and (now_utc - parse_iso_time(a['created_time'])).total_seconds() > 259200}
+    active_adsets = {}
+    for a in raw_adsets:
+        if a.get('effective_status') == 'ACTIVE' and a.get('created_time'):
+            p_time = parse_iso_time(a['created_time'])
+            # Захист від None, якщо час не вдалося розпарсити
+            if p_time and (now_utc - p_time).total_seconds() > 259200:
+                active_adsets[a['id']] = a['name']
+                
     if active_adsets:
         adset_insights = fetch_data(f"https://graph.facebook.com/{API_VER}/act_{acc_id}/insights", {'level': 'adset', 'fields': 'adset_id,impressions', 'date_preset': 'last_7d', 'limit': 250})
         adsets_with_impressions = {r.get('adset_id') for r in adset_insights if int(r.get('impressions', 0)) > 0}
@@ -84,7 +96,14 @@ def process_hygiene_logic(acc_id):
     ads_endpoint = f"https://graph.facebook.com/{API_VER}/act_{acc_id}/ads"
     raw_ads = fetch_data(ads_endpoint, {'fields': 'id,name,effective_status,created_time', 'limit': 250})
     
-    active_ads = {a['id']: a['name'] for a in raw_ads if a.get('effective_status') == 'ACTIVE' and a.get('created_time') and (now_utc - parse_iso_time(a['created_time'])).total_seconds() > 259200}
+    active_ads = {}
+    for a in raw_ads:
+        if a.get('effective_status') == 'ACTIVE' and a.get('created_time'):
+            p_time = parse_iso_time(a['created_time'])
+            # Захист від None, якщо час не вдалося розпарсити
+            if p_time and (now_utc - p_time).total_seconds() > 259200:
+                active_ads[a['id']] = a['name']
+                
     if active_ads:
         ad_insights = fetch_data(f"https://graph.facebook.com/{API_VER}/act_{acc_id}/insights", {'level': 'ad', 'fields': 'ad_id,impressions', 'date_preset': 'last_7d', 'limit': 250})
         ads_with_impressions = {r.get('ad_id') for r in ad_insights if int(r.get('impressions', 0)) > 0}
@@ -98,13 +117,16 @@ def main():
         print("❌ Помилка: FB_ACCESS_TOKEN не знайдено в змінних середовища!", flush=True)
         return
 
-    now = datetime.now()
-    print(f"🧹 [FB Ads Hygiene Start] {now.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+    now_poland = datetime.now(POLAND_TZ)
+    print(f"🧹 [FB Ads Hygiene Start] {now_poland.strftime('%Y-%m-%d %H:%M:%S')} (Poland Time)", flush=True)
     
     for acc_id, currency in ACCOUNTS.items():
         print(f"\n📊 Акаунт: {acc_id} ({currency})", flush=True)
-        process_hygiene_logic(acc_id)
-        
+        try:
+            process_hygiene_logic(acc_id)
+        except Exception as e:
+            print(f" ❌ Помилка під час обробки гігієни акаунта {acc_id}: {e}", flush=True)
+            
     print("\n✅ Денне чищення успішно завершено.", flush=True)
 
 if __name__ == '__main__':
