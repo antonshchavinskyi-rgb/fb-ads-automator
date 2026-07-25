@@ -29,11 +29,22 @@ OFFERS = {
 API_VER = "v25.0"
 POLAND_TZ = ZoneInfo("Europe/Warsaw")
 
+# Атрибуція, яку використовуємо для підрахунку лідів у insights
+ATTRIBUTION_WINDOW = ['1d_click']
+
+CURRENCY_SYMBOLS = {
+    'USD': '$',
+    'PLN': 'zł',
+}
+
+def cur_symbol(currency):
+    return CURRENCY_SYMBOLS.get(currency, currency + ' ')
+
 def fetch_data(endpoint, params):
     params['access_token'] = ACCESS_TOKEN
     query_string = urllib.parse.urlencode(params)
     url = f"{endpoint}?{query_string}"
-
+    
     results = []
     while url:
         time.sleep(0.1)
@@ -80,21 +91,20 @@ def change_entity_status(entity_id, new_status):
 
 def process_offers_logic(acc_id, currency, is_morning_restart):
     rate = 3.8 if currency == 'PLN' else 1.0
+    sym = cur_symbol(currency)
     endpoint = f"https://graph.facebook.com/{API_VER}/act_{acc_id}/adsets"
     # ФІКС 1: Додано campaign{name}, щоб Meta віддавала назву кампанії
     params = {'fields': 'id,name,status,effective_status,campaign{name}', 'limit': 250}
     raw_adsets = fetch_data(endpoint, params)
-
+    
     adsets_data = {}
     for adset in raw_adsets:
-        # ФІКС 4: (adset.get('campaign') or {}) — захист від "campaign": null,
-        # інакше .get('campaign', {}) поверне None замість {} і впаде на .get('name')
-        camp_name = (adset.get('campaign') or {}).get('name', '').lower()
+        camp_name = adset.get('campaign', {}).get('name', '').lower()
         eff_status = adset.get('effective_status', adset.get('status'))
-
+        
         if eff_status not in ['ACTIVE', 'PAUSED']:
             continue
-
+            
         for tag, base_cpl in OFFERS.items():
             if tag in camp_name:
                 adsets_data[adset['id']] = {
@@ -107,7 +117,7 @@ def process_offers_logic(acc_id, currency, is_morning_restart):
                     'stats': {'today': {'s':0, 'l':0}, 'last_2d': {'s':0, 'l':0}, 'last_3d': {'s':0, 'l':0}}
                 }
                 break
-
+                
     if not adsets_data:
         return
 
@@ -118,22 +128,22 @@ def process_offers_logic(acc_id, currency, is_morning_restart):
     last_2d_time_range = json.dumps({'since': yesterday_str, 'until': today_str})
 
     insights_endpoint = f"https://graph.facebook.com/{API_VER}/act_{acc_id}/insights"
-
-    insights_today = fetch_data(insights_endpoint, {'level': 'adset', 'fields': 'adset_id,spend,actions', 'date_preset': 'today', 'limit': 250})
+    
+    insights_today = fetch_data(insights_endpoint, {'level': 'adset', 'fields': 'adset_id,spend,actions', 'date_preset': 'today', 'action_attribution_windows': json.dumps(ATTRIBUTION_WINDOW), 'limit': 250})
     for row in insights_today:
         aid = row.get('adset_id')
         if aid in adsets_data:
             adsets_data[aid]['stats']['today']['s'] = float(row.get('spend', 0))
             adsets_data[aid]['stats']['today']['l'] = get_leads(row.get('actions', []))
 
-    insights_2d = fetch_data(insights_endpoint, {'level': 'adset', 'fields': 'adset_id,spend,actions', 'time_range': last_2d_time_range, 'limit': 250})
+    insights_2d = fetch_data(insights_endpoint, {'level': 'adset', 'fields': 'adset_id,spend,actions', 'time_range': last_2d_time_range, 'action_attribution_windows': json.dumps(ATTRIBUTION_WINDOW), 'limit': 250})
     for row in insights_2d:
         aid = row.get('adset_id')
         if aid in adsets_data:
             adsets_data[aid]['stats']['last_2d']['s'] = float(row.get('spend', 0))
             adsets_data[aid]['stats']['last_2d']['l'] = get_leads(row.get('actions', []))
 
-    insights_3d = fetch_data(insights_endpoint, {'level': 'adset', 'fields': 'adset_id,spend,actions', 'date_preset': 'last_3d', 'limit': 250})
+    insights_3d = fetch_data(insights_endpoint, {'level': 'adset', 'fields': 'adset_id,spend,actions', 'date_preset': 'last_3d', 'action_attribution_windows': json.dumps(ATTRIBUTION_WINDOW), 'limit': 250})
     for row in insights_3d:
         aid = row.get('adset_id')
         if aid in adsets_data:
@@ -146,23 +156,23 @@ def process_offers_logic(acc_id, currency, is_morning_restart):
         s_2d, l_2d = data['stats']['last_2d']['s'], data['stats']['last_2d']['l']
         s_3d, l_3d = data['stats']['last_3d']['s'], data['stats']['last_3d']['l']
         cpl_3d = s_3d / l_3d if l_3d > 0 else 0
-
+        
         t_cpl, l_no_leads, l_high_cpl = data['target_cpl'], data['limit_no_leads'], data['limit_high_cpl']
         action, reason = None, ""
-
+        
         if s_today > l_no_leads and l_today == 0:
-            action, reason = 'PAUSED', f"Швидкий стоп без лідів (TODAY): Витрати ${s_today:.2f} > ${l_no_leads:.2f}"
+            action, reason = 'PAUSED', f"Швидкий стоп без лідів (TODAY): Витрати {s_today:.2f}{sym} > {l_no_leads:.2f}{sym}"
         elif s_today > l_high_cpl and l_today >= 1 and cpl_today > t_cpl:
-            action, reason = 'PAUSED', f"Збитковий CPL (TODAY): CPL ${cpl_today:.2f} > ${t_cpl:.2f}"
+            action, reason = 'PAUSED', f"Збитковий CPL (TODAY): CPL {cpl_today:.2f}{sym} > {t_cpl:.2f}{sym}"
         elif s_2d > l_no_leads and l_2d == 0:
-            action, reason = 'PAUSED', f"Стоп без лідів (2 DAYS): Витрати ${s_2d:.2f} > ${l_no_leads:.2f}"
-
+            action, reason = 'PAUSED', f"Стоп без лідів (2 DAYS): Витрати {s_2d:.2f}{sym} > {l_no_leads:.2f}{sym}"
+            
         if not action:
             if l_today >= 1 and cpl_today < t_cpl:
-                action, reason = 'ACTIVE', f"Доліт ліда (TODAY): CPL ${cpl_today:.2f} < ${t_cpl:.2f}"
+                action, reason = 'ACTIVE', f"Доліт ліда (TODAY): CPL {cpl_today:.2f}{sym} < {t_cpl:.2f}{sym}"
             elif is_morning_restart and l_3d > 0 and cpl_3d < t_cpl:
-                action, reason = 'ACTIVE', f"Ранковий рестарт 05:30 (LAST 3 DAYS): CPL ${cpl_3d:.2f} < ${t_cpl:.2f}"
-
+                action, reason = 'ACTIVE', f"Ранковий рестарт 05:30 (LAST 3 DAYS): CPL {cpl_3d:.2f}{sym} < {t_cpl:.2f}{sym}"
+                
         if action and action != data['status']:
             icon = '🔴' if action == 'PAUSED' else '🟢'
             act_word = 'Вимкнено' if action == 'PAUSED' else 'Увімкнено'
@@ -177,9 +187,9 @@ def main():
 
     now_poland = datetime.now(POLAND_TZ)
     is_morning_restart = now_poland.hour == 5 and 30 <= now_poland.minute <= 59
-
+    
     print(f"🚀 [FB Manager Monitoring] {now_poland.strftime('%Y-%m-%d %H:%M:%S')} (Poland Time)", flush=True)
-
+    
     # ФІКС 3: Ізоляція обробки кожного акаунта через try/except
     for acc_id, currency in ACCOUNTS.items():
         print(f"\n📊 Акаунт: {acc_id} ({currency})", flush=True)
@@ -187,7 +197,7 @@ def main():
             process_offers_logic(acc_id, currency, is_morning_restart)
         except Exception as e:
             print(f" ❌ Помилка під час обробки акаунта {acc_id}: {e}", flush=True)
-
+        
     print("\n✅ Моніторинг успішно завершено.", flush=True)
 
 if __name__ == '__main__':
