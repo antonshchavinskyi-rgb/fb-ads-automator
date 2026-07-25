@@ -5,6 +5,7 @@ import urllib.error
 import json
 import time
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo  # Вбудований модуль для роботи з часовими поясами
 
 # Токен безпечно зчитується із секретів GitHub
 ACCESS_TOKEN = os.environ.get('FB_ACCESS_TOKEN')
@@ -16,6 +17,7 @@ ACCOUNTS = {
     '1732457457319086': 'PLN',  # 4
    # '1117620796468102': 'USD',  # 5
 }
+
 OFFERS = {
     'пла': 16.0,
     'зол': 14.0,
@@ -25,6 +27,7 @@ OFFERS = {
 }
 
 API_VER = "v25.0"
+POLAND_TZ = ZoneInfo("Europe/Warsaw")
 
 def fetch_data(endpoint, params):
     params['access_token'] = ACCESS_TOKEN
@@ -102,8 +105,10 @@ def process_offers_logic(acc_id, currency, is_morning_restart):
     if not adsets_data:
         return
 
-    today_str = datetime.now().strftime('%Y-%m-%d')
-    yesterday_str = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+    # Розрахунок дат за польським часом
+    now_poland = datetime.now(POLAND_TZ)
+    today_str = now_poland.strftime('%Y-%m-%d')
+    yesterday_str = (now_poland - timedelta(days=1)).strftime('%Y-%m-%d')
     last_2d_time_range = json.dumps({'since': yesterday_str, 'until': today_str})
 
     insights_endpoint = f"https://graph.facebook.com/{API_VER}/act_{acc_id}/insights"
@@ -164,9 +169,11 @@ def main():
         print("❌ Помилка: FB_ACCESS_TOKEN не знайдено в змінних середовища!", flush=True)
         return
 
-    now = datetime.now()
-    is_morning_restart = now.hour == 5 and 30 <= now.minute <= 59
-    print(f"🚀 [FB Manager Monitoring] {now.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+    # Отримуємо поточний час у Польщі
+    now_poland = datetime.now(POLAND_TZ)
+    is_morning_restart = now_poland.hour == 5 and 30 <= now_poland.minute <= 59
+    
+    print(f"🚀 [FB Manager Monitoring] {now_poland.strftime('%Y-%m-%d %H:%M:%S')} (Poland Time)", flush=True)
     
     for acc_id, currency in ACCOUNTS.items():
         print(f"\n📊 Акаунт: {acc_id} ({currency})", flush=True)
