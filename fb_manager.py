@@ -16,7 +16,6 @@ ACCOUNTS = {
     '1732457457319086': 'PLN',  # 4
    # '1117620796468102': 'USD',  # 5
 }
-
 OFFERS = {
     'пла': 16.0,
     'зол': 14.0,
@@ -73,12 +72,6 @@ def change_entity_status(entity_id, new_status):
         print(f" ❌ Помилка зміни статусу ID {entity_id}: {e}", flush=True)
         return False
 
-def parse_iso_time(time_str):
-    try:
-        return datetime.strptime(time_str, "%Y-%m-%dT%H:%M:%S%z")
-    except:
-        return None
-
 def process_offers_logic(acc_id, currency, is_morning_restart):
     rate = 3.8 if currency == 'PLN' else 1.0
     endpoint = f"https://graph.facebook.com/{API_VER}/act_{acc_id}/adsets"
@@ -90,7 +83,6 @@ def process_offers_logic(acc_id, currency, is_morning_restart):
         camp_name = adset.get('campaign', {}).get('name', '').lower()
         eff_status = adset.get('effective_status', adset.get('status'))
         
-        # Перевіряємо лише реально активні групи
         if eff_status not in ['ACTIVE', 'PAUSED']:
             continue
             
@@ -167,43 +159,6 @@ def process_offers_logic(acc_id, currency, is_morning_restart):
                 print(f"   {icon} {act_word} група: [{data['tag'].upper()}] {data['name']} (ID: {aid})", flush=True)
                 print(f"      ↳ Причина: {reason}", flush=True)
 
-def process_hygiene_logic(acc_id):
-    now_utc = datetime.now(timezone.utc)
-    
-    # Гігієна груп
-    adsets_endpoint = f"https://graph.facebook.com/{API_VER}/act_{acc_id}/adsets"
-    raw_adsets = fetch_data(adsets_endpoint, {'fields': 'id,name,effective_status,created_time', 'limit': 250})
-    
-    active_adsets = {a['id']: a['name'] for a in raw_adsets if a.get('effective_status') == 'ACTIVE' and a.get('created_time') and (now_utc - parse_iso_time(a['created_time'])).total_seconds() > 259200}
-    if active_adsets:
-        adset_insights = fetch_data(f"https://graph.facebook.com/{API_VER}/act_{acc_id}/insights", {'level': 'adset', 'fields': 'adset_id,impressions', 'date_preset': 'last_7d', 'limit': 250})
-        adsets_with_impressions = {r.get('adset_id') for r in adset_insights if int(r.get('impressions', 0)) > 0}
-        
-        count = 0
-        for aid, name in active_adsets.items():
-            if aid not in adsets_with_impressions and change_entity_status(aid, 'PAUSED'):
-                print(f"   🧹 Гігієна: Вимкнено неактивну групу [{name}] | ID: {aid}", flush=True)
-                count += 1
-                if count >= 10: # Обмеження 10 за один запуск
-                    break
-
-    # Гігієна оголошень
-    ads_endpoint = f"https://graph.facebook.com/{API_VER}/act_{acc_id}/ads"
-    raw_ads = fetch_data(ads_endpoint, {'fields': 'id,name,effective_status,created_time', 'limit': 250})
-    
-    active_ads = {a['id']: a['name'] for a in raw_ads if a.get('effective_status') == 'ACTIVE' and a.get('created_time') and (now_utc - parse_iso_time(a['created_time'])).total_seconds() > 259200}
-    if active_ads:
-        ad_insights = fetch_data(f"https://graph.facebook.com/{API_VER}/act_{acc_id}/insights", {'level': 'ad', 'fields': 'ad_id,impressions', 'date_preset': 'last_7d', 'limit': 250})
-        ads_with_impressions = {r.get('ad_id') for r in ad_insights if int(r.get('impressions', 0)) > 0}
-        
-        count = 0
-        for ad_id, name in active_ads.items():
-            if ad_id not in ads_with_impressions and change_entity_status(ad_id, 'PAUSED'):
-                print(f"   🧹 Гігієна: Вимкнено неактивне оголошення [{name}] | ID: {ad_id}", flush=True)
-                count += 1
-                if count >= 20: # Обмеження 20 за один запуск
-                    break
-
 def main():
     if not ACCESS_TOKEN:
         print("❌ Помилка: FB_ACCESS_TOKEN не знайдено в змінних середовища!", flush=True)
@@ -211,14 +166,13 @@ def main():
 
     now = datetime.now()
     is_morning_restart = now.hour == 5 and 30 <= now.minute <= 59
-    print(f"🚀 [GitHub Actions Start] {now.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+    print(f"🚀 [FB Manager Monitoring] {now.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
     
     for acc_id, currency in ACCOUNTS.items():
         print(f"\n📊 Акаунт: {acc_id} ({currency})", flush=True)
         process_offers_logic(acc_id, currency, is_morning_restart)
-        process_hygiene_logic(acc_id)
         
-    print("\n✅ Перевірку успішно завершено.", flush=True)
+    print("\n✅ Моніторинг успішно завершено.", flush=True)
 
 if __name__ == '__main__':
     main()
