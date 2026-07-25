@@ -69,8 +69,11 @@ def change_entity_status(entity_id, new_status):
     data = urllib.parse.urlencode({'status': new_status, 'access_token': ACCESS_TOKEN}).encode('utf-8')
     try:
         req = urllib.request.Request(url, data=data)
-        with urllib.request.urlopen(req) as res:
+        with urllib.request.urlopen(req):
             return True
+    except urllib.error.HTTPError as e:
+        print(f" ❌ HTTP {e.code} при зміні статусу ID {entity_id}: {e.read().decode('utf-8')}", flush=True)
+        return False
     except Exception as e:
         print(f" ❌ Помилка зміни статусу ID {entity_id}: {e}", flush=True)
         return False
