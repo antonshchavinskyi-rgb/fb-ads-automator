@@ -3,6 +3,7 @@ import urllib.request
 import urllib.parse
 import urllib.error
 import json
+import time
 from datetime import datetime, timezone, timedelta
 
 # Токен безпечно зчитується із секретів GitHub
