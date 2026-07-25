@@ -5,7 +5,7 @@ import urllib.error
 import json
 import time
 from datetime import datetime, timezone, timedelta
-from zoneinfo import ZoneInfo  # Вбудований модуль для роботи з часовими поясами
+from zoneinfo import ZoneInfo
 
 # Токен безпечно зчитується із секретів GitHub
 ACCESS_TOKEN = os.environ.get('FB_ACCESS_TOKEN')
@@ -78,7 +78,8 @@ def change_entity_status(entity_id, new_status):
 def process_offers_logic(acc_id, currency, is_morning_restart):
     rate = 3.8 if currency == 'PLN' else 1.0
     endpoint = f"https://graph.facebook.com/{API_VER}/act_{acc_id}/adsets"
-    params = {'fields': 'id,name,status,effective_status,campaign', 'limit': 250}
+    # ФІКС 1: Додано campaign{name}, щоб Meta віддавала назву кампанії
+    params = {'fields': 'id,name,status,effective_status,campaign{name}', 'limit': 250}
     raw_adsets = fetch_data(endpoint, params)
     
     adsets_data = {}
@@ -105,7 +106,7 @@ def process_offers_logic(acc_id, currency, is_morning_restart):
     if not adsets_data:
         return
 
-    # Розрахунок дат за польським часом
+    # ФІКС 2: Час за Польщею
     now_poland = datetime.now(POLAND_TZ)
     today_str = now_poland.strftime('%Y-%m-%d')
     yesterday_str = (now_poland - timedelta(days=1)).strftime('%Y-%m-%d')
@@ -169,15 +170,18 @@ def main():
         print("❌ Помилка: FB_ACCESS_TOKEN не знайдено в змінних середовища!", flush=True)
         return
 
-    # Отримуємо поточний час у Польщі
     now_poland = datetime.now(POLAND_TZ)
     is_morning_restart = now_poland.hour == 5 and 30 <= now_poland.minute <= 59
     
     print(f"🚀 [FB Manager Monitoring] {now_poland.strftime('%Y-%m-%d %H:%M:%S')} (Poland Time)", flush=True)
     
+    # ФІКС 3: Ізоляція обробки кожного акаунта через try/except
     for acc_id, currency in ACCOUNTS.items():
         print(f"\n📊 Акаунт: {acc_id} ({currency})", flush=True)
-        process_offers_logic(acc_id, currency, is_morning_restart)
+        try:
+            process_offers_logic(acc_id, currency, is_morning_restart)
+        except Exception as e:
+            print(f" ❌ Помилка під час обробки акаунта {acc_id}: {e}", flush=True)
         
     print("\n✅ Моніторинг успішно завершено.", flush=True)
 
