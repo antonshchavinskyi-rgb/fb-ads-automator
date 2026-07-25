@@ -1,0 +1,26 @@
+name: FB Ads Hygiene Daily
+
+on:
+  schedule:
+    # Запуск 1 раз на добу о 03:00 UTC
+    - cron: '0 3 * * *'
+  workflow_dispatch: # Кнопка для ручного запуску
+
+jobs:
+  run-hygiene:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Run FB Hygiene Script
+        env:
+          FB_ACCESS_TOKEN: ${{ secrets.FB_ACCESS_TOKEN }}
+          PYTHONUNBUFFERED: "1"
+        run: python fb_hygiene.py
