@@ -34,7 +34,7 @@ def fetch_data(endpoint, params):
     
     results = []
     while url:
-        time.sleep(0.2) # Невелика затримка для захисту від блокувань
+        time.sleep(0.1)
         try:
             req = urllib.request.Request(url)
             with urllib.request.urlopen(req) as response:
@@ -44,14 +44,14 @@ def fetch_data(endpoint, params):
         except urllib.error.HTTPError as e:
             error_body = e.read().decode('utf-8')
             if 'User request limit reached' in error_body or '"code":17' in error_body:
-                print(" ⏳ Ліміт запитів Meta (Code 17). Коротка пауза 15 сек...")
+                print(" ⏳ Ліміт запитів Meta (Code 17). Пауза 15 сек...", flush=True)
                 time.sleep(15)
                 continue
             else:
-                print(f" ❌ Помилка API Meta ({e.code}): {error_body}")
+                print(f" ❌ Помилка API Meta ({e.code}): {error_body}", flush=True)
             break
         except Exception as e:
-            print(f" ⚠️ Помилка з'єднання: {e}")
+            print(f" ⚠️ Помилка з'єднання: {e}", flush=True)
             break
     return results
 
@@ -62,7 +62,7 @@ def get_leads(actions_list):
     return 0
 
 def change_entity_status(entity_id, new_status):
-    time.sleep(0.2)
+    time.sleep(0.1)
     url = f"https://graph.facebook.com/{API_VER}/{entity_id}"
     data = urllib.parse.urlencode({'status': new_status, 'access_token': ACCESS_TOKEN}).encode('utf-8')
     try:
@@ -70,7 +70,7 @@ def change_entity_status(entity_id, new_status):
         with urllib.request.urlopen(req) as res:
             return True
     except Exception as e:
-        print(f" ❌ Помилка зміни статусу ID {entity_id}: {e}")
+        print(f" ❌ Помилка зміни статусу ID {entity_id}: {e}", flush=True)
         return False
 
 def parse_iso_time(time_str):
@@ -82,21 +82,23 @@ def parse_iso_time(time_str):
 def process_offers_logic(acc_id, currency, is_morning_restart):
     rate = 3.8 if currency == 'PLN' else 1.0
     endpoint = f"https://graph.facebook.com/{API_VER}/act_{acc_id}/adsets"
-    params = {'fields': 'id,name,status,campaign', 'limit': 250}
+    params = {'fields': 'id,name,status,effective_status,campaign', 'limit': 250}
     raw_adsets = fetch_data(endpoint, params)
     
     adsets_data = {}
     for adset in raw_adsets:
         camp_name = adset.get('campaign', {}).get('name', '').lower()
-        status = adset.get('status')
-        if status not in ['ACTIVE', 'PAUSED']:
+        eff_status = adset.get('effective_status', adset.get('status'))
+        
+        # Перевіряємо лише реально активні групи
+        if eff_status not in ['ACTIVE', 'PAUSED']:
             continue
             
         for tag, base_cpl in OFFERS.items():
             if tag in camp_name:
                 adsets_data[adset['id']] = {
                     'name': adset['name'],
-                    'status': status,
+                    'status': adset.get('status'),
                     'tag': tag,
                     'target_cpl': base_cpl * rate * 1.0,
                     'limit_no_leads': base_cpl * rate * 0.6,
@@ -162,47 +164,61 @@ def process_offers_logic(acc_id, currency, is_morning_restart):
             icon = '🔴' if action == 'PAUSED' else '🟢'
             act_word = 'Вимкнено' if action == 'PAUSED' else 'Увімкнено'
             if change_entity_status(aid, action):
-                print(f"   {icon} {act_word} група: [{data['tag'].upper()}] {data['name']} (ID: {aid})")
-                print(f"      ↳ Причина: {reason}")
+                print(f"   {icon} {act_word} група: [{data['tag'].upper()}] {data['name']} (ID: {aid})", flush=True)
+                print(f"      ↳ Причина: {reason}", flush=True)
 
 def process_hygiene_logic(acc_id):
     now_utc = datetime.now(timezone.utc)
-    adsets_endpoint = f"https://graph.facebook.com/{API_VER}/act_{acc_id}/adsets"
-    raw_adsets = fetch_data(adsets_endpoint, {'fields': 'id,name,status,created_time', 'limit': 250})
     
-    active_adsets = {a['id']: a['name'] for a in raw_adsets if a.get('status') == 'ACTIVE' and a.get('created_time') and (now_utc - parse_iso_time(a['created_time'])).total_seconds() > 259200}
+    # Гігієна груп
+    adsets_endpoint = f"https://graph.facebook.com/{API_VER}/act_{acc_id}/adsets"
+    raw_adsets = fetch_data(adsets_endpoint, {'fields': 'id,name,effective_status,created_time', 'limit': 250})
+    
+    active_adsets = {a['id']: a['name'] for a in raw_adsets if a.get('effective_status') == 'ACTIVE' and a.get('created_time') and (now_utc - parse_iso_time(a['created_time'])).total_seconds() > 259200}
     if active_adsets:
         adset_insights = fetch_data(f"https://graph.facebook.com/{API_VER}/act_{acc_id}/insights", {'level': 'adset', 'fields': 'adset_id,impressions', 'date_preset': 'last_7d', 'limit': 250})
         adsets_with_impressions = {r.get('adset_id') for r in adset_insights if int(r.get('impressions', 0)) > 0}
+        
+        count = 0
         for aid, name in active_adsets.items():
             if aid not in adsets_with_impressions and change_entity_status(aid, 'PAUSED'):
-                print(f"   🧹 Гігієна: Вимкнено неактивну групу [{name}] | ID: {aid}")
+                print(f"   🧹 Гігієна: Вимкнено неактивну групу [{name}] | ID: {aid}", flush=True)
+                count += 1
+                if count >= 10: # Обмеження 10 за один запуск
+                    break
 
+    # Гігієна оголошень
     ads_endpoint = f"https://graph.facebook.com/{API_VER}/act_{acc_id}/ads"
-    raw_ads = fetch_data(ads_endpoint, {'fields': 'id,name,status,created_time', 'limit': 250})
-    active_ads = {a['id']: a['name'] for a in raw_ads if a.get('status') == 'ACTIVE' and a.get('created_time') and (now_utc - parse_iso_time(a['created_time'])).total_seconds() > 259200}
+    raw_ads = fetch_data(ads_endpoint, {'fields': 'id,name,effective_status,created_time', 'limit': 250})
+    
+    active_ads = {a['id']: a['name'] for a in raw_ads if a.get('effective_status') == 'ACTIVE' and a.get('created_time') and (now_utc - parse_iso_time(a['created_time'])).total_seconds() > 259200}
     if active_ads:
         ad_insights = fetch_data(f"https://graph.facebook.com/{API_VER}/act_{acc_id}/insights", {'level': 'ad', 'fields': 'ad_id,impressions', 'date_preset': 'last_7d', 'limit': 250})
         ads_with_impressions = {r.get('ad_id') for r in ad_insights if int(r.get('impressions', 0)) > 0}
+        
+        count = 0
         for ad_id, name in active_ads.items():
             if ad_id not in ads_with_impressions and change_entity_status(ad_id, 'PAUSED'):
-                print(f"   🧹 Гігієна: Вимкнено неактивне оголошення [{name}] | ID: {ad_id}")
+                print(f"   🧹 Гігієна: Вимкнено неактивне оголошення [{name}] | ID: {ad_id}", flush=True)
+                count += 1
+                if count >= 20: # Обмеження 20 за один запуск
+                    break
 
 def main():
     if not ACCESS_TOKEN:
-        print("❌ Помилка: FB_ACCESS_TOKEN не знайдено в змінних середовища!")
+        print("❌ Помилка: FB_ACCESS_TOKEN не знайдено в змінних середовища!", flush=True)
         return
 
     now = datetime.now()
     is_morning_restart = now.hour == 5 and 30 <= now.minute <= 59
-    print(f"🚀 [GitHub Actions Start] {now.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"🚀 [GitHub Actions Start] {now.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
     
     for acc_id, currency in ACCOUNTS.items():
-        print(f"\n📊 Акаунт: {acc_id} ({currency})")
+        print(f"\n📊 Акаунт: {acc_id} ({currency})", flush=True)
         process_offers_logic(acc_id, currency, is_morning_restart)
         process_hygiene_logic(acc_id)
         
-    print("\n✅ Одноразову перевірку успішно завершено.")
+    print("\n✅ Перевірку успішно завершено.", flush=True)
 
 if __name__ == '__main__':
     main()
