@@ -1,10 +1,7 @@
 name: FB Ads Hygiene Daily
 
 on:
-  schedule:
-    # Запуск 1 раз на добу о 03:00 UTC
-    - cron: '0 3 * * *'
-  workflow_dispatch: # Кнопка для ручного запуску
+  workflow_dispatch: # Тепер тригериться зовнішнім cron-job.org
 
 jobs:
   run-hygiene:
