@@ -20,6 +20,26 @@ ACCOUNTS = {
 API_VER = "v25.0"
 POLAND_TZ = ZoneInfo("Europe/Warsaw")
 
+TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
+TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
+
+def send_telegram(message):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print(" ⚠️ TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID не задані — сповіщення пропущено.", flush=True)
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    data = urllib.parse.urlencode({
+        'chat_id': TELEGRAM_CHAT_ID,
+        'text': message,
+        'parse_mode': 'HTML',
+        'disable_web_page_preview': 'true',
+    }).encode('utf-8')
+    try:
+        req = urllib.request.Request(url, data=data)
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as e:
+        print(f" ⚠️ Не вдалося надіслати Telegram-повідомлення: {e}", flush=True)
+
 def fetch_data(endpoint, params):
     params['access_token'] = ACCESS_TOKEN
     query_string = urllib.parse.urlencode(params)
@@ -69,7 +89,7 @@ def parse_iso_time(time_str):
     except:
         return None
 
-def process_hygiene_logic(acc_id):
+def process_hygiene_logic(acc_id, events):
     now_utc = datetime.now(timezone.utc)
     
     # 1. Гігієна груп (старіші за 3 дні без показів за останні 7 днів)
@@ -91,6 +111,7 @@ def process_hygiene_logic(acc_id):
         for aid, name in active_adsets.items():
             if aid not in adsets_with_impressions and change_entity_status(aid, 'PAUSED'):
                 print(f"   🧹 Гігієна: Вимкнено неактивну групу [{name}] | ID: {aid}", flush=True)
+                events.append(f"🧹 Група: {name}")
 
     # 2. Гігієна оголошень (старіші за 3 дні без показів за останні 7 днів)
     ads_endpoint = f"https://graph.facebook.com/{API_VER}/act_{acc_id}/ads"
@@ -111,6 +132,7 @@ def process_hygiene_logic(acc_id):
         for ad_id, name in active_ads.items():
             if ad_id not in ads_with_impressions and change_entity_status(ad_id, 'PAUSED'):
                 print(f"   🧹 Гігієна: Вимкнено неактивне оголошення [{name}] | ID: {ad_id}", flush=True)
+                events.append(f"🧹 Оголошення: {name}")
 
 def main():
     if not ACCESS_TOKEN:
@@ -119,15 +141,34 @@ def main():
 
     now_poland = datetime.now(POLAND_TZ)
     print(f"🧹 [FB Ads Hygiene Start] {now_poland.strftime('%Y-%m-%d %H:%M:%S')} (Poland Time)", flush=True)
-    
+
+    all_events = []
+    all_errors = []
+
     for acc_id, currency in ACCOUNTS.items():
         print(f"\n📊 Акаунт: {acc_id} ({currency})", flush=True)
+        acc_events = []
         try:
-            process_hygiene_logic(acc_id)
+            process_hygiene_logic(acc_id, acc_events)
+            all_events.extend(f"Акаунт {acc_id} ({currency}): {e}" for e in acc_events)
         except Exception as e:
+            err_msg = f"Акаунт {acc_id} ({currency}): {e}"
             print(f" ❌ Помилка під час обробки гігієни акаунта {acc_id}: {e}", flush=True)
-            
+            all_errors.append(err_msg)
+
     print("\n✅ Денне чищення успішно завершено.", flush=True)
+
+    time_str = now_poland.strftime('%Y-%m-%d %H:%M')
+    if all_errors:
+        text = f"⚠️ <b>FB Hygiene: помилки</b> ({time_str})\n\n" + "\n".join(all_errors)
+        if all_events:
+            text += "\n\n" + "\n".join(all_events)
+        send_telegram(text)
+    elif all_events:
+        text = f"🧹 <b>FB Hygiene: очищено</b> ({time_str})\n\n" + "\n".join(all_events)
+        send_telegram(text)
+    else:
+        send_telegram(f"✅ FB Hygiene живий, чистити не було чого ({time_str})")
 
 if __name__ == '__main__':
     main()
