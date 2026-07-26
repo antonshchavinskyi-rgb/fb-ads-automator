@@ -40,6 +40,31 @@ CURRENCY_SYMBOLS = {
 def cur_symbol(currency):
     return CURRENCY_SYMBOLS.get(currency, currency + ' ')
 
+TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
+TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
+
+# "Пульс" раз на добу: один із запусків о 12:00-12:14 (Poland time)
+# завжди надішле коротке "все ок", навіть якщо дій не було.
+HEARTBEAT_HOUR = 12
+HEARTBEAT_MINUTE_MAX = 15
+
+def send_telegram(message):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print(" ⚠️ TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID не задані — сповіщення пропущено.", flush=True)
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    data = urllib.parse.urlencode({
+        'chat_id': TELEGRAM_CHAT_ID,
+        'text': message,
+        'parse_mode': 'HTML',
+        'disable_web_page_preview': 'true',
+    }).encode('utf-8')
+    try:
+        req = urllib.request.Request(url, data=data)
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as e:
+        print(f" ⚠️ Не вдалося надіслати Telegram-повідомлення: {e}", flush=True)
+
 def fetch_data(endpoint, params):
     params['access_token'] = ACCESS_TOKEN
     query_string = urllib.parse.urlencode(params)
@@ -89,7 +114,7 @@ def change_entity_status(entity_id, new_status):
         print(f" ❌ Помилка зміни статусу ID {entity_id}: {e}", flush=True)
         return False
 
-def process_offers_logic(acc_id, currency, is_morning_restart):
+def process_offers_logic(acc_id, currency, is_morning_restart, events):
     rate = 3.8 if currency == 'PLN' else 1.0
     sym = cur_symbol(currency)
     endpoint = f"https://graph.facebook.com/{API_VER}/act_{acc_id}/adsets"
@@ -179,6 +204,7 @@ def process_offers_logic(acc_id, currency, is_morning_restart):
             if change_entity_status(aid, action):
                 print(f"   {icon} {act_word} група: [{data['tag'].upper()}] {data['name']} (ID: {aid})", flush=True)
                 print(f"      ↳ Причина: {reason}", flush=True)
+                events.append(f"{icon} <b>{act_word}</b>: [{data['tag'].upper()}] {data['name']}\n   ↳ {reason}")
 
 def main():
     if not ACCESS_TOKEN:
@@ -187,18 +213,38 @@ def main():
 
     now_poland = datetime.now(POLAND_TZ)
     is_morning_restart = now_poland.hour == 5 and 30 <= now_poland.minute <= 59
-    
+    is_heartbeat_window = now_poland.hour == HEARTBEAT_HOUR and now_poland.minute < HEARTBEAT_MINUTE_MAX
+
     print(f"🚀 [FB Manager Monitoring] {now_poland.strftime('%Y-%m-%d %H:%M:%S')} (Poland Time)", flush=True)
-    
+
+    all_events = []
+    all_errors = []
+
     # ФІКС 3: Ізоляція обробки кожного акаунта через try/except
     for acc_id, currency in ACCOUNTS.items():
         print(f"\n📊 Акаунт: {acc_id} ({currency})", flush=True)
+        acc_events = []
         try:
-            process_offers_logic(acc_id, currency, is_morning_restart)
+            process_offers_logic(acc_id, currency, is_morning_restart, acc_events)
+            all_events.extend(f"Акаунт {acc_id} ({currency}):\n{e}" for e in acc_events)
         except Exception as e:
+            err_msg = f"Акаунт {acc_id} ({currency}): {e}"
             print(f" ❌ Помилка під час обробки акаунта {acc_id}: {e}", flush=True)
-        
+            all_errors.append(err_msg)
+
     print("\n✅ Моніторинг успішно завершено.", flush=True)
+
+    time_str = now_poland.strftime('%Y-%m-%d %H:%M')
+    if all_errors:
+        text = f"⚠️ <b>FB Manager: помилки</b> ({time_str})\n\n" + "\n\n".join(all_errors)
+        if all_events:
+            text += "\n\n" + "\n\n".join(all_events)
+        send_telegram(text)
+    elif all_events:
+        text = f"🔔 <b>FB Manager: зміни</b> ({time_str})\n\n" + "\n\n".join(all_events)
+        send_telegram(text)
+    elif is_heartbeat_window:
+        send_telegram(f"✅ FB Manager живий, змін не було ({time_str})")
 
 if __name__ == '__main__':
     main()
