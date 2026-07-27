@@ -139,7 +139,7 @@ def process_offers_logic(acc_id, currency, is_morning_restart, events):
                     'target_cpl': base_cpl * rate * 1.0,
                     'limit_no_leads': base_cpl * rate * 0.6,
                     'limit_high_cpl': base_cpl * rate * 1.3,
-                    'stats': {'today': {'s':0, 'l':0}, 'last_2d': {'s':0, 'l':0}, 'last_3d': {'s':0, 'l':0}}
+                    'stats': {'today': {'s':0, 'l':0}, 'last_2d': {'s':0, 'l':0}, 'hist_2d': {'s':0, 'l':0}}
                 }
                 break
                 
@@ -150,7 +150,10 @@ def process_offers_logic(acc_id, currency, is_morning_restart, events):
     now_poland = datetime.now(POLAND_TZ)
     today_str = now_poland.strftime('%Y-%m-%d')
     yesterday_str = (now_poland - timedelta(days=1)).strftime('%Y-%m-%d')
+    day_before_yesterday_str = (now_poland - timedelta(days=2)).strftime('%Y-%m-%d')
     last_2d_time_range = json.dumps({'since': yesterday_str, 'until': today_str})
+    # Явно 2 ПОВНІ минулих дні, сьогодні НЕ входить (напр. якщо сьогодні 27.07 -> 25.07 та 26.07)
+    hist_2d_time_range = json.dumps({'since': day_before_yesterday_str, 'until': yesterday_str})
 
     insights_endpoint = f"https://graph.facebook.com/{API_VER}/act_{acc_id}/insights"
     
@@ -168,19 +171,19 @@ def process_offers_logic(acc_id, currency, is_morning_restart, events):
             adsets_data[aid]['stats']['last_2d']['s'] = float(row.get('spend', 0))
             adsets_data[aid]['stats']['last_2d']['l'] = get_leads(row.get('actions', []))
 
-    insights_3d = fetch_data(insights_endpoint, {'level': 'adset', 'fields': 'adset_id,spend,actions', 'date_preset': 'last_3d', 'action_attribution_windows': json.dumps(ATTRIBUTION_WINDOW), 'limit': 250})
-    for row in insights_3d:
+    insights_hist2d = fetch_data(insights_endpoint, {'level': 'adset', 'fields': 'adset_id,spend,actions', 'time_range': hist_2d_time_range, 'action_attribution_windows': json.dumps(ATTRIBUTION_WINDOW), 'limit': 250})
+    for row in insights_hist2d:
         aid = row.get('adset_id')
         if aid in adsets_data:
-            adsets_data[aid]['stats']['last_3d']['s'] = float(row.get('spend', 0))
-            adsets_data[aid]['stats']['last_3d']['l'] = get_leads(row.get('actions', []))
+            adsets_data[aid]['stats']['hist_2d']['s'] = float(row.get('spend', 0))
+            adsets_data[aid]['stats']['hist_2d']['l'] = get_leads(row.get('actions', []))
 
     for aid, data in adsets_data.items():
         s_today, l_today = data['stats']['today']['s'], data['stats']['today']['l']
         cpl_today = s_today / l_today if l_today > 0 else 0
         s_2d, l_2d = data['stats']['last_2d']['s'], data['stats']['last_2d']['l']
-        s_3d, l_3d = data['stats']['last_3d']['s'], data['stats']['last_3d']['l']
-        cpl_3d = s_3d / l_3d if l_3d > 0 else 0
+        s_hist2d, l_hist2d = data['stats']['hist_2d']['s'], data['stats']['hist_2d']['l']
+        cpl_hist2d = s_hist2d / l_hist2d if l_hist2d > 0 else 0
         
         t_cpl, l_no_leads, l_high_cpl = data['target_cpl'], data['limit_no_leads'], data['limit_high_cpl']
         action, reason = None, ""
@@ -195,8 +198,8 @@ def process_offers_logic(acc_id, currency, is_morning_restart, events):
         if not action:
             if l_today >= 1 and cpl_today < t_cpl:
                 action, reason = 'ACTIVE', f"Доліт ліда (TODAY): CPL {cpl_today:.2f}{sym} < {t_cpl:.2f}{sym}"
-            elif is_morning_restart and l_3d > 0 and cpl_3d < t_cpl:
-                action, reason = 'ACTIVE', f"Ранковий рестарт 05:30 (LAST 3 DAYS): CPL {cpl_3d:.2f}{sym} < {t_cpl:.2f}{sym}"
+            elif is_morning_restart and l_hist2d > 0 and cpl_hist2d < t_cpl:
+                action, reason = 'ACTIVE', f"Ранковий рестарт 05:30 ({day_before_yesterday_str}–{yesterday_str}): CPL {cpl_hist2d:.2f}{sym} < {t_cpl:.2f}{sym}"
                 
         if action and action != data['status']:
             icon = '🔴' if action == 'PAUSED' else '🟢'
