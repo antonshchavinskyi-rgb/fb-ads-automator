@@ -114,7 +114,7 @@ def change_entity_status(entity_id, new_status):
         print(f" ❌ Помилка зміни статусу ID {entity_id}: {e}", flush=True)
         return False
 
-def process_offers_logic(acc_id, currency, is_morning_restart, events, diagnostics):
+def process_offers_logic(acc_id, currency, is_morning_restart, events):
     rate = 3.8 if currency == 'PLN' else 1.0
     sym = cur_symbol(currency)
     endpoint = f"https://graph.facebook.com/{API_VER}/act_{acc_id}/adsets"
@@ -165,11 +165,6 @@ def process_offers_logic(acc_id, currency, is_morning_restart, events, diagnosti
             adsets_data[aid]['stats']['today']['l'] = get_leads(row.get('actions', []))
 
     insights_2d = fetch_data(insights_endpoint, {'level': 'adset', 'fields': 'adset_id,spend,actions', 'time_range': last_2d_time_range, 'action_attribution_windows': json.dumps(ATTRIBUTION_WINDOW), 'limit': 250})
-    if insights_2d:
-        diag_line = (f"last_2d — запит: since={yesterday_str}, until={today_str} | "
-                     f"Facebook повернув: date_start={insights_2d[0].get('date_start')}, date_stop={insights_2d[0].get('date_stop')}")
-        print(f"   🔎 ДІАГНОСТИКА {diag_line}", flush=True)
-        diagnostics.append(diag_line)
     for row in insights_2d:
         aid = row.get('adset_id')
         if aid in adsets_data:
@@ -177,25 +172,11 @@ def process_offers_logic(acc_id, currency, is_morning_restart, events, diagnosti
             adsets_data[aid]['stats']['last_2d']['l'] = get_leads(row.get('actions', []))
 
     insights_hist2d = fetch_data(insights_endpoint, {'level': 'adset', 'fields': 'adset_id,spend,actions', 'time_range': hist_2d_time_range, 'action_attribution_windows': json.dumps(ATTRIBUTION_WINDOW), 'limit': 250})
-    if insights_hist2d:
-        diag_line = (f"hist_2d — запит: since={day_before_yesterday_str}, until={yesterday_str} | "
-                     f"Facebook повернув: date_start={insights_hist2d[0].get('date_start')}, date_stop={insights_hist2d[0].get('date_stop')}")
-        print(f"   🔎 ДІАГНОСТИКА {diag_line}", flush=True)
-        diagnostics.append(diag_line)
     for row in insights_hist2d:
         aid = row.get('adset_id')
         if aid in adsets_data:
             adsets_data[aid]['stats']['hist_2d']['s'] = float(row.get('spend', 0))
             adsets_data[aid]['stats']['hist_2d']['l'] = get_leads(row.get('actions', []))
-
-    # ТИМЧАСОВО, суто для довідки: як поводився старий date_preset='last_3d'.
-    # Результат НІЯК не впливає на жодне рішення скрипта — тільки в діагностику.
-    insights_old_last3d = fetch_data(insights_endpoint, {'level': 'adset', 'fields': 'adset_id,spend,actions', 'date_preset': 'last_3d', 'action_attribution_windows': json.dumps(ATTRIBUTION_WINDOW), 'limit': 250})
-    if insights_old_last3d:
-        diag_line = (f"last_3d (стара логіка, для довідки, сьогодні={today_str}) — Facebook повернув: "
-                     f"date_start={insights_old_last3d[0].get('date_start')}, date_stop={insights_old_last3d[0].get('date_stop')}")
-        print(f"   🔎 ДІАГНОСТИКА {diag_line}", flush=True)
-        diagnostics.append(diag_line)
 
     for aid, data in adsets_data.items():
         s_today, l_today = data['stats']['today']['s'], data['stats']['today']['l']
@@ -241,17 +222,14 @@ def main():
 
     all_events = []
     all_errors = []
-    all_diagnostics = []
 
     # ФІКС 3: Ізоляція обробки кожного акаунта через try/except
     for acc_id, currency in ACCOUNTS.items():
         print(f"\n📊 Акаунт: {acc_id} ({currency})", flush=True)
         acc_events = []
-        acc_diagnostics = []
         try:
-            process_offers_logic(acc_id, currency, is_morning_restart, acc_events, acc_diagnostics)
+            process_offers_logic(acc_id, currency, is_morning_restart, acc_events)
             all_events.extend(f"Акаунт {acc_id} ({currency}):\n{e}" for e in acc_events)
-            all_diagnostics.extend(f"Акаунт {acc_id}: {d}" for d in acc_diagnostics)
         except Exception as e:
             err_msg = f"Акаунт {acc_id} ({currency}): {e}"
             print(f" ❌ Помилка під час обробки акаунта {acc_id}: {e}", flush=True)
@@ -270,12 +248,6 @@ def main():
         send_telegram(text)
     elif is_heartbeat_window:
         send_telegram(f"✅ FB Manager живий, змін не було ({time_str})")
-
-    # ТИМЧАСОВО для перевірки дат last_2d / hist_2d. Приберіть цей блок,
-    # коли переконаєтесь, що дати правильні (досить один раз побачити).
-    if all_diagnostics:
-        diag_text = f"🔎 <b>Діагностика дат</b> ({time_str})\n\n" + "\n\n".join(all_diagnostics)
-        send_telegram(diag_text)
 
 if __name__ == '__main__':
     main()
