@@ -4,6 +4,7 @@ import urllib.parse
 import urllib.error
 import json
 import time
+import html
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
@@ -47,6 +48,15 @@ TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
 # завжди надішле коротке "все ок", навіть якщо дій не було.
 HEARTBEAT_HOUR = 12
 HEARTBEAT_MINUTE_MAX = 15
+
+# "2 DAYS без лідів" враховує сьогодні, а рано вранці "сьогодні" ще порожнє —
+# тому правило вмикається тільки після цієї години (за Варшавою), щоб не
+# конфліктувати з ранковим рестартом і не паузити групи на пустих сьогоднішніх даних.
+TWO_DAY_RULE_START_HOUR = 10
+
+def esc(text):
+    """Екранує <, >, & для безпечної вставки динамічного тексту в HTML-повідомлення Telegram."""
+    return html.escape(str(text), quote=False)
 
 def send_telegram(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -114,7 +124,7 @@ def change_entity_status(entity_id, new_status):
         print(f" ❌ Помилка зміни статусу ID {entity_id}: {e}", flush=True)
         return False
 
-def process_offers_logic(acc_id, currency, is_morning_restart, events):
+def process_offers_logic(acc_id, currency, is_morning_restart, events, restart_diag):
     rate = 3.8 if currency == 'PLN' else 1.0
     sym = cur_symbol(currency)
     endpoint = f"https://graph.facebook.com/{API_VER}/act_{acc_id}/adsets"
@@ -192,7 +202,7 @@ def process_offers_logic(acc_id, currency, is_morning_restart, events):
             action, reason = 'PAUSED', f"Швидкий стоп без лідів (TODAY): Витрати {s_today:.2f}{sym} > {l_no_leads:.2f}{sym}"
         elif s_today > l_high_cpl and l_today >= 1 and cpl_today > t_cpl:
             action, reason = 'PAUSED', f"Збитковий CPL (TODAY): CPL {cpl_today:.2f}{sym} > {t_cpl:.2f}{sym}"
-        elif s_2d > l_no_leads and l_2d == 0:
+        elif now_poland.hour >= TWO_DAY_RULE_START_HOUR and s_2d > l_no_leads and l_2d == 0:
             action, reason = 'PAUSED', f"Стоп без лідів (2 DAYS): Витрати {s_2d:.2f}{sym} > {l_no_leads:.2f}{sym}"
             
         if not action:
@@ -200,14 +210,31 @@ def process_offers_logic(acc_id, currency, is_morning_restart, events):
                 action, reason = 'ACTIVE', f"Доліт ліда (TODAY): CPL {cpl_today:.2f}{sym} < {t_cpl:.2f}{sym}"
             elif is_morning_restart and l_hist2d > 0 and cpl_hist2d < t_cpl:
                 action, reason = 'ACTIVE', f"Ранковий рестарт 05:30 ({day_before_yesterday_str}–{yesterday_str}): CPL {cpl_hist2d:.2f}{sym} < {t_cpl:.2f}{sym}"
-                
+
+        # Діагностика ранкового рестарту: тільки у вікні 5:30-5:59, тільки для PAUSED адсетів,
+        # незалежно від того, чи спрацював рестарт — щоб бачити ПРИЧИНУ, а не тільки результат.
+        if is_morning_restart and data['status'] == 'PAUSED':
+            if action == 'ACTIVE':
+                diag_line = f"🟢 [{data['tag'].upper()}] {data['name']}: перезапущено (ліди={l_hist2d}, CPL={cpl_hist2d:.2f}{sym} < {t_cpl:.2f}{sym})"
+            elif action == 'PAUSED':
+                diag_line = f"⏸ [{data['tag'].upper()}] {data['name']}: спрацювало правило паузи цього ж запуску ({reason}) → рестарт не розглядався"
+            elif l_hist2d == 0:
+                diag_line = f"⏸ [{data['tag'].upper()}] {data['name']}: без лідів за {day_before_yesterday_str}–{yesterday_str} → не перезапущено"
+            elif cpl_hist2d >= t_cpl:
+                diag_line = f"⏸ [{data['tag'].upper()}] {data['name']}: CPL {cpl_hist2d:.2f}{sym} ≥ {t_cpl:.2f}{sym} за {day_before_yesterday_str}–{yesterday_str} → не перезапущено"
+            else:
+                diag_line = None
+            if diag_line:
+                print(f"   🔎 РЕСТАРТ-ДІАГ: {diag_line}", flush=True)
+                restart_diag.append(esc(diag_line))
+
         if action and action != data['status']:
             icon = '🔴' if action == 'PAUSED' else '🟢'
             act_word = 'Вимкнено' if action == 'PAUSED' else 'Увімкнено'
             if change_entity_status(aid, action):
                 print(f"   {icon} {act_word} група: [{data['tag'].upper()}] {data['name']} (ID: {aid})", flush=True)
                 print(f"      ↳ Причина: {reason}", flush=True)
-                events.append(f"{icon} <b>{act_word}</b>: [{data['tag'].upper()}] {data['name']}\n   ID: <code>{aid}</code>\n   ↳ {reason}")
+                events.append(f"{icon} <b>{act_word}</b>: [{esc(data['tag'].upper())}] {esc(data['name'])}\n   ID: <code>{aid}</code>\n   ↳ {esc(reason)}")
 
 def main():
     if not ACCESS_TOKEN:
@@ -222,16 +249,19 @@ def main():
 
     all_events = []
     all_errors = []
+    all_restart_diag = []
 
     # ФІКС 3: Ізоляція обробки кожного акаунта через try/except
     for acc_id, currency in ACCOUNTS.items():
         print(f"\n📊 Акаунт: {acc_id} ({currency})", flush=True)
         acc_events = []
+        acc_restart_diag = []
         try:
-            process_offers_logic(acc_id, currency, is_morning_restart, acc_events)
+            process_offers_logic(acc_id, currency, is_morning_restart, acc_events, acc_restart_diag)
             all_events.extend(f"Акаунт {acc_id} ({currency}):\n{e}" for e in acc_events)
+            all_restart_diag.extend(f"Акаунт {acc_id}: {d}" for d in acc_restart_diag)
         except Exception as e:
-            err_msg = f"Акаунт {acc_id} ({currency}): {e}"
+            err_msg = f"Акаунт {acc_id} ({currency}): {esc(e)}"
             print(f" ❌ Помилка під час обробки акаунта {acc_id}: {e}", flush=True)
             all_errors.append(err_msg)
 
@@ -248,6 +278,15 @@ def main():
         send_telegram(text)
     elif is_heartbeat_window:
         send_telegram(f"✅ FB Manager живий, змін не було ({time_str})")
+
+    # Окреме повідомлення тільки у вікні ранкового рестарту (5:30-5:59 за Варшавою):
+    # показує причину по кожному PAUSED-адсету, навіть якщо нічого не перезапустилось.
+    if is_morning_restart:
+        if all_restart_diag:
+            text = f"☀️ <b>Ранковий рестарт — перевірка</b> ({time_str})\n\n" + "\n\n".join(all_restart_diag)
+        else:
+            text = f"☀️ <b>Ранковий рестарт</b> ({time_str}): не знайдено жодного PAUSED-адсету серед офферів — перевіряти нічого."
+        send_telegram(text)
 
 if __name__ == '__main__':
     main()
