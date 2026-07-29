@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 ACCESS_TOKEN = os.environ.get('FB_ACCESS_TOKEN')
 
 ACCOUNTS = {
-   # '1271459967771680': 'USD',  # 1
+   '1271459967771680': 'USD',  # 1
     '746852230541150': 'USD',   # 2
     #'269403135857791': 'USD',   # 3
     '1732457457319086': 'PLN',  # 4
