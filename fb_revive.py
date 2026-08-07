@@ -77,27 +77,69 @@ def send_telegram_lines(header, lines, max_chars=3800):
 
 
 def fetch_data(endpoint, params, errors=None, context=""):
+    """
+    Meta GET with compact transient-rate-limit handling.
+
+    For transient application/request limits (code 4 / code 17 / subcode 1504022)
+    we back off instead of immediately failing or retrying forever.
+    """
     params = dict(params)
     params['access_token'] = ACCESS_TOKEN
     query_string = urllib.parse.urlencode(params)
     url = f"{endpoint}?{query_string}"
 
     results = []
+    rate_limit_delays = [30, 60, 120]
+    rate_limit_attempt = 0
+
     while url:
-        time.sleep(0.1)
+        time.sleep(0.2)
         try:
             req = urllib.request.Request(url)
             with urllib.request.urlopen(req) as response:
                 data = json.loads(response.read().decode('utf-8'))
                 results.extend(data.get('data', []))
                 url = data.get('paging', {}).get('next') if 'paging' in data else None
+                rate_limit_attempt = 0
         except urllib.error.HTTPError as e:
             error_body = e.read().decode('utf-8')
-            if 'User request limit reached' in error_body or '"code":17' in error_body:
-                print(" ⏳ Ліміт запитів Meta (Code 17). Пауза 15 сек...", flush=True)
-                time.sleep(15)
+            try:
+                payload = json.loads(error_body)
+                meta_error = payload.get('error', {})
+            except Exception:
+                meta_error = {}
+
+            code = meta_error.get('code')
+            subcode = meta_error.get('error_subcode')
+            is_transient = bool(meta_error.get('is_transient'))
+            message = meta_error.get('message') or error_body
+
+            is_rate_limit = (
+                code in (4, 17)
+                or subcode == 1504022
+                or 'request limit' in str(message).lower()
+                or 'user request limit' in str(message).lower()
+            )
+
+            if is_rate_limit and rate_limit_attempt < len(rate_limit_delays):
+                delay = rate_limit_delays[rate_limit_attempt]
+                rate_limit_attempt += 1
+                print(
+                    f" ⏳ Meta rate limit ({context}) code={code} subcode={subcode}. "
+                    f"Пауза {delay} сек, спроба {rate_limit_attempt}/{len(rate_limit_delays)}...",
+                    flush=True,
+                )
+                time.sleep(delay)
                 continue
-            msg = f"API Meta HTTP {e.code} {context}: {error_body}"
+
+            if is_rate_limit:
+                msg = (
+                    f"Meta rate limit після {rate_limit_attempt} повторів — {context}; "
+                    f"HTTP {e.code}, code={code}, subcode={subcode}, transient={is_transient}"
+                )
+            else:
+                msg = f"API Meta HTTP {e.code} {context}: code={code}, subcode={subcode}, message={message}"
+
             print(f" ❌ {msg}", flush=True)
             if errors is not None:
                 errors.append(msg)
@@ -109,7 +151,6 @@ def fetch_data(endpoint, params, errors=None, context=""):
                 errors.append(msg)
             break
     return results
-
 
 def get_leads(actions_list):
     for action in actions_list:
@@ -251,24 +292,8 @@ def get_account_state(acc_id, currency, time_ranges, errors, warnings):
             raw_candidates[aid]['recent_leads'] = get_leads(row.get('actions', []))
             raw_candidates[aid]['recent_impressions'] = int(row.get('impressions', 0))
 
-    # Deep idle: останні 7 повних днів.
-    idle = fetch_data(
-        insights_endpoint,
-        {
-            'level': 'adset',
-            'fields': 'adset_id,impressions',
-            'time_range': time_ranges['idle'],
-            'limit': 250,
-        },
-        errors,
-        f"idle insights account {acc_id}",
-    )
-    for row in idle:
-        aid = row.get('adset_id')
-        if aid in raw_candidates:
-            raw_candidates[aid]['idle_impressions'] = int(row.get('impressions', 0))
-
-    # Deep history: 14 днів перед idle-вікном. Impressions тут — попередній фільтр сенсу перевірки.
+    # Deep history: спочатку дивимося 14 днів ПЕРЕД idle-вікном.
+    # Якщо там взагалі немає показів у жодного PAUSED-кандидата, окремий idle-запит не потрібен.
     history = fetch_data(
         insights_endpoint,
         {
@@ -287,6 +312,26 @@ def get_account_state(acc_id, currency, time_ranges, errors, warnings):
             raw_candidates[aid]['hist_spend'] = float(row.get('spend', 0))
             raw_candidates[aid]['hist_leads'] = get_leads(row.get('actions', []))
             raw_candidates[aid]['hist_impressions'] = int(row.get('impressions', 0))
+
+    has_deep_history = any(c['hist_impressions'] > 0 for c in raw_candidates.values())
+    if has_deep_history:
+        # Deep idle: останні 7 повних днів. Потрібно підтвердити 0 показів лише тоді,
+        # коли в 14-денній історії перед ними справді була активність.
+        idle = fetch_data(
+            insights_endpoint,
+            {
+                'level': 'adset',
+                'fields': 'adset_id,impressions',
+                'time_range': time_ranges['idle'],
+                'limit': 250,
+            },
+            errors,
+            f"idle insights account {acc_id}",
+        )
+        for row in idle:
+            aid = row.get('adset_id')
+            if aid in raw_candidates:
+                raw_candidates[aid]['idle_impressions'] = int(row.get('impressions', 0))
 
     candidates = {}
     rate = currency_rate(currency)
@@ -475,9 +520,11 @@ def main():
         restarted_ids.add(candidate['adset_id'])
         sym = currency_symbol(candidate['currency'])
         recent_events.append(
-            f"{'🧪' if REVIVE_DRY_RUN else '🟢'} <b>{'DRY RUN • ' if REVIVE_DRY_RUN else ''}Recent</b> [{esc(candidate['category'].upper())}] {esc(candidate['adset_name'])}\n"
+            f"{'🧪' if REVIVE_DRY_RUN else '🟢'} <b>{'DRY RUN • ' if REVIVE_DRY_RUN else ''}RECENT 2D</b> [{esc(candidate['category'].upper())}] {esc(candidate['adset_name'])}\n"
+            f"   Rule: <b>2 повні попередні дні</b> • {esc(time_ranges['recent_label'])}\n"
+            f"   Account: <code>{candidate['account_id']}</code>\n"
             f"   Campaign: {esc(candidate['campaign_name'])}\n"
-            f"   CID: <code>{candidate['campaign_id']}</code> | AID: <code>{candidate['adset_id']}</code>\n"
+            f"   Campaign ID: <code>{candidate['campaign_id']}</code> | Adset ID: <code>{candidate['adset_id']}</code>\n"
             f"   {candidate['recent_leads']} лідів • CPL {candidate['recent_cpl']:.2f}{sym} • BE {candidate['be']:.2f}{sym}"
             + (f" • ads +{activated_ads}" if activated_ads else "")
         )
@@ -525,9 +572,12 @@ def main():
         sym = currency_symbol(candidate['currency'])
         label = candidate['offer_id'] if candidate['offer_id'] else 'КТГ'
         deep_events.append(
-            f"{'🧪' if REVIVE_DRY_RUN else '♻️'} <b>{'DRY RUN • ' if REVIVE_DRY_RUN else ''}Deep</b> [{esc(label)} / {esc(candidate['category'].upper())}] {esc(candidate['adset_name'])}\n"
+            f"{'🧪' if REVIVE_DRY_RUN else '♻️'} <b>{'DRY RUN • ' if REVIVE_DRY_RUN else ''}DEEP 14D→7D</b> [{esc(label)} / {esc(candidate['category'].upper())}] {esc(candidate['adset_name'])}\n"
+            f"   Rule: <b>14 днів історії → 7 днів без показів</b>\n"
+            f"   History: {esc(time_ranges['history_label'])} • Idle: {esc(time_ranges['idle_label'])}\n"
+            f"   Account: <code>{candidate['account_id']}</code>\n"
             f"   Campaign: {esc(candidate['campaign_name'])}\n"
-            f"   CID: <code>{candidate['campaign_id']}</code> | AID: <code>{candidate['adset_id']}</code>\n"
+            f"   Campaign ID: <code>{candidate['campaign_id']}</code> | Adset ID: <code>{candidate['adset_id']}</code>\n"
             f"   {candidate['hist_leads']} лідів • CPL {candidate['deep_cpl']:.2f}{sym} • BE {candidate['be']:.2f}{sym}"
             + (f" • ads +{activated_ads}" if activated_ads else "")
         )
@@ -535,7 +585,9 @@ def main():
     time_str = now_poland.strftime('%Y-%m-%d %H:%M')
     summary = (
         f"🌅 <b>FB Revive — {'DRY RUN' if REVIVE_DRY_RUN else 'LIVE'}</b> ({time_str})\n"
-        f"Recent: <b>{len(recent_events)}</b> | Deep: <b>{len(deep_events)}</b> | Warnings: <b>{len(warnings)}</b> | Errors: <b>{len(errors)}</b>"
+        f"Recent 2D: <b>{len(recent_events)}</b> ({esc(time_ranges['recent_label'])})\n"
+        f"Deep 14D→7D: <b>{len(deep_events)}</b> (history {esc(time_ranges['history_label'])}; idle {esc(time_ranges['idle_label'])})\n"
+        f"Warnings: <b>{len(warnings)}</b> | Errors: <b>{len(errors)}</b>"
     )
     if REVIVE_DRY_RUN:
         summary += "\n🧪 <b>Жоден статус у Meta не змінено.</b>"
