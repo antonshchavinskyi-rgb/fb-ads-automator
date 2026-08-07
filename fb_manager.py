@@ -5,58 +5,32 @@ import urllib.error
 import json
 import time
 import html
-from datetime import datetime, timezone, timedelta
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta
 
-# Токен безпечно зчитується із секретів GitHub
+from fb_config import (
+    ACCOUNTS,
+    OFFERS,
+    API_VER,
+    POLAND_TZ,
+    ATTRIBUTION_WINDOW,
+    MANAGER_NO_LEAD_FACTOR,
+    MANAGER_HIGH_SPEND_FACTOR,
+    MANAGER_TARGET_CPL_FACTOR,
+    MANAGER_TWO_DAY_RULE_START_HOUR,
+    MANAGER_HEARTBEAT_HOUR,
+    MANAGER_HEARTBEAT_MINUTE_MAX,
+    currency_rate,
+    currency_symbol,
+)
+
 ACCESS_TOKEN = os.environ.get('FB_ACCESS_TOKEN')
-
-ACCOUNTS = {
-    '1271459967771680': 'USD',  # 1
-    '746852230541150': 'USD',   # 2
-   # '269403135857791': 'USD',   # 3
-    '1732457457319086': 'PLN',  # 4
-   # '1117620796468102': 'USD',  # 5
-}
-
-OFFERS = {
-    'пла': 16.0,
-    'зол': 14.0,
-    'сер': 13.0,
-    'бро': 11.0,
-    'зал': 9.0
-}
-
-API_VER = "v25.0"
-POLAND_TZ = ZoneInfo("Europe/Warsaw")
-
-# Атрибуція, яку використовуємо для підрахунку лідів у insights
-ATTRIBUTION_WINDOW = ['1d_click']
-
-CURRENCY_SYMBOLS = {
-    'USD': '$',
-    'PLN': 'zł',
-}
-
-def cur_symbol(currency):
-    return CURRENCY_SYMBOLS.get(currency, currency + ' ')
-
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
 
-# "Пульс" раз на добу: один із запусків о 12:00-12:14 (Poland time)
-# завжди надішле коротке "все ок", навіть якщо дій не було.
-HEARTBEAT_HOUR = 12
-HEARTBEAT_MINUTE_MAX = 15
-
-# "2 DAYS без лідів" враховує сьогодні, а рано вранці "сьогодні" ще порожнє —
-# тому правило вмикається тільки після цієї години (за Варшавою), щоб не
-# конфліктувати з ранковим рестартом і не паузити групи на пустих сьогоднішніх даних.
-TWO_DAY_RULE_START_HOUR = 10
 
 def esc(text):
-    """Екранує <, >, & для безпечної вставки динамічного тексту в HTML-повідомлення Telegram."""
     return html.escape(str(text), quote=False)
+
 
 def send_telegram(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -75,11 +49,13 @@ def send_telegram(message):
     except Exception as e:
         print(f" ⚠️ Не вдалося надіслати Telegram-повідомлення: {e}", flush=True)
 
+
 def fetch_data(endpoint, params):
+    params = dict(params)
     params['access_token'] = ACCESS_TOKEN
     query_string = urllib.parse.urlencode(params)
     url = f"{endpoint}?{query_string}"
-    
+
     results = []
     while url:
         time.sleep(0.1)
@@ -95,19 +71,20 @@ def fetch_data(endpoint, params):
                 print(" ⏳ Ліміт запитів Meta (Code 17). Пауза 15 сек...", flush=True)
                 time.sleep(15)
                 continue
-            else:
-                print(f" ❌ Помилка API Meta ({e.code}): {error_body}", flush=True)
+            print(f" ❌ Помилка API Meta ({e.code}): {error_body}", flush=True)
             break
         except Exception as e:
             print(f" ⚠️ Помилка з'єднання: {e}", flush=True)
             break
     return results
 
+
 def get_leads(actions_list):
     for action in actions_list:
         if action.get('action_type') in ['offsite_conversion.fb_pixel_lead', 'lead']:
-            return int(action.get('value', 0))
+            return int(float(action.get('value', 0)))
     return 0
+
 
 def change_entity_status(entity_id, new_status):
     time.sleep(0.1)
@@ -124,109 +101,130 @@ def change_entity_status(entity_id, new_status):
         print(f" ❌ Помилка зміни статусу ID {entity_id}: {e}", flush=True)
         return False
 
-def process_offers_logic(acc_id, currency, is_morning_restart, events, restart_diag):
-    rate = 3.8 if currency == 'PLN' else 1.0
-    sym = cur_symbol(currency)
+
+def parse_category(campaign_name):
+    """Повертає категорію BE для звичайної або каталожної кампанії."""
+    parts = [p.strip().lower() for p in campaign_name.split('-')]
+
+    # Звичайна кампанія: offer_id - category - ...
+    if len(parts) >= 2 and parts[1] in OFFERS:
+        return parts[1]
+
+    # Каталог: category - ктг - ...
+    if parts and parts[0] in OFFERS and 'ктг' in parts:
+        return parts[0]
+
+    # Безпечний fallback для старих назв
+    for part in parts:
+        if part in OFFERS:
+            return part
+    return None
+
+
+def process_offers_logic(acc_id, currency, events):
+    rate = currency_rate(currency)
+    sym = currency_symbol(currency)
+
     endpoint = f"https://graph.facebook.com/{API_VER}/act_{acc_id}/adsets"
-    # ФІКС 1: Додано campaign{name}, щоб Meta віддавала назву кампанії
-    params = {'fields': 'id,name,status,effective_status,campaign{name}', 'limit': 250}
-    raw_adsets = fetch_data(endpoint, params)
-    
+    raw_adsets = fetch_data(endpoint, {
+        'fields': 'id,name,status,effective_status,campaign{name}',
+        'limit': 250,
+    })
+
     adsets_data = {}
     for adset in raw_adsets:
-        camp_name = adset.get('campaign', {}).get('name', '').lower()
         eff_status = adset.get('effective_status', adset.get('status'))
-        
         if eff_status not in ['ACTIVE', 'PAUSED']:
             continue
-            
-        for tag, base_cpl in OFFERS.items():
-            if tag in camp_name:
-                adsets_data[adset['id']] = {
-                    'name': adset['name'],
-                    'status': adset.get('status'),
-                    'tag': tag,
-                    'target_cpl': base_cpl * rate * 1.0,
-                    'limit_no_leads': base_cpl * rate * 0.6,
-                    'limit_high_cpl': base_cpl * rate * 1.3,
-                    'stats': {'today': {'s':0, 'l':0}, 'last_2d': {'s':0, 'l':0}, 'hist_2d': {'s':0, 'l':0}}
-                }
-                break
-                
+
+        campaign_name = adset.get('campaign', {}).get('name', '')
+        tag = parse_category(campaign_name)
+        if not tag:
+            continue
+
+        base_cpl = OFFERS[tag]
+        adsets_data[adset['id']] = {
+            'name': adset['name'],
+            'status': adset.get('status'),
+            'tag': tag,
+            'target_cpl': base_cpl * rate * MANAGER_TARGET_CPL_FACTOR,
+            'limit_no_leads': base_cpl * rate * MANAGER_NO_LEAD_FACTOR,
+            'limit_high_cpl': base_cpl * rate * MANAGER_HIGH_SPEND_FACTOR,
+            'stats': {
+                'today': {'s': 0.0, 'l': 0},
+                'last_2d': {'s': 0.0, 'l': 0},
+            },
+        }
+
     if not adsets_data:
         return
 
-    # ФІКС 2: Час за Польщею
     now_poland = datetime.now(POLAND_TZ)
     today_str = now_poland.strftime('%Y-%m-%d')
     yesterday_str = (now_poland - timedelta(days=1)).strftime('%Y-%m-%d')
-    day_before_yesterday_str = (now_poland - timedelta(days=2)).strftime('%Y-%m-%d')
     last_2d_time_range = json.dumps({'since': yesterday_str, 'until': today_str})
-    # Явно 2 ПОВНІ минулих дні, сьогодні НЕ входить (напр. якщо сьогодні 27.07 -> 25.07 та 26.07)
-    hist_2d_time_range = json.dumps({'since': day_before_yesterday_str, 'until': yesterday_str})
 
     insights_endpoint = f"https://graph.facebook.com/{API_VER}/act_{acc_id}/insights"
-    
-    insights_today = fetch_data(insights_endpoint, {'level': 'adset', 'fields': 'adset_id,spend,actions', 'date_preset': 'today', 'action_attribution_windows': json.dumps(ATTRIBUTION_WINDOW), 'limit': 250})
+
+    insights_today = fetch_data(insights_endpoint, {
+        'level': 'adset',
+        'fields': 'adset_id,spend,actions',
+        'date_preset': 'today',
+        'action_attribution_windows': json.dumps(ATTRIBUTION_WINDOW),
+        'limit': 250,
+    })
     for row in insights_today:
         aid = row.get('adset_id')
         if aid in adsets_data:
             adsets_data[aid]['stats']['today']['s'] = float(row.get('spend', 0))
             adsets_data[aid]['stats']['today']['l'] = get_leads(row.get('actions', []))
 
-    insights_2d = fetch_data(insights_endpoint, {'level': 'adset', 'fields': 'adset_id,spend,actions', 'time_range': last_2d_time_range, 'action_attribution_windows': json.dumps(ATTRIBUTION_WINDOW), 'limit': 250})
+    insights_2d = fetch_data(insights_endpoint, {
+        'level': 'adset',
+        'fields': 'adset_id,spend,actions',
+        'time_range': last_2d_time_range,
+        'action_attribution_windows': json.dumps(ATTRIBUTION_WINDOW),
+        'limit': 250,
+    })
     for row in insights_2d:
         aid = row.get('adset_id')
         if aid in adsets_data:
             adsets_data[aid]['stats']['last_2d']['s'] = float(row.get('spend', 0))
             adsets_data[aid]['stats']['last_2d']['l'] = get_leads(row.get('actions', []))
 
-    insights_hist2d = fetch_data(insights_endpoint, {'level': 'adset', 'fields': 'adset_id,spend,actions', 'time_range': hist_2d_time_range, 'action_attribution_windows': json.dumps(ATTRIBUTION_WINDOW), 'limit': 250})
-    for row in insights_hist2d:
-        aid = row.get('adset_id')
-        if aid in adsets_data:
-            adsets_data[aid]['stats']['hist_2d']['s'] = float(row.get('spend', 0))
-            adsets_data[aid]['stats']['hist_2d']['l'] = get_leads(row.get('actions', []))
-
     for aid, data in adsets_data.items():
-        s_today, l_today = data['stats']['today']['s'], data['stats']['today']['l']
-        cpl_today = s_today / l_today if l_today > 0 else 0
-        s_2d, l_2d = data['stats']['last_2d']['s'], data['stats']['last_2d']['l']
-        s_hist2d, l_hist2d = data['stats']['hist_2d']['s'], data['stats']['hist_2d']['l']
-        cpl_hist2d = s_hist2d / l_hist2d if l_hist2d > 0 else 0
-        
-        t_cpl, l_no_leads, l_high_cpl = data['target_cpl'], data['limit_no_leads'], data['limit_high_cpl']
-        action, reason = None, ""
-        
-        if s_today > l_no_leads and l_today == 0:
-            action, reason = 'PAUSED', f"Швидкий стоп без лідів (TODAY): Витрати {s_today:.2f}{sym} > {l_no_leads:.2f}{sym}"
-        elif s_today > l_high_cpl and l_today >= 1 and cpl_today > t_cpl:
-            action, reason = 'PAUSED', f"Збитковий CPL (TODAY): CPL {cpl_today:.2f}{sym} > {t_cpl:.2f}{sym}"
-        elif now_poland.hour >= TWO_DAY_RULE_START_HOUR and s_2d > l_no_leads and l_2d == 0:
-            action, reason = 'PAUSED', f"Стоп без лідів (2 DAYS): Витрати {s_2d:.2f}{sym} > {l_no_leads:.2f}{sym}"
-            
-        if not action:
-            if l_today >= 1 and cpl_today < t_cpl:
-                action, reason = 'ACTIVE', f"Доліт ліда (TODAY): CPL {cpl_today:.2f}{sym} < {t_cpl:.2f}{sym}"
-            elif is_morning_restart and l_hist2d > 0 and cpl_hist2d < t_cpl:
-                action, reason = 'ACTIVE', f"Ранковий рестарт 05:30 ({day_before_yesterday_str}–{yesterday_str}): CPL {cpl_hist2d:.2f}{sym} < {t_cpl:.2f}{sym}"
+        s_today = data['stats']['today']['s']
+        l_today = data['stats']['today']['l']
+        cpl_today = s_today / l_today if l_today > 0 else 0.0
+        s_2d = data['stats']['last_2d']['s']
+        l_2d = data['stats']['last_2d']['l']
 
-        # Діагностика ранкового рестарту: тільки у вікні 5:30-5:59, тільки для PAUSED адсетів,
-        # незалежно від того, чи спрацював рестарт — щоб бачити ПРИЧИНУ, а не тільки результат.
-        if is_morning_restart and data['status'] == 'PAUSED':
-            if action == 'ACTIVE':
-                diag_line = f"🟢 [{data['tag'].upper()}] {data['name']}: перезапущено (ліди={l_hist2d}, CPL={cpl_hist2d:.2f}{sym} < {t_cpl:.2f}{sym})"
-            elif action == 'PAUSED':
-                diag_line = f"⏸ [{data['tag'].upper()}] {data['name']}: спрацювало правило паузи цього ж запуску ({reason}) → рестарт не розглядався"
-            elif l_hist2d == 0:
-                diag_line = f"⏸ [{data['tag'].upper()}] {data['name']}: без лідів за {day_before_yesterday_str}–{yesterday_str} → не перезапущено"
-            elif cpl_hist2d >= t_cpl:
-                diag_line = f"⏸ [{data['tag'].upper()}] {data['name']}: CPL {cpl_hist2d:.2f}{sym} ≥ {t_cpl:.2f}{sym} за {day_before_yesterday_str}–{yesterday_str} → не перезапущено"
-            else:
-                diag_line = None
-            if diag_line:
-                print(f"   🔎 РЕСТАРТ-ДІАГ: {diag_line}", flush=True)
-                restart_diag.append(esc(diag_line))
+        t_cpl = data['target_cpl']
+        l_no_leads = data['limit_no_leads']
+        l_high_cpl = data['limit_high_cpl']
+
+        action = None
+        reason = ""
+
+        # 1) Швидкий стоп сьогодні без ліда
+        if s_today > l_no_leads and l_today == 0:
+            action = 'PAUSED'
+            reason = f"Швидкий стоп без лідів (TODAY): Витрати {s_today:.2f}{sym} > {l_no_leads:.2f}{sym}"
+
+        # 2) High-CPL stop після хоча б одного ліда
+        elif s_today > l_high_cpl and l_today >= 1 and cpl_today > t_cpl:
+            action = 'PAUSED'
+            reason = f"Збитковий CPL (TODAY): CPL {cpl_today:.2f}{sym} > {t_cpl:.2f}{sym}"
+
+        # 3) Сьогодні + вчора без лідів; працює після 10:00 за Польщею
+        elif now_poland.hour >= MANAGER_TWO_DAY_RULE_START_HOUR and s_2d > l_no_leads and l_2d == 0:
+            action = 'PAUSED'
+            reason = f"Стоп без лідів (2 DAYS): Витрати {s_2d:.2f}{sym} > {l_no_leads:.2f}{sym}"
+
+        # 4) Доліт ліда після паузи
+        if not action and l_today >= 1 and cpl_today < t_cpl:
+            action = 'ACTIVE'
+            reason = f"Доліт ліда (TODAY): CPL {cpl_today:.2f}{sym} < {t_cpl:.2f}{sym}"
 
         if action and action != data['status']:
             icon = '🔴' if action == 'PAUSED' else '🟢'
@@ -234,7 +232,12 @@ def process_offers_logic(acc_id, currency, is_morning_restart, events, restart_d
             if change_entity_status(aid, action):
                 print(f"   {icon} {act_word} група: [{data['tag'].upper()}] {data['name']} (ID: {aid})", flush=True)
                 print(f"      ↳ Причина: {reason}", flush=True)
-                events.append(f"{icon} <b>{act_word}</b>: [{esc(data['tag'].upper())}] {esc(data['name'])}\n   ID: <code>{aid}</code>\n   ↳ {esc(reason)}")
+                events.append(
+                    f"{icon} <b>{act_word}</b>: [{esc(data['tag'].upper())}] {esc(data['name'])}\n"
+                    f"   ID: <code>{aid}</code>\n"
+                    f"   ↳ {esc(reason)}"
+                )
+
 
 def main():
     if not ACCESS_TOKEN:
@@ -242,24 +245,22 @@ def main():
         return
 
     now_poland = datetime.now(POLAND_TZ)
-    is_morning_restart = now_poland.hour == 5 and 30 <= now_poland.minute <= 59
-    is_heartbeat_window = now_poland.hour == HEARTBEAT_HOUR and now_poland.minute < HEARTBEAT_MINUTE_MAX
+    is_heartbeat_window = (
+        now_poland.hour == MANAGER_HEARTBEAT_HOUR
+        and now_poland.minute < MANAGER_HEARTBEAT_MINUTE_MAX
+    )
 
     print(f"🚀 [FB Manager Monitoring] {now_poland.strftime('%Y-%m-%d %H:%M:%S')} (Poland Time)", flush=True)
 
     all_events = []
     all_errors = []
-    all_restart_diag = []
 
-    # ФІКС 3: Ізоляція обробки кожного акаунта через try/except
     for acc_id, currency in ACCOUNTS.items():
         print(f"\n📊 Акаунт: {acc_id} ({currency})", flush=True)
         acc_events = []
-        acc_restart_diag = []
         try:
-            process_offers_logic(acc_id, currency, is_morning_restart, acc_events, acc_restart_diag)
+            process_offers_logic(acc_id, currency, acc_events)
             all_events.extend(f"Акаунт {acc_id} ({currency}):\n{e}" for e in acc_events)
-            all_restart_diag.extend(f"Акаунт {acc_id}: {d}" for d in acc_restart_diag)
         except Exception as e:
             err_msg = f"Акаунт {acc_id} ({currency}): {esc(e)}"
             print(f" ❌ Помилка під час обробки акаунта {acc_id}: {e}", flush=True)
@@ -279,14 +280,6 @@ def main():
     elif is_heartbeat_window:
         send_telegram(f"✅ FB Manager живий, змін не було ({time_str})")
 
-    # Окреме повідомлення тільки у вікні ранкового рестарту (5:30-5:59 за Варшавою):
-    # показує причину по кожному PAUSED-адсету, навіть якщо нічого не перезапустилось.
-    if is_morning_restart:
-        if all_restart_diag:
-            text = f"☀️ <b>Ранковий рестарт — перевірка</b> ({time_str})\n\n" + "\n\n".join(all_restart_diag)
-        else:
-            text = f"☀️ <b>Ранковий рестарт</b> ({time_str}): не знайдено жодного PAUSED-адсету серед офферів — перевіряти нічого."
-        send_telegram(text)
 
 if __name__ == '__main__':
     main()

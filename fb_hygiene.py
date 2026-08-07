@@ -5,23 +5,19 @@ import urllib.error
 import json
 import time
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
+
+from fb_config import (
+    ACCOUNTS,
+    API_VER,
+    POLAND_TZ,
+    HYGIENE_MIN_AGE_DAYS,
+    HYGIENE_NO_IMPRESSIONS_DAYS,
+)
 
 ACCESS_TOKEN = os.environ.get('FB_ACCESS_TOKEN')
-
-ACCOUNTS = {
-   '1271459967771680': 'USD',  # 1
-    '746852230541150': 'USD',   # 2
-    #'269403135857791': 'USD',   # 3
-    '1732457457319086': 'PLN',  # 4
-    #'1117620796468102': 'USD',  # 5
-}
-
-API_VER = "v25.0"
-POLAND_TZ = ZoneInfo("Europe/Warsaw")
-
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
+
 
 def send_telegram(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -40,11 +36,13 @@ def send_telegram(message):
     except Exception as e:
         print(f" ⚠️ Не вдалося надіслати Telegram-повідомлення: {e}", flush=True)
 
+
 def fetch_data(endpoint, params):
+    params = dict(params)
     params['access_token'] = ACCESS_TOKEN
     query_string = urllib.parse.urlencode(params)
     url = f"{endpoint}?{query_string}"
-    
+
     results = []
     while url:
         time.sleep(0.1)
@@ -60,13 +58,13 @@ def fetch_data(endpoint, params):
                 print(" ⏳ Ліміт запитів Meta (Code 17). Пауза 15 сек...", flush=True)
                 time.sleep(15)
                 continue
-            else:
-                print(f" ❌ Помилка API Meta ({e.code}): {error_body}", flush=True)
+            print(f" ❌ Помилка API Meta ({e.code}): {error_body}", flush=True)
             break
         except Exception as e:
             print(f" ⚠️ Помилка з'єднання: {e}", flush=True)
             break
     return results
+
 
 def change_entity_status(entity_id, new_status):
     time.sleep(0.1)
@@ -83,56 +81,85 @@ def change_entity_status(entity_id, new_status):
         print(f" ❌ Помилка зміни статусу ID {entity_id}: {e}", flush=True)
         return False
 
+
 def parse_iso_time(time_str):
     try:
         return datetime.strptime(time_str, "%Y-%m-%dT%H:%M:%S%z")
-    except:
+    except Exception:
         return None
+
 
 def process_hygiene_logic(acc_id, events):
     now_utc = datetime.now(timezone.utc)
-    
-    # 1. Гігієна груп (старіші за 3 дні без показів за останні 7 днів)
-    adsets_endpoint = f"https://graph.facebook.com/{API_VER}/act_{acc_id}/adsets"
-    raw_adsets = fetch_data(adsets_endpoint, {'fields': 'id,name,effective_status,created_time', 'limit': 250})
-    
+    min_age_seconds = HYGIENE_MIN_AGE_DAYS * 24 * 60 * 60
+    date_preset = f"last_{HYGIENE_NO_IMPRESSIONS_DAYS}d"
+
+    # 1. Адсети: активні, старші за 3 дні, 0 показів за last_7d
+    raw_adsets = fetch_data(
+        f"https://graph.facebook.com/{API_VER}/act_{acc_id}/adsets",
+        {'fields': 'id,name,effective_status,created_time', 'limit': 250},
+    )
+
     active_adsets = {}
-    for a in raw_adsets:
-        if a.get('effective_status') == 'ACTIVE' and a.get('created_time'):
-            p_time = parse_iso_time(a['created_time'])
-            # Захист від None, якщо час не вдалося розпарсити
-            if p_time and (now_utc - p_time).total_seconds() > 259200:
-                active_adsets[a['id']] = a['name']
-                
+    for adset in raw_adsets:
+        if adset.get('effective_status') != 'ACTIVE' or not adset.get('created_time'):
+            continue
+        created = parse_iso_time(adset['created_time'])
+        if created and (now_utc - created).total_seconds() > min_age_seconds:
+            active_adsets[adset['id']] = adset['name']
+
     if active_adsets:
-        adset_insights = fetch_data(f"https://graph.facebook.com/{API_VER}/act_{acc_id}/insights", {'level': 'adset', 'fields': 'adset_id,impressions', 'date_preset': 'last_7d', 'limit': 250})
-        adsets_with_impressions = {r.get('adset_id') for r in adset_insights if int(r.get('impressions', 0)) > 0}
-        
-        for aid, name in active_adsets.items():
-            if aid not in adsets_with_impressions and change_entity_status(aid, 'PAUSED'):
-                print(f"   🧹 Гігієна: Вимкнено неактивну групу [{name}] | ID: {aid}", flush=True)
+        insights = fetch_data(
+            f"https://graph.facebook.com/{API_VER}/act_{acc_id}/insights",
+            {
+                'level': 'adset',
+                'fields': 'adset_id,impressions',
+                'date_preset': date_preset,
+                'limit': 250,
+            },
+        )
+        with_impressions = {
+            row.get('adset_id') for row in insights if int(row.get('impressions', 0)) > 0
+        }
+
+        for adset_id, name in active_adsets.items():
+            if adset_id not in with_impressions and change_entity_status(adset_id, 'PAUSED'):
+                print(f"   🧹 Гігієна: Вимкнено неактивну групу [{name}] | ID: {adset_id}", flush=True)
                 events.append(f"🧹 Група: {name}")
 
-    # 2. Гігієна оголошень (старіші за 3 дні без показів за останні 7 днів)
-    ads_endpoint = f"https://graph.facebook.com/{API_VER}/act_{acc_id}/ads"
-    raw_ads = fetch_data(ads_endpoint, {'fields': 'id,name,effective_status,created_time', 'limit': 250})
-    
+    # 2. Оголошення: активні, старші за 3 дні, 0 показів за last_7d
+    raw_ads = fetch_data(
+        f"https://graph.facebook.com/{API_VER}/act_{acc_id}/ads",
+        {'fields': 'id,name,effective_status,created_time', 'limit': 250},
+    )
+
     active_ads = {}
-    for a in raw_ads:
-        if a.get('effective_status') == 'ACTIVE' and a.get('created_time'):
-            p_time = parse_iso_time(a['created_time'])
-            # Захист від None, якщо час не вдалося розпарсити
-            if p_time and (now_utc - p_time).total_seconds() > 259200:
-                active_ads[a['id']] = a['name']
-                
+    for ad in raw_ads:
+        if ad.get('effective_status') != 'ACTIVE' or not ad.get('created_time'):
+            continue
+        created = parse_iso_time(ad['created_time'])
+        if created and (now_utc - created).total_seconds() > min_age_seconds:
+            active_ads[ad['id']] = ad['name']
+
     if active_ads:
-        ad_insights = fetch_data(f"https://graph.facebook.com/{API_VER}/act_{acc_id}/insights", {'level': 'ad', 'fields': 'ad_id,impressions', 'date_preset': 'last_7d', 'limit': 250})
-        ads_with_impressions = {r.get('ad_id') for r in ad_insights if int(r.get('impressions', 0)) > 0}
-        
+        insights = fetch_data(
+            f"https://graph.facebook.com/{API_VER}/act_{acc_id}/insights",
+            {
+                'level': 'ad',
+                'fields': 'ad_id,impressions',
+                'date_preset': date_preset,
+                'limit': 250,
+            },
+        )
+        with_impressions = {
+            row.get('ad_id') for row in insights if int(row.get('impressions', 0)) > 0
+        }
+
         for ad_id, name in active_ads.items():
-            if ad_id not in ads_with_impressions and change_entity_status(ad_id, 'PAUSED'):
+            if ad_id not in with_impressions and change_entity_status(ad_id, 'PAUSED'):
                 print(f"   🧹 Гігієна: Вимкнено неактивне оголошення [{name}] | ID: {ad_id}", flush=True)
                 events.append(f"🧹 Оголошення: {name}")
+
 
 def main():
     if not ACCESS_TOKEN:
@@ -169,6 +196,7 @@ def main():
         send_telegram(text)
     else:
         send_telegram(f"✅ FB Hygiene живий, чистити не було чого ({time_str})")
+
 
 if __name__ == '__main__':
     main()
