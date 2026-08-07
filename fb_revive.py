@@ -170,6 +170,17 @@ def build_time_ranges(now_poland):
 
 
 def get_account_state(acc_id, currency, time_ranges, errors, warnings):
+    """
+    Revive спочатку дивиться, чи є взагалі релевантна історія, і тільки потім парсить кампанію.
+
+    Це принципово:
+    - Recent: цікавлять лише PAUSED-групи з активністю за 2 повні минулі дні;
+    - Deep: цікавлять лише PAUSED-групи з 0 показів за останні 7 повних днів
+      І з >0 показів у 14-денній історії перед цими 7 днями.
+
+    Старі кампанії без показів у потрібних вікнах навіть не потрапляють у перевірку неймінгу,
+    тому не створюють UNKNOWN CAMPAIGN FORMAT шум.
+    """
     campaigns_raw = fetch_data(
         f"https://graph.facebook.com/{API_VER}/act_{acc_id}/campaigns",
         {'fields': 'id,name,status,effective_status', 'limit': 250},
@@ -190,12 +201,9 @@ def get_account_state(acc_id, currency, time_ranges, errors, warnings):
         f"adsets account {acc_id}",
     )
 
-    candidates = {}
-    rate = currency_rate(currency)
-    unknown_campaigns = set()
-
+    # Спочатку збираємо тільки PAUSED адсети в ACTIVE кампаніях — без парсингу назви.
+    raw_candidates = {}
     for adset in adsets_raw:
-        # Потрібен саме PAUSED адсет у ACTIVE кампанії.
         if adset.get('status') != 'PAUSED':
             continue
 
@@ -204,52 +212,31 @@ def get_account_state(acc_id, currency, time_ranges, errors, warnings):
         if not campaign:
             continue
 
-        campaign_name = campaign.get('name', '')
-        parsed = parse_campaign_name(campaign_name)
-        if not parsed['valid']:
-            warning_key = campaign_id or campaign_name
-            if warning_key not in unknown_campaigns:
-                unknown_campaigns.add(warning_key)
-                warnings.append(
-                    f"⚠️ <b>UNKNOWN CAMPAIGN FORMAT</b>\n"
-                    f"   Campaign: {esc(campaign_name or '—')}\n"
-                    f"   CID: <code>{esc(campaign_id or '—')}</code>\n"
-                    f"   ↳ {esc(parsed['reason'])}; Revive цю кампанію пропустив"
-                )
-            continue
-
-        offer_id = parsed['offer_id']
-        category = parsed['category']
-        is_catalog = parsed['is_catalog']
-        be = OFFERS[category] * rate
-        candidates[adset['id']] = {
-            'account_id': acc_id,
-            'currency': currency,
+        raw_candidates[adset['id']] = {
             'adset_id': adset['id'],
             'adset_name': adset.get('name', ''),
             'campaign_id': campaign_id,
-            'campaign_name': campaign_name,
-            'offer_id': offer_id,
-            'category': category,
-            'is_catalog': is_catalog,
-            'be': be,
+            'campaign_name': campaign.get('name', ''),
             'recent_spend': 0.0,
             'recent_leads': 0,
+            'recent_impressions': 0,
             'idle_impressions': 0,
             'hist_spend': 0.0,
             'hist_leads': 0,
+            'hist_impressions': 0,
         }
 
-    if not candidates:
-        return candidates, defaultdict(list)
+    if not raw_candidates:
+        return {}, defaultdict(list)
 
     insights_endpoint = f"https://graph.facebook.com/{API_VER}/act_{acc_id}/insights"
 
+    # Recent: 2 повні попередні дні.
     recent = fetch_data(
         insights_endpoint,
         {
             'level': 'adset',
-            'fields': 'adset_id,spend,actions',
+            'fields': 'adset_id,spend,actions,impressions',
             'time_range': time_ranges['recent'],
             'action_attribution_windows': json.dumps(ATTRIBUTION_WINDOW),
             'limit': 250,
@@ -259,10 +246,12 @@ def get_account_state(acc_id, currency, time_ranges, errors, warnings):
     )
     for row in recent:
         aid = row.get('adset_id')
-        if aid in candidates:
-            candidates[aid]['recent_spend'] = float(row.get('spend', 0))
-            candidates[aid]['recent_leads'] = get_leads(row.get('actions', []))
+        if aid in raw_candidates:
+            raw_candidates[aid]['recent_spend'] = float(row.get('spend', 0))
+            raw_candidates[aid]['recent_leads'] = get_leads(row.get('actions', []))
+            raw_candidates[aid]['recent_impressions'] = int(row.get('impressions', 0))
 
+    # Deep idle: останні 7 повних днів.
     idle = fetch_data(
         insights_endpoint,
         {
@@ -276,14 +265,15 @@ def get_account_state(acc_id, currency, time_ranges, errors, warnings):
     )
     for row in idle:
         aid = row.get('adset_id')
-        if aid in candidates:
-            candidates[aid]['idle_impressions'] = int(row.get('impressions', 0))
+        if aid in raw_candidates:
+            raw_candidates[aid]['idle_impressions'] = int(row.get('impressions', 0))
 
+    # Deep history: 14 днів перед idle-вікном. Impressions тут — попередній фільтр сенсу перевірки.
     history = fetch_data(
         insights_endpoint,
         {
             'level': 'adset',
-            'fields': 'adset_id,spend,actions',
+            'fields': 'adset_id,spend,actions,impressions',
             'time_range': time_ranges['history'],
             'action_attribution_windows': json.dumps(ATTRIBUTION_WINDOW),
             'limit': 250,
@@ -293,10 +283,74 @@ def get_account_state(acc_id, currency, time_ranges, errors, warnings):
     )
     for row in history:
         aid = row.get('adset_id')
-        if aid in candidates:
-            candidates[aid]['hist_spend'] = float(row.get('spend', 0))
-            candidates[aid]['hist_leads'] = get_leads(row.get('actions', []))
+        if aid in raw_candidates:
+            raw_candidates[aid]['hist_spend'] = float(row.get('spend', 0))
+            raw_candidates[aid]['hist_leads'] = get_leads(row.get('actions', []))
+            raw_candidates[aid]['hist_impressions'] = int(row.get('impressions', 0))
 
+    candidates = {}
+    rate = currency_rate(currency)
+    unknown_campaigns = set()
+
+    for aid, raw in raw_candidates.items():
+        recent_relevant = any((
+            raw['recent_impressions'] > 0,
+            raw['recent_spend'] > 0,
+            raw['recent_leads'] > 0,
+        ))
+
+        deep_relevant = (
+            raw['idle_impressions'] == 0
+            and raw['hist_impressions'] > 0
+        )
+
+        # Немає активності ні для Recent, ні для Deep — взагалі не перевіряємо кампанію.
+        if not recent_relevant and not deep_relevant:
+            continue
+
+        parsed = parse_campaign_name(raw['campaign_name'])
+        if not parsed['valid']:
+            warning_key = raw['campaign_id'] or raw['campaign_name']
+            if warning_key not in unknown_campaigns:
+                unknown_campaigns.add(warning_key)
+                relevant_reason = []
+                if recent_relevant:
+                    relevant_reason.append('є активність у Recent-вікні')
+                if deep_relevant:
+                    relevant_reason.append('є покази у 14-денній Deep-історії та 0 показів останні 7 днів')
+                warnings.append(
+                    f"⚠️ <b>UNKNOWN CAMPAIGN FORMAT</b>\n"
+                    f"   Campaign: {esc(raw['campaign_name'] or '—')}\n"
+                    f"   CID: <code>{esc(raw['campaign_id'] or '—')}</code>\n"
+                    f"   ↳ {esc(parsed['reason'])}; {esc(' / '.join(relevant_reason))}; Revive кампанію пропустив"
+                )
+            continue
+
+        category = parsed['category']
+        candidates[aid] = {
+            'account_id': acc_id,
+            'currency': currency,
+            'adset_id': aid,
+            'adset_name': raw['adset_name'],
+            'campaign_id': raw['campaign_id'],
+            'campaign_name': raw['campaign_name'],
+            'offer_id': parsed['offer_id'],
+            'category': category,
+            'is_catalog': parsed['is_catalog'],
+            'be': OFFERS[category] * rate,
+            'recent_spend': raw['recent_spend'],
+            'recent_leads': raw['recent_leads'],
+            'recent_impressions': raw['recent_impressions'],
+            'idle_impressions': raw['idle_impressions'],
+            'hist_spend': raw['hist_spend'],
+            'hist_leads': raw['hist_leads'],
+            'hist_impressions': raw['hist_impressions'],
+        }
+
+    if not candidates:
+        return {}, defaultdict(list)
+
+    # Ads потрібні тільки для тих груп, які реально пройшли попередній activity-фільтр і парсер.
     ads_raw = fetch_data(
         f"https://graph.facebook.com/{API_VER}/act_{acc_id}/ads",
         {'fields': 'id,name,status,effective_status,adset_id', 'limit': 250},
@@ -310,7 +364,6 @@ def get_account_state(acc_id, currency, time_ranges, errors, warnings):
             ads_by_adset[aid].append(ad)
 
     return candidates, ads_by_adset
-
 
 def qualifies_recent(candidate):
     leads = candidate['recent_leads']

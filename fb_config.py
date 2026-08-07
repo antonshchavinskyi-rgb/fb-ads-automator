@@ -83,7 +83,7 @@ def parse_campaign_name(campaign_name: str) -> dict:
     - категорія BE шукається як ТОЧНИЙ токен між дефісами, а не як підрядок;
     - зайві дефіси/пробіли та повтори того самого тегу не заважають;
     - якщо знайдено кілька РІЗНИХ BE-категорій, назва вважається неоднозначною;
-    - `ктг` може стояти будь-де як окремий токен;
+    - каталог визначається маркером `ктг` або `каталог` як окремим токеном;
     - для звичайної кампанії offer_id = перший чисто цифровий токен;
     - для каталогу offer_id не потрібен.
     """
@@ -91,7 +91,8 @@ def parse_campaign_name(campaign_name: str) -> dict:
     normalized = raw.replace('—', '-').replace('–', '-').replace('−', '-')
     parts = [p.strip().lower() for p in normalized.split('-') if p.strip()]
 
-    is_catalog = 'ктг' in parts
+    catalog_markers = {'ктг', 'каталог'}
+    is_catalog = any(p in catalog_markers for p in parts)
     category_hits = [p for p in parts if p in OFFERS]
     unique_categories = list(dict.fromkeys(category_hits))
 

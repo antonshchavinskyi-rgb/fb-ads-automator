@@ -125,6 +125,10 @@ def change_entity_status(entity_id, new_status):
 
 
 def process_offers_logic(acc_id, currency, events):
+    """
+    Manager працює лише з адсетами, у яких є релевантна активність сьогодні/вчора.
+    Це прибирає шум від старих кампаній і не генерує UNKNOWN-попередження для архівного сміття.
+    """
     rate = currency_rate(currency)
     sym = currency_symbol(currency)
 
@@ -134,125 +138,120 @@ def process_offers_logic(acc_id, currency, events):
         'limit': 250,
     })
 
-    adsets_data = {}
-    unknown_campaigns = set()
+    raw_candidates = {}
     for adset in raw_adsets:
         eff_status = adset.get('effective_status', adset.get('status'))
         if eff_status not in ['ACTIVE', 'PAUSED']:
             continue
-
-        campaign_name = adset.get('campaign', {}).get('name', '')
-        campaign_id = adset.get('campaign_id', '')
-        parsed = parse_campaign_name(campaign_name)
-        if not parsed['valid']:
-            warning_key = campaign_id or campaign_name
-            if warning_key not in unknown_campaigns:
-                unknown_campaigns.add(warning_key)
-                events.append(
-                    f"⚠️ <b>UNKNOWN CAMPAIGN FORMAT</b>\n"
-                    f"   Campaign: {esc(campaign_name or '—')}\n"
-                    f"   CID: <code>{esc(campaign_id or '—')}</code>\n"
-                    f"   ↳ {esc(parsed['reason'])}; автоматика цю кампанію пропустила"
-                )
-            continue
-
-        tag = parsed['category']
-        base_cpl = OFFERS[tag]
-        adsets_data[adset['id']] = {
-            'name': adset['name'],
+        raw_candidates[adset['id']] = {
+            'id': adset['id'],
+            'name': adset.get('name', ''),
             'status': adset.get('status'),
-            'tag': tag,
-            'campaign_id': campaign_id,
-            'campaign_name': campaign_name,
-            'target_cpl': base_cpl * rate * MANAGER_TARGET_CPL_FACTOR,
-            'limit_no_leads': base_cpl * rate * MANAGER_NO_LEAD_FACTOR,
-            'limit_high_cpl': base_cpl * rate * MANAGER_HIGH_SPEND_FACTOR,
-            'stats': {
-                'today': {'s': 0.0, 'l': 0},
-                'last_2d': {'s': 0.0, 'l': 0},
-            },
+            'campaign_id': adset.get('campaign_id', ''),
+            'campaign_name': adset.get('campaign', {}).get('name', ''),
+            'today': {'s': 0.0, 'l': 0, 'i': 0},
+            'last_2d': {'s': 0.0, 'l': 0, 'i': 0},
         }
 
-    if not adsets_data:
+    if not raw_candidates:
         return
 
     now_poland = datetime.now(POLAND_TZ)
     today_str = now_poland.strftime('%Y-%m-%d')
     yesterday_str = (now_poland - timedelta(days=1)).strftime('%Y-%m-%d')
     last_2d_time_range = json.dumps({'since': yesterday_str, 'until': today_str})
-
     insights_endpoint = f"https://graph.facebook.com/{API_VER}/act_{acc_id}/insights"
 
     insights_today = fetch_data(insights_endpoint, {
         'level': 'adset',
-        'fields': 'adset_id,spend,actions',
+        'fields': 'adset_id,spend,actions,impressions',
         'date_preset': 'today',
         'action_attribution_windows': json.dumps(ATTRIBUTION_WINDOW),
         'limit': 250,
     })
     for row in insights_today:
         aid = row.get('adset_id')
-        if aid in adsets_data:
-            adsets_data[aid]['stats']['today']['s'] = float(row.get('spend', 0))
-            adsets_data[aid]['stats']['today']['l'] = get_leads(row.get('actions', []))
+        if aid in raw_candidates:
+            raw_candidates[aid]['today']['s'] = float(row.get('spend', 0))
+            raw_candidates[aid]['today']['l'] = get_leads(row.get('actions', []))
+            raw_candidates[aid]['today']['i'] = int(row.get('impressions', 0))
 
     insights_2d = fetch_data(insights_endpoint, {
         'level': 'adset',
-        'fields': 'adset_id,spend,actions',
+        'fields': 'adset_id,spend,actions,impressions',
         'time_range': last_2d_time_range,
         'action_attribution_windows': json.dumps(ATTRIBUTION_WINDOW),
         'limit': 250,
     })
     for row in insights_2d:
         aid = row.get('adset_id')
-        if aid in adsets_data:
-            adsets_data[aid]['stats']['last_2d']['s'] = float(row.get('spend', 0))
-            adsets_data[aid]['stats']['last_2d']['l'] = get_leads(row.get('actions', []))
+        if aid in raw_candidates:
+            raw_candidates[aid]['last_2d']['s'] = float(row.get('spend', 0))
+            raw_candidates[aid]['last_2d']['l'] = get_leads(row.get('actions', []))
+            raw_candidates[aid]['last_2d']['i'] = int(row.get('impressions', 0))
 
-    for aid, data in adsets_data.items():
-        s_today = data['stats']['today']['s']
-        l_today = data['stats']['today']['l']
+    unknown_campaigns = set()
+
+    for aid, raw in raw_candidates.items():
+        s_today = raw['today']['s']
+        l_today = raw['today']['l']
+        i_today = raw['today']['i']
+        s_2d = raw['last_2d']['s']
+        l_2d = raw['last_2d']['l']
+        i_2d = raw['last_2d']['i']
+
+        # Якщо за сьогодні+вчора немає ані показів, ані витрат, ані лідів — Manager цю групу не потребує.
+        has_relevant_activity = any((i_today > 0, s_today > 0, l_today > 0, i_2d > 0, s_2d > 0, l_2d > 0))
+        if not has_relevant_activity:
+            continue
+
+        parsed = parse_campaign_name(raw['campaign_name'])
+        if not parsed['valid']:
+            warning_key = raw['campaign_id'] or raw['campaign_name']
+            if warning_key not in unknown_campaigns:
+                unknown_campaigns.add(warning_key)
+                events.append(
+                    f"⚠️ <b>UNKNOWN CAMPAIGN FORMAT</b>\n"
+                    f"   Campaign: {esc(raw['campaign_name'] or '—')}\n"
+                    f"   CID: <code>{esc(raw['campaign_id'] or '—')}</code>\n"
+                    f"   ↳ {esc(parsed['reason'])}; є активність за сьогодні/вчора, але автоматика кампанію пропустила"
+                )
+            continue
+
+        tag = parsed['category']
+        base_cpl = OFFERS[tag]
+        target_cpl = base_cpl * rate * MANAGER_TARGET_CPL_FACTOR
+        limit_no_leads = base_cpl * rate * MANAGER_NO_LEAD_FACTOR
+        limit_high_cpl = base_cpl * rate * MANAGER_HIGH_SPEND_FACTOR
         cpl_today = s_today / l_today if l_today > 0 else 0.0
-        s_2d = data['stats']['last_2d']['s']
-        l_2d = data['stats']['last_2d']['l']
-
-        t_cpl = data['target_cpl']
-        l_no_leads = data['limit_no_leads']
-        l_high_cpl = data['limit_high_cpl']
 
         action = None
-        reason = ""
+        reason = ''
 
-        # 1) Швидкий стоп сьогодні без ліда
-        if s_today > l_no_leads and l_today == 0:
+        if s_today > limit_no_leads and l_today == 0:
             action = 'PAUSED'
-            reason = f"Швидкий стоп без лідів (TODAY): Витрати {s_today:.2f}{sym} > {l_no_leads:.2f}{sym}"
-
-        # 2) High-CPL stop після хоча б одного ліда
-        elif s_today > l_high_cpl and l_today >= 1 and cpl_today > t_cpl:
+            reason = f"Швидкий стоп без лідів (TODAY): Витрати {s_today:.2f}{sym} > {limit_no_leads:.2f}{sym}"
+        elif s_today > limit_high_cpl and l_today >= 1 and cpl_today > target_cpl:
             action = 'PAUSED'
-            reason = f"Збитковий CPL (TODAY): CPL {cpl_today:.2f}{sym} > {t_cpl:.2f}{sym}"
-
-        # 3) Сьогодні + вчора без лідів; працює після 10:00 за Польщею
-        elif now_poland.hour >= MANAGER_TWO_DAY_RULE_START_HOUR and s_2d > l_no_leads and l_2d == 0:
+            reason = f"Збитковий CPL (TODAY): CPL {cpl_today:.2f}{sym} > {target_cpl:.2f}{sym}"
+        elif now_poland.hour >= MANAGER_TWO_DAY_RULE_START_HOUR and s_2d > limit_no_leads and l_2d == 0:
             action = 'PAUSED'
-            reason = f"Стоп без лідів (2 DAYS): Витрати {s_2d:.2f}{sym} > {l_no_leads:.2f}{sym}"
+            reason = f"Стоп без лідів (2 DAYS): Витрати {s_2d:.2f}{sym} > {limit_no_leads:.2f}{sym}"
 
-        # 4) Доліт ліда після паузи
-        if not action and l_today >= 1 and cpl_today < t_cpl:
+        if not action and l_today >= 1 and cpl_today < target_cpl:
             action = 'ACTIVE'
-            reason = f"Доліт ліда (TODAY): CPL {cpl_today:.2f}{sym} < {t_cpl:.2f}{sym}"
+            reason = f"Доліт ліда (TODAY): CPL {cpl_today:.2f}{sym} < {target_cpl:.2f}{sym}"
 
-        if action and action != data['status']:
+        if action and action != raw['status']:
             icon = '🔴' if action == 'PAUSED' else '🟢'
             act_word = 'Вимкнено' if action == 'PAUSED' else 'Увімкнено'
             if change_entity_status(aid, action):
-                print(f"   {icon} {act_word} група: [{data['tag'].upper()}] {data['name']} (ID: {aid})", flush=True)
+                print(f"   {icon} {act_word} група: [{tag.upper()}] {raw['name']} (ID: {aid})", flush=True)
                 print(f"      ↳ Причина: {reason}", flush=True)
                 events.append(
-                    f"{icon} <b>{act_word}</b>: [{esc(data['tag'].upper())}] {esc(data['name'])}\n"
-                    f"   Campaign: {esc(data['campaign_name'])}\n"
-                    f"   CID: <code>{esc(data['campaign_id'])}</code> | AID: <code>{aid}</code>\n"
+                    f"{icon} <b>{act_word}</b>: [{esc(tag.upper())}] {esc(raw['name'])}\n"
+                    f"   Campaign: {esc(raw['campaign_name'])}\n"
+                    f"   CID: <code>{esc(raw['campaign_id'])}</code> | AID: <code>{aid}</code>\n"
                     f"   ↳ {esc(reason)}"
                 )
 
