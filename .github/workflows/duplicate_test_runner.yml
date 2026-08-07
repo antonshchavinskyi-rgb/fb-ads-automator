@@ -1,0 +1,39 @@
+name: FB Duplicate Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      adset_ids:
+        description: 'Adset IDs, comma or space separated (max 5). Creates PAUSED deep copies.'
+        required: true
+        type: string
+
+jobs:
+  duplicate-test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run duplicate test
+        env:
+          FB_ACCESS_TOKEN: ${{ secrets.FB_ACCESS_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DUPLICATE_TEST_ADSET_IDS: ${{ inputs.adset_ids }}
+        run: python fb_duplicate_test.py
+
+      - name: Upload audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fb-duplicate-test-report
+          path: duplicate_test_report.json
+          if-no-files-found: ignore
