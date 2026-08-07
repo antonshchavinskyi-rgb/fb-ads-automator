@@ -53,7 +53,7 @@ HYGIENE_MIN_AGE_DAYS = 3
 HYGIENE_NO_IMPRESSIONS_DAYS = 7
 
 # Безпечний тестовий режим Revive: True = лише показати, що БИ увімкнули, без змін у Meta
-REVIVE_DRY_RUN = True
+REVIVE_DRY_RUN = False
 
 # fb_revive.py — Recent Restart
 REVIVE_RECENT_TWO_PLUS_CPL_FACTOR = 1.00  # strict <
