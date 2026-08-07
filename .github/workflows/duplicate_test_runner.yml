@@ -1,4 +1,4 @@
-name: FB Duplicate Test
+name: FB Duplicate Test v2
 
 on:
   workflow_dispatch:
@@ -22,7 +22,7 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Run duplicate test
+      - name: Run duplicate test v2
         env:
           FB_ACCESS_TOKEN: ${{ secrets.FB_ACCESS_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -34,6 +34,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: fb-duplicate-test-report
+          name: fb-duplicate-test-v2-report
           path: duplicate_test_report.json
           if-no-files-found: ignore
