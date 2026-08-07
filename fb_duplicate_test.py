@@ -139,6 +139,125 @@ def graph_request(method, path, params=None, retries=3, stage=None):
             raise MetaRequestError(e.code, info, stage=stage)
 
 
+RELEVANT_PERMISSION_NAMES = {
+    "ads_management", "ads_read", "business_management",
+    "pages_show_list", "pages_read_engagement", "pages_manage_ads",
+    "instagram_basic", "instagram_manage_insights",
+}
+
+
+def get_api_access_diagnostics():
+    """Read token identity + granted/declined OAuth permissions. No extra secret required."""
+    diag = {
+        "identity": None,
+        "permissions": [],
+        "granted": [],
+        "declined_or_other": [],
+        "relevant": {},
+        "errors": [],
+    }
+    try:
+        diag["identity"] = graph_request(
+            "GET", "me", {"fields": "id,name"}, stage="access_diag:me"
+        )
+    except Exception as e:
+        diag["errors"].append({"stage": "me", "error": str(e)})
+
+    try:
+        rows = graph_request(
+            "GET", "me/permissions", {}, stage="access_diag:permissions"
+        ).get("data", [])
+        diag["permissions"] = rows
+        for row in rows:
+            name = row.get("permission")
+            status = row.get("status")
+            if status == "granted":
+                diag["granted"].append(name)
+            else:
+                diag["declined_or_other"].append({"permission": name, "status": status})
+        diag["granted"] = sorted(x for x in diag["granted"] if x)
+        diag["relevant"] = {
+            name: ("granted" if name in diag["granted"] else "not_granted_or_not_returned")
+            for name in sorted(RELEVANT_PERMISSION_NAMES)
+        }
+    except Exception as e:
+        diag["errors"].append({"stage": "permissions", "error": str(e)})
+    return diag
+
+
+def access_diag_summary(diag):
+    identity = diag.get("identity") or {}
+    relevant = diag.get("relevant") or {}
+    granted_relevant = [k for k, v in relevant.items() if v == "granted"]
+    missing_relevant = [k for k, v in relevant.items() if v != "granted"]
+    lines = [
+        "🔐 <b>Meta API access diagnostics</b>",
+        f"API identity: {esc(identity.get('name') or 'unknown')} • <code>{esc(identity.get('id') or 'unknown')}</code>",
+        f"Relevant granted: {esc(', '.join(granted_relevant) or 'none detected')}",
+        f"Relevant not granted/not returned: {esc(', '.join(missing_relevant) or 'none')}",
+    ]
+    if diag.get("errors"):
+        lines.append(f"Diagnostic errors: {len(diag['errors'])}")
+    lines.append("ℹ️ OAuth scopes ≠ asset-level access. Page/Instagram access is probed separately per source adset.")
+    return "\n".join(lines)
+
+
+def extract_identity_ids_from_ads(ads):
+    page_ids = set()
+    instagram_ids = set()
+    creative_ids = []
+    for ad in ads or []:
+        creative_ref = ad.get("creative") or {}
+        cid = creative_ref.get("id") if isinstance(creative_ref, dict) else None
+        if not cid:
+            continue
+        creative_ids.append(str(cid))
+        creative, _ = get_node_fields_resilient(
+            cid, ["id", "object_story_id", "object_story_spec", "instagram_user_id"],
+            stage_prefix=f"access_diag:creative:{cid}"
+        )
+        spec = creative.get("object_story_spec") or {}
+        if isinstance(spec, dict) and spec.get("page_id"):
+            page_ids.add(str(spec.get("page_id")))
+        story_id = creative.get("object_story_id")
+        if story_id and "_" in str(story_id):
+            # object_story_id normally starts with the Page ID. Use as fallback only.
+            page_ids.add(str(story_id).split("_", 1)[0])
+        if creative.get("instagram_user_id"):
+            instagram_ids.add(str(creative.get("instagram_user_id")))
+    return sorted(page_ids), sorted(instagram_ids), creative_ids
+
+
+def probe_asset(node_id, kind):
+    try:
+        data = graph_request(
+            "GET", str(node_id), {"fields": "id,name"}, stage=f"access_diag:{kind}:{node_id}"
+        )
+        return {"id": str(node_id), "kind": kind, "accessible": True, "data": data}
+    except MetaRequestError as e:
+        return {
+            "id": str(node_id), "kind": kind, "accessible": False,
+            "error": {
+                "message": e.info.get("message"), "code": e.info.get("code"),
+                "subcode": e.info.get("subcode"), "user_title": e.info.get("user_title"),
+                "user_msg": e.info.get("user_msg"),
+            },
+        }
+
+
+def get_source_asset_access(source_ads_basic):
+    page_ids, instagram_ids, creative_ids = extract_identity_ids_from_ads(source_ads_basic)
+    pages = [probe_asset(x, "page") for x in page_ids]
+    instagram = [probe_asset(x, "instagram") for x in instagram_ids]
+    return {
+        "creative_ids": creative_ids,
+        "page_ids": page_ids,
+        "instagram_ids": instagram_ids,
+        "pages": pages,
+        "instagram": instagram,
+    }
+
+
 def get_node_fields_resilient(node_id, fields, stage_prefix):
     """Fetch as many requested fields as possible without one protected field killing the test."""
     data = {"id": str(node_id)}
@@ -368,6 +487,23 @@ def test_one(source_id, suffix):
     if source_ad_unavailable:
         result["warnings"].append({"source_ads_unavailable_fields": source_ad_unavailable})
 
+    # Asset-level diagnostics: OAuth scopes alone do not prove access to the Page/IG identity
+    # used by the ad. Probe those identities before attempting the copy.
+    asset_access = get_source_asset_access(source_ads_basic)
+    result["asset_access"] = asset_access
+    PARTIAL_RESULTS[source_id] = {
+        "source_adset_id": source_id,
+        "account_id": source.get("account_id"),
+        "campaign_id": source.get("campaign_id"),
+        "asset_access": asset_access,
+    }
+    inaccessible_assets = [x for x in asset_access.get("pages", []) + asset_access.get("instagram", []) if not x.get("accessible")]
+    if inaccessible_assets:
+        result["warnings"].append({"inaccessible_assets": inaccessible_assets})
+        stage("source_identity_access", "warning", f"{len(inaccessible_assets)} inaccessible Page/IG asset(s)")
+    else:
+        stage("source_identity_access", detail=f"pages={len(asset_access.get('page_ids', []))}, ig={len(asset_access.get('instagram_ids', []))}")
+
     # 3) Native Meta deep-copy with the smallest supported parameter set.
     # Same campaign is implicit; no rename_options in the copy request. This isolates
     # the actual /copies capability from optional parameters.
@@ -485,7 +621,7 @@ def compact_summary(result):
     creative_diff_count = sum(len(x.get("creative_diffs", [])) for x in result.get("ads", []))
     icon = "✅" if result.get("critical_ok") else "⚠️"
     return (
-        f"{icon} <b>Duplicate test v2</b>\n"
+        f"{icon} <b>Duplicate test v3</b>\n"
         f"Account: <code>{esc(result.get('account_id'))}</code>\n"
         f"Source Adset: <code>{esc(result.get('source_adset_id'))}</code>\n"
         f"Copy Adset: <code>{esc(result.get('copied_adset_id'))}</code> (PAUSED)\n"
@@ -502,13 +638,20 @@ def error_summary(source_id, e, partial=None):
     copy_line = ""
     if partial.get("copied_adset_id"):
         copy_line = f"\n⚠️ Copy may already exist: <code>{esc(partial['copied_adset_id'])}</code> (should be PAUSED)"
+    access_line = ""
+    asset_access = partial.get("asset_access") or {}
+    if asset_access:
+        page_bits = [f"{x.get('id')}={'OK' if x.get('accessible') else 'NO'}" for x in asset_access.get("pages", [])]
+        ig_bits = [f"{x.get('id')}={'OK' if x.get('accessible') else 'NO'}" for x in asset_access.get("instagram", [])]
+        if page_bits or ig_bits:
+            access_line = "\nAsset access: " + esc("; ".join((["Page " + ", ".join(page_bits)] if page_bits else []) + (["IG " + ", ".join(ig_bits)] if ig_bits else [])))
     stage = e.stage if isinstance(e, MetaRequestError) else None
     detail = meta_error_summary(e) if isinstance(e, MetaRequestError) else str(e)
     return (
-        f"❌ <b>Duplicate test v2 error</b>\n"
+        f"❌ <b>Duplicate test v3 error</b>\n"
         f"Source Adset: <code>{esc(source_id)}</code>\n"
         f"Stage: <b>{esc(stage or 'unknown')}</b>"
-        f"{copy_line}\n"
+        f"{copy_line}{access_line}\n"
         f"{esc(detail)}"
     )
 
@@ -520,17 +663,21 @@ def main():
     ids = parse_ids()
     now = datetime.now(POLAND_TZ)
     suffix = f" [PYTEST {now.strftime('%Y%m%d-%H%M')}]"
+    access_diag = get_api_access_diagnostics()
     report = {
         "created_at": now.isoformat(),
         "api_version": API_VER,
-        "mode": "REAL_COPY_PAUSED_V2",
+        "mode": "REAL_COPY_PAUSED_V3",
         "source_ids": ids,
+        "api_access": access_diag,
         "results": [],
         "errors": [],
     }
 
-    print("FB duplicate test v2: native deep-copy, always PAUSED.", flush=True)
-    print("Important: v2 uses minimal copy params and stage-aware diagnostics.", flush=True)
+    print("FB duplicate test v3: native deep-copy, always PAUSED + access diagnostics.", flush=True)
+    print(json.dumps({"api_access": access_diag}, ensure_ascii=False, indent=2), flush=True)
+    send_telegram(access_diag_summary(access_diag))
+    print("Important: v3 adds token permissions and asset-access diagnostics before copy.", flush=True)
     print(f"IDs: {ids}", flush=True)
 
     for source_id in ids:
