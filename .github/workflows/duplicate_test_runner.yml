@@ -1,4 +1,4 @@
-name: FB Duplicate Test v2
+name: FB Duplicate Test v3 v2
 
 on:
   workflow_dispatch:
