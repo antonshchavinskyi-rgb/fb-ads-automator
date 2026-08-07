@@ -21,6 +21,7 @@ from fb_config import (
     MANAGER_HEARTBEAT_MINUTE_MAX,
     currency_rate,
     currency_symbol,
+    parse_campaign_name,
 )
 
 ACCESS_TOKEN = os.environ.get('FB_ACCESS_TOKEN')
@@ -48,6 +49,27 @@ def send_telegram(message):
         urllib.request.urlopen(req, timeout=10)
     except Exception as e:
         print(f" ⚠️ Не вдалося надіслати Telegram-повідомлення: {e}", flush=True)
+
+
+def send_telegram_lines(header, lines, max_chars=3800):
+    """Надсилає звіт частинами, щоб не перевищити ліміт Telegram."""
+    if not lines:
+        send_telegram(header)
+        return
+
+    chunks = []
+    current = header
+    for line in lines:
+        candidate = current + "\n\n" + line
+        if len(candidate) > max_chars and current != header:
+            chunks.append(current)
+            current = header + "\n\n" + line
+        else:
+            current = candidate
+    chunks.append(current)
+
+    for chunk in chunks:
+        send_telegram(chunk)
 
 
 def fetch_data(endpoint, params):
@@ -102,51 +124,46 @@ def change_entity_status(entity_id, new_status):
         return False
 
 
-def parse_category(campaign_name):
-    """Повертає категорію BE для звичайної або каталожної кампанії."""
-    parts = [p.strip().lower() for p in campaign_name.split('-')]
-
-    # Звичайна кампанія: offer_id - category - ...
-    if len(parts) >= 2 and parts[1] in OFFERS:
-        return parts[1]
-
-    # Каталог: category - ктг - ...
-    if parts and parts[0] in OFFERS and 'ктг' in parts:
-        return parts[0]
-
-    # Безпечний fallback для старих назв
-    for part in parts:
-        if part in OFFERS:
-            return part
-    return None
-
-
 def process_offers_logic(acc_id, currency, events):
     rate = currency_rate(currency)
     sym = currency_symbol(currency)
 
     endpoint = f"https://graph.facebook.com/{API_VER}/act_{acc_id}/adsets"
     raw_adsets = fetch_data(endpoint, {
-        'fields': 'id,name,status,effective_status,campaign{name}',
+        'fields': 'id,name,status,effective_status,campaign_id,campaign{name}',
         'limit': 250,
     })
 
     adsets_data = {}
+    unknown_campaigns = set()
     for adset in raw_adsets:
         eff_status = adset.get('effective_status', adset.get('status'))
         if eff_status not in ['ACTIVE', 'PAUSED']:
             continue
 
         campaign_name = adset.get('campaign', {}).get('name', '')
-        tag = parse_category(campaign_name)
-        if not tag:
+        campaign_id = adset.get('campaign_id', '')
+        parsed = parse_campaign_name(campaign_name)
+        if not parsed['valid']:
+            warning_key = campaign_id or campaign_name
+            if warning_key not in unknown_campaigns:
+                unknown_campaigns.add(warning_key)
+                events.append(
+                    f"⚠️ <b>UNKNOWN CAMPAIGN FORMAT</b>\n"
+                    f"   Campaign: {esc(campaign_name or '—')}\n"
+                    f"   CID: <code>{esc(campaign_id or '—')}</code>\n"
+                    f"   ↳ {esc(parsed['reason'])}; автоматика цю кампанію пропустила"
+                )
             continue
 
+        tag = parsed['category']
         base_cpl = OFFERS[tag]
         adsets_data[adset['id']] = {
             'name': adset['name'],
             'status': adset.get('status'),
             'tag': tag,
+            'campaign_id': campaign_id,
+            'campaign_name': campaign_name,
             'target_cpl': base_cpl * rate * MANAGER_TARGET_CPL_FACTOR,
             'limit_no_leads': base_cpl * rate * MANAGER_NO_LEAD_FACTOR,
             'limit_high_cpl': base_cpl * rate * MANAGER_HIGH_SPEND_FACTOR,
@@ -234,7 +251,8 @@ def process_offers_logic(acc_id, currency, events):
                 print(f"      ↳ Причина: {reason}", flush=True)
                 events.append(
                     f"{icon} <b>{act_word}</b>: [{esc(data['tag'].upper())}] {esc(data['name'])}\n"
-                    f"   ID: <code>{aid}</code>\n"
+                    f"   Campaign: {esc(data['campaign_name'])}\n"
+                    f"   CID: <code>{esc(data['campaign_id'])}</code> | AID: <code>{aid}</code>\n"
                     f"   ↳ {esc(reason)}"
                 )
 
@@ -270,13 +288,11 @@ def main():
 
     time_str = now_poland.strftime('%Y-%m-%d %H:%M')
     if all_errors:
-        text = f"⚠️ <b>FB Manager: помилки</b> ({time_str})\n\n" + "\n\n".join(all_errors)
-        if all_events:
-            text += "\n\n" + "\n\n".join(all_events)
-        send_telegram(text)
+        header = f"⚠️ <b>FB Manager: помилки</b> ({time_str})"
+        send_telegram_lines(header, all_errors + all_events)
     elif all_events:
-        text = f"🔔 <b>FB Manager: зміни</b> ({time_str})\n\n" + "\n\n".join(all_events)
-        send_telegram(text)
+        header = f"🔔 <b>FB Manager: зміни</b> ({time_str})"
+        send_telegram_lines(header, all_events)
     elif is_heartbeat_window:
         send_telegram(f"✅ FB Manager живий, змін не було ({time_str})")
 

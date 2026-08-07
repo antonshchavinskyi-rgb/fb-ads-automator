@@ -14,6 +14,7 @@ from fb_config import (
     API_VER,
     POLAND_TZ,
     ATTRIBUTION_WINDOW,
+    REVIVE_DRY_RUN,
     REVIVE_RECENT_TWO_PLUS_CPL_FACTOR,
     REVIVE_RECENT_ONE_CPL_FACTOR,
     REVIVE_DEEP_IDLE_DAYS,
@@ -21,8 +22,10 @@ from fb_config import (
     REVIVE_DEEP_TWO_PLUS_CPL_FACTOR,
     REVIVE_DEEP_ONE_CPL_FACTOR,
     REVIVE_DEEP_CAP_PER_OFFER,
+    REVIVE_DEEP_CAP_PER_CATALOG_CAMPAIGN,
     currency_rate,
     currency_symbol,
+    parse_campaign_name,
 )
 
 ACCESS_TOKEN = os.environ.get('FB_ACCESS_TOKEN')
@@ -138,31 +141,6 @@ def change_entity_status(entity_id, new_status, errors=None, context=""):
         return False
 
 
-def parse_campaign(campaign_name):
-    """
-    Повертає (offer_id, category, is_catalog).
-    Звичайна: 1389 - зал - ...
-    Каталог: бро - ктг - ...
-    """
-    parts = [p.strip().lower() for p in campaign_name.split('-')]
-    is_catalog = 'ктг' in parts
-
-    if is_catalog:
-        category = parts[0] if parts and parts[0] in OFFERS else None
-        return None, category, True
-
-    offer_id = parts[0] if parts and parts[0].isdigit() else None
-    category = parts[1] if len(parts) >= 2 and parts[1] in OFFERS else None
-
-    if not category:
-        for part in parts:
-            if part in OFFERS:
-                category = part
-                break
-
-    return offer_id, category, False
-
-
 def build_time_ranges(now_poland):
     today = now_poland.date()
 
@@ -191,7 +169,7 @@ def build_time_ranges(now_poland):
     }
 
 
-def get_account_state(acc_id, currency, time_ranges, errors):
+def get_account_state(acc_id, currency, time_ranges, errors, warnings):
     campaigns_raw = fetch_data(
         f"https://graph.facebook.com/{API_VER}/act_{acc_id}/campaigns",
         {'fields': 'id,name,status,effective_status', 'limit': 250},
@@ -214,6 +192,7 @@ def get_account_state(acc_id, currency, time_ranges, errors):
 
     candidates = {}
     rate = currency_rate(currency)
+    unknown_campaigns = set()
 
     for adset in adsets_raw:
         # Потрібен саме PAUSED адсет у ACTIVE кампанії.
@@ -225,10 +204,23 @@ def get_account_state(acc_id, currency, time_ranges, errors):
         if not campaign:
             continue
 
-        offer_id, category, is_catalog = parse_campaign(campaign.get('name', ''))
-        if not category:
+        campaign_name = campaign.get('name', '')
+        parsed = parse_campaign_name(campaign_name)
+        if not parsed['valid']:
+            warning_key = campaign_id or campaign_name
+            if warning_key not in unknown_campaigns:
+                unknown_campaigns.add(warning_key)
+                warnings.append(
+                    f"⚠️ <b>UNKNOWN CAMPAIGN FORMAT</b>\n"
+                    f"   Campaign: {esc(campaign_name or '—')}\n"
+                    f"   CID: <code>{esc(campaign_id or '—')}</code>\n"
+                    f"   ↳ {esc(parsed['reason'])}; Revive цю кампанію пропустив"
+                )
             continue
 
+        offer_id = parsed['offer_id']
+        category = parsed['category']
+        is_catalog = parsed['is_catalog']
         be = OFFERS[category] * rate
         candidates[adset['id']] = {
             'account_id': acc_id,
@@ -236,7 +228,7 @@ def get_account_state(acc_id, currency, time_ranges, errors):
             'adset_id': adset['id'],
             'adset_name': adset.get('name', ''),
             'campaign_id': campaign_id,
-            'campaign_name': campaign.get('name', ''),
+            'campaign_name': campaign_name,
             'offer_id': offer_id,
             'category': category,
             'is_catalog': is_catalog,
@@ -355,18 +347,27 @@ def qualifies_deep(candidate):
     return False, cpl
 
 
-def activate_candidate(candidate, ads_by_adset, errors):
+def activate_candidate(candidate, ads_by_adset, errors, dry_run=False):
     aid = candidate['adset_id']
+    paused_ads = [ad for ad in ads_by_adset.get(aid, []) if ad.get('status') == 'PAUSED']
+
+    if dry_run:
+        # У DRY RUN нічого не змінюємо в Meta. Лише рахуємо, скільки оголошень
+        # довелося б увімкнути разом із групою.
+        print(
+            f"   🧪 DRY RUN: would activate adset {aid} + {len(paused_ads)} paused ad(s)",
+            flush=True,
+        )
+        return True, len(paused_ads)
 
     # Спочатку вмикаємо adset. Якщо оголошення було вимкнене Hygiene — вмикаємо його після цього.
     if not change_entity_status(aid, 'ACTIVE', errors, f"adset {aid}"):
         return False, 0
 
     activated_ads = 0
-    for ad in ads_by_adset.get(aid, []):
-        if ad.get('status') == 'PAUSED':
-            if change_entity_status(ad['id'], 'ACTIVE', errors, f"ad {ad['id']} / adset {aid}"):
-                activated_ads += 1
+    for ad in paused_ads:
+        if change_entity_status(ad['id'], 'ACTIVE', errors, f"ad {ad['id']} / adset {aid}"):
+            activated_ads += 1
 
     return True, activated_ads
 
@@ -378,18 +379,20 @@ def main():
 
     now_poland = datetime.now(POLAND_TZ)
     time_ranges = build_time_ranges(now_poland)
-    print(f"🌅 [FB Revive Start] {now_poland.strftime('%Y-%m-%d %H:%M:%S')} (Poland Time)", flush=True)
+    mode_label = 'DRY RUN' if REVIVE_DRY_RUN else 'LIVE'
+    print(f"🌅 [FB Revive Start / {mode_label}] {now_poland.strftime('%Y-%m-%d %H:%M:%S')} (Poland Time)", flush=True)
     print(f"   Recent: {time_ranges['recent_label']}", flush=True)
     print(f"   Deep idle: {time_ranges['idle_label']}", flush=True)
     print(f"   Deep history: {time_ranges['history_label']}", flush=True)
 
     errors = []
+    warnings = []
     account_states = {}
     ads_maps = {}
 
     for acc_id, currency in ACCOUNTS.items():
         try:
-            candidates, ads_by_adset = get_account_state(acc_id, currency, time_ranges, errors)
+            candidates, ads_by_adset = get_account_state(acc_id, currency, time_ranges, errors, warnings)
             account_states[acc_id] = candidates
             ads_maps[acc_id] = ads_by_adset
             print(f"📊 Акаунт {acc_id} ({currency}): paused candidates = {len(candidates)}", flush=True)
@@ -411,13 +414,15 @@ def main():
 
     recent_events = []
     for candidate in recent_selected:
-        ok, activated_ads = activate_candidate(candidate, ads_maps[candidate['account_id']], errors)
+        ok, activated_ads = activate_candidate(
+            candidate, ads_maps[candidate['account_id']], errors, dry_run=REVIVE_DRY_RUN
+        )
         if not ok:
             continue
         restarted_ids.add(candidate['adset_id'])
         sym = currency_symbol(candidate['currency'])
         recent_events.append(
-            f"🟢 <b>Recent</b> [{esc(candidate['category'].upper())}] {esc(candidate['adset_name'])}\n"
+            f"{'🧪' if REVIVE_DRY_RUN else '🟢'} <b>{'DRY RUN • ' if REVIVE_DRY_RUN else ''}Recent</b> [{esc(candidate['category'].upper())}] {esc(candidate['adset_name'])}\n"
             f"   Campaign: {esc(candidate['campaign_name'])}\n"
             f"   CID: <code>{candidate['campaign_id']}</code> | AID: <code>{candidate['adset_id']}</code>\n"
             f"   {candidate['recent_leads']} лідів • CPL {candidate['recent_cpl']:.2f}{sym} • BE {candidate['be']:.2f}{sym}"
@@ -438,28 +443,36 @@ def main():
             candidate['deep_cpl'] = cpl
             candidate['deep_ratio'] = cpl / candidate['be'] if candidate['be'] else 999.0
 
-            # Звичайний товар: cap глобально по offer_id через усі акаунти.
-            # Каталог не має offer_id, тому консервативно застосовуємо той самий cap на кампанію.
+            # BE для каталогу визначає категорія на початку назви: зал/бро/сер/зол/пла.
+            # Cap при цьому рахуємо не по категорії, а по конкретній каталожній кампанії,
+            # щоб кілька ACTIVE-каталогів однієї категорії не ділили між собою один ліміт.
             if candidate['offer_id']:
-                key = f"offer:{candidate['offer_id']}"
+                key = ("offer", candidate['offer_id'])
             else:
-                key = f"catalog:{candidate['account_id']}:{candidate['campaign_id']}"
+                key = ("catalog", candidate['account_id'], candidate['campaign_id'])
             deep_groups[key].append(candidate)
 
     deep_selected = []
-    for group in deep_groups.values():
+    for key, group in deep_groups.items():
         group.sort(key=lambda x: (-x['hist_leads'], x['deep_ratio'], x['adset_id']))
-        deep_selected.extend(group[:REVIVE_DEEP_CAP_PER_OFFER])
+        cap = (
+            REVIVE_DEEP_CAP_PER_OFFER
+            if key[0] == "offer"
+            else REVIVE_DEEP_CAP_PER_CATALOG_CAMPAIGN
+        )
+        deep_selected.extend(group[:cap])
 
     deep_events = []
     for candidate in deep_selected:
-        ok, activated_ads = activate_candidate(candidate, ads_maps[candidate['account_id']], errors)
+        ok, activated_ads = activate_candidate(
+            candidate, ads_maps[candidate['account_id']], errors, dry_run=REVIVE_DRY_RUN
+        )
         if not ok:
             continue
         sym = currency_symbol(candidate['currency'])
         label = candidate['offer_id'] if candidate['offer_id'] else 'КТГ'
         deep_events.append(
-            f"♻️ <b>Deep</b> [{esc(label)} / {esc(candidate['category'].upper())}] {esc(candidate['adset_name'])}\n"
+            f"{'🧪' if REVIVE_DRY_RUN else '♻️'} <b>{'DRY RUN • ' if REVIVE_DRY_RUN else ''}Deep</b> [{esc(label)} / {esc(candidate['category'].upper())}] {esc(candidate['adset_name'])}\n"
             f"   Campaign: {esc(candidate['campaign_name'])}\n"
             f"   CID: <code>{candidate['campaign_id']}</code> | AID: <code>{candidate['adset_id']}</code>\n"
             f"   {candidate['hist_leads']} лідів • CPL {candidate['deep_cpl']:.2f}{sym} • BE {candidate['be']:.2f}{sym}"
@@ -468,20 +481,23 @@ def main():
 
     time_str = now_poland.strftime('%Y-%m-%d %H:%M')
     summary = (
-        f"🌅 <b>FB Revive</b> ({time_str})\n"
-        f"Recent: <b>{len(recent_events)}</b> | Deep: <b>{len(deep_events)}</b> | Errors: <b>{len(errors)}</b>"
+        f"🌅 <b>FB Revive — {'DRY RUN' if REVIVE_DRY_RUN else 'LIVE'}</b> ({time_str})\n"
+        f"Recent: <b>{len(recent_events)}</b> | Deep: <b>{len(deep_events)}</b> | Warnings: <b>{len(warnings)}</b> | Errors: <b>{len(errors)}</b>"
     )
+    if REVIVE_DRY_RUN:
+        summary += "\n🧪 <b>Жоден статус у Meta не змінено.</b>"
 
     lines = []
     lines.extend(recent_events)
     lines.extend(deep_events)
+    lines.extend(warnings)
 
     if errors:
         lines.append("⚠️ <b>Помилки</b>\n" + "\n".join(esc(e) for e in errors[:10]))
 
     send_telegram_lines(summary, lines)
 
-    print(f"✅ Revive завершено. Recent={len(recent_events)}, Deep={len(deep_events)}, Errors={len(errors)}", flush=True)
+    print(f"✅ Revive завершено ({mode_label}). Recent={len(recent_events)}, Deep={len(deep_events)}, Warnings={len(warnings)}, Errors={len(errors)}", flush=True)
 
 
 if __name__ == '__main__':

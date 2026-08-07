@@ -4,6 +4,7 @@ import urllib.parse
 import urllib.error
 import json
 import time
+import html
 from datetime import datetime, timezone
 
 from fb_config import (
@@ -17,6 +18,10 @@ from fb_config import (
 ACCESS_TOKEN = os.environ.get('FB_ACCESS_TOKEN')
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
+
+
+def esc(text):
+    return html.escape(str(text), quote=False)
 
 
 def send_telegram(message):
@@ -35,6 +40,27 @@ def send_telegram(message):
         urllib.request.urlopen(req, timeout=10)
     except Exception as e:
         print(f" ⚠️ Не вдалося надіслати Telegram-повідомлення: {e}", flush=True)
+
+
+def send_telegram_lines(header, lines, max_chars=3800):
+    """Надсилає звіт частинами, щоб не перевищити ліміт Telegram."""
+    if not lines:
+        send_telegram(header)
+        return
+
+    chunks = []
+    current = header
+    for line in lines:
+        candidate = current + "\n\n" + line
+        if len(candidate) > max_chars and current != header:
+            chunks.append(current)
+            current = header + "\n\n" + line
+        else:
+            current = candidate
+    chunks.append(current)
+
+    for chunk in chunks:
+        send_telegram(chunk)
 
 
 def fetch_data(endpoint, params):
@@ -97,16 +123,24 @@ def process_hygiene_logic(acc_id, events):
     # 1. Адсети: активні, старші за 3 дні, 0 показів за last_7d
     raw_adsets = fetch_data(
         f"https://graph.facebook.com/{API_VER}/act_{acc_id}/adsets",
-        {'fields': 'id,name,effective_status,created_time', 'limit': 250},
+        {'fields': 'id,name,effective_status,created_time,campaign_id,campaign{name}', 'limit': 250},
     )
 
+    adset_meta = {}
     active_adsets = {}
     for adset in raw_adsets:
+        meta = {
+            'name': adset.get('name', ''),
+            'campaign_id': adset.get('campaign_id', ''),
+            'campaign_name': adset.get('campaign', {}).get('name', ''),
+        }
+        adset_meta[adset['id']] = meta
+
         if adset.get('effective_status') != 'ACTIVE' or not adset.get('created_time'):
             continue
         created = parse_iso_time(adset['created_time'])
         if created and (now_utc - created).total_seconds() > min_age_seconds:
-            active_adsets[adset['id']] = adset['name']
+            active_adsets[adset['id']] = meta
 
     if active_adsets:
         insights = fetch_data(
@@ -122,15 +156,19 @@ def process_hygiene_logic(acc_id, events):
             row.get('adset_id') for row in insights if int(row.get('impressions', 0)) > 0
         }
 
-        for adset_id, name in active_adsets.items():
+        for adset_id, meta in active_adsets.items():
             if adset_id not in with_impressions and change_entity_status(adset_id, 'PAUSED'):
-                print(f"   🧹 Гігієна: Вимкнено неактивну групу [{name}] | ID: {adset_id}", flush=True)
-                events.append(f"🧹 Група: {name}")
+                print(f"   🧹 Гігієна: Вимкнено неактивну групу [{meta['name']}] | ID: {adset_id}", flush=True)
+                events.append(
+                    f"🧹 <b>Групу вимкнено</b>: {esc(meta['name'])}\n"
+                    f"   Campaign: {esc(meta['campaign_name'] or '—')}\n"
+                    f"   CID: <code>{esc(meta['campaign_id'] or '—')}</code> | AID: <code>{adset_id}</code>"
+                )
 
     # 2. Оголошення: активні, старші за 3 дні, 0 показів за last_7d
     raw_ads = fetch_data(
         f"https://graph.facebook.com/{API_VER}/act_{acc_id}/ads",
-        {'fields': 'id,name,effective_status,created_time', 'limit': 250},
+        {'fields': 'id,name,effective_status,created_time,adset_id', 'limit': 250},
     )
 
     active_ads = {}
@@ -139,7 +177,10 @@ def process_hygiene_logic(acc_id, events):
             continue
         created = parse_iso_time(ad['created_time'])
         if created and (now_utc - created).total_seconds() > min_age_seconds:
-            active_ads[ad['id']] = ad['name']
+            active_ads[ad['id']] = {
+                'name': ad.get('name', ''),
+                'adset_id': ad.get('adset_id', ''),
+            }
 
     if active_ads:
         insights = fetch_data(
@@ -155,10 +196,16 @@ def process_hygiene_logic(acc_id, events):
             row.get('ad_id') for row in insights if int(row.get('impressions', 0)) > 0
         }
 
-        for ad_id, name in active_ads.items():
+        for ad_id, meta in active_ads.items():
             if ad_id not in with_impressions and change_entity_status(ad_id, 'PAUSED'):
-                print(f"   🧹 Гігієна: Вимкнено неактивне оголошення [{name}] | ID: {ad_id}", flush=True)
-                events.append(f"🧹 Оголошення: {name}")
+                parent = adset_meta.get(meta['adset_id'], {})
+                print(f"   🧹 Гігієна: Вимкнено неактивне оголошення [{meta['name']}] | ID: {ad_id}", flush=True)
+                events.append(
+                    f"🧹 <b>Оголошення вимкнено</b>: {esc(meta['name'])}\n"
+                    f"   Group: {esc(parent.get('name', '—'))}\n"
+                    f"   Campaign: {esc(parent.get('campaign_name', '—'))}\n"
+                    f"   CID: <code>{esc(parent.get('campaign_id', '—'))}</code> | AID: <code>{esc(meta['adset_id'] or '—')}</code>"
+                )
 
 
 def main():
@@ -179,7 +226,7 @@ def main():
             process_hygiene_logic(acc_id, acc_events)
             all_events.extend(f"Акаунт {acc_id} ({currency}): {e}" for e in acc_events)
         except Exception as e:
-            err_msg = f"Акаунт {acc_id} ({currency}): {e}"
+            err_msg = f"Акаунт {acc_id} ({currency}): {esc(e)}"
             print(f" ❌ Помилка під час обробки гігієни акаунта {acc_id}: {e}", flush=True)
             all_errors.append(err_msg)
 
@@ -187,13 +234,11 @@ def main():
 
     time_str = now_poland.strftime('%Y-%m-%d %H:%M')
     if all_errors:
-        text = f"⚠️ <b>FB Hygiene: помилки</b> ({time_str})\n\n" + "\n".join(all_errors)
-        if all_events:
-            text += "\n\n" + "\n".join(all_events)
-        send_telegram(text)
+        header = f"⚠️ <b>FB Hygiene: помилки</b> ({time_str})"
+        send_telegram_lines(header, all_errors + all_events)
     elif all_events:
-        text = f"🧹 <b>FB Hygiene: очищено</b> ({time_str})\n\n" + "\n".join(all_events)
-        send_telegram(text)
+        header = f"🧹 <b>FB Hygiene: очищено</b> ({time_str})"
+        send_telegram_lines(header, all_events)
     else:
         send_telegram(f"✅ FB Hygiene живий, чистити не було чого ({time_str})")
 
