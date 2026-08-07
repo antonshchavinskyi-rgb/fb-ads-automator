@@ -16,37 +16,41 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 MAX_TEST_ADSETS = 5
-MAX_SYNC_CHILD_ADS = 3  # conservative sync deep-copy guard
 REPORT_FILE = "duplicate_test_report.json"
 
+# Core fields we actually need to verify settings. If Meta rejects any field,
+# the resilient reader splits the request and records the exact unavailable field
+# instead of aborting the whole test.
 ADSET_FIELDS = [
     "id", "name", "account_id", "campaign_id", "status", "effective_status",
-    "bid_strategy", "bid_amount", "bid_constraints", "bid_info", "billing_event",
-    "optimization_goal", "optimization_sub_event", "daily_budget", "lifetime_budget",
-    "start_time", "end_time", "attribution_spec", "promoted_object", "destination_type",
-    "pacing_type", "targeting", "is_dynamic_creative", "recurring_budget_semantics",
-    "dsa_beneficiary", "dsa_payor", "existing_customer_budget_percentage",
-    "frequency_control_specs", "automatic_manual_state", "source_adset_id",
+    "bid_strategy", "bid_amount", "bid_constraints", "billing_event",
+    "optimization_goal", "daily_budget", "lifetime_budget", "start_time", "end_time",
+    "attribution_spec", "promoted_object", "destination_type", "pacing_type",
+    "targeting", "is_dynamic_creative", "recurring_budget_semantics",
 ]
 
 AD_FIELDS = [
     "id", "name", "status", "effective_status", "adset_id", "campaign_id",
     "creative", "tracking_specs", "conversion_specs", "conversion_domain",
-    "creative_automation_spec", "creative_asset_groups_spec", "source_ad_id",
+    "source_ad_id",
 ]
 
+# Fields most relevant to checking whether Meta silently changes creative automation/
+# Advantage+ enhancements. These are optional probes: lack of permission for one field
+# does not abort the duplicate test.
 CREATIVE_FIELDS = [
     "id", "name", "object_story_id", "object_story_spec", "asset_feed_spec",
     "degrees_of_freedom_spec", "creative_sourcing_spec", "format_transformation_spec",
     "generative_asset_spec", "product_set_id", "url_tags", "instagram_user_id",
     "source_facebook_post_id", "source_instagram_media_id", "template_url",
-    "template_url_spec", "platform_customizations", "authorization_category",
-    "dynamic_ad_voice", "product_suggestion_settings", "recommender_settings",
-    "place_page_set_id", "destination_set_id", "destination_spec",
-    "omnichannel_link_spec", "contextual_multi_ads",
+    "template_url_spec", "platform_customizations", "dynamic_ad_voice",
+    "product_suggestion_settings", "recommender_settings", "place_page_set_id",
+    "destination_set_id", "destination_spec", "omnichannel_link_spec",
+    "contextual_multi_ads",
 ]
 
 TRANSIENT_CODES = {4, 17, 80004}
+PARTIAL_RESULTS = {}
 
 
 def esc(text):
@@ -71,7 +75,7 @@ def send_telegram(message):
         print(f"Telegram error: {e}", flush=True)
 
 
-def _decode_error(body):
+def decode_meta_error(body):
     try:
         parsed = json.loads(body)
         err = parsed.get("error", {})
@@ -80,13 +84,33 @@ def _decode_error(body):
             "code": err.get("code"),
             "subcode": err.get("error_subcode"),
             "is_transient": err.get("is_transient", False),
+            "user_title": err.get("error_user_title"),
+            "user_msg": err.get("error_user_msg"),
+            "fbtrace_id": err.get("fbtrace_id"),
             "raw": parsed,
         }
     except Exception:
-        return {"message": body, "code": None, "subcode": None, "is_transient": False, "raw": body}
+        return {
+            "message": body, "code": None, "subcode": None,
+            "is_transient": False, "user_title": None, "user_msg": None,
+            "fbtrace_id": None, "raw": body,
+        }
 
 
-def graph_request(method, path, params=None, retries=3):
+class MetaRequestError(RuntimeError):
+    def __init__(self, http_status, info, stage=None):
+        self.http_status = http_status
+        self.info = info
+        self.stage = stage
+        text = f"Meta HTTP {http_status}: {info.get('message')} (code={info.get('code')}, subcode={info.get('subcode')})"
+        if info.get("user_title"):
+            text += f" | {info.get('user_title')}"
+        if info.get("user_msg"):
+            text += f" | {info.get('user_msg')}"
+        super().__init__(text)
+
+
+def graph_request(method, path, params=None, retries=3, stage=None):
     params = dict(params or {})
     params["access_token"] = ACCESS_TOKEN
     url = f"https://graph.facebook.com/{API_VER}/{path.lstrip('/')}"
@@ -101,72 +125,108 @@ def graph_request(method, path, params=None, retries=3):
                 data = urllib.parse.urlencode(params).encode("utf-8")
                 req = urllib.request.Request(url, data=data, method="POST")
             with urllib.request.urlopen(req, timeout=60) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+                body = resp.read().decode("utf-8")
+                return json.loads(body) if body else {}
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
-            info = _decode_error(body)
+            info = decode_meta_error(body)
             transient = info.get("is_transient") or info.get("code") in TRANSIENT_CODES
             if transient and attempt < retries:
                 delay = delays[min(attempt, len(delays) - 1)]
-                print(f"Meta transient error {info.get('code')}; retry in {delay}s: {info.get('message')}", flush=True)
+                print(f"[{stage or 'request'}] Meta transient error {info.get('code')}; retry in {delay}s", flush=True)
                 time.sleep(delay)
                 continue
-            raise RuntimeError(
-                f"Meta HTTP {e.code}: {info.get('message')} (code={info.get('code')}, subcode={info.get('subcode')})"
-            )
-        except Exception:
-            if attempt < retries:
-                delay = delays[min(attempt, len(delays) - 1)]
-                time.sleep(delay)
-                continue
-            raise
+            raise MetaRequestError(e.code, info, stage=stage)
 
 
-def get_node(node_id, fields):
-    return graph_request("GET", str(node_id), {"fields": ",".join(fields)})
+def get_node_fields_resilient(node_id, fields, stage_prefix):
+    """Fetch as many requested fields as possible without one protected field killing the test."""
+    data = {"id": str(node_id)}
+    unavailable = []
 
-
-def get_edge(node_id, edge, fields, limit=100):
-    results = []
-    path = f"{node_id}/{edge}"
-    data = graph_request("GET", path, {"fields": ",".join(fields), "limit": limit})
-    results.extend(data.get("data", []))
-    next_url = data.get("paging", {}).get("next")
-    while next_url:
-        # paging URLs already contain token/params; use directly
+    def fetch_group(group):
+        if not group:
+            return
         try:
-            with urllib.request.urlopen(next_url, timeout=60) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            results.extend(data.get("data", []))
-            next_url = data.get("paging", {}).get("next")
-        except Exception as e:
-            raise RuntimeError(f"Paging error for {path}: {e}")
-    return results
+            result = graph_request(
+                "GET", str(node_id), {"fields": ",".join(group)},
+                stage=f"{stage_prefix}:{','.join(group)}"
+            )
+            data.update(result)
+        except MetaRequestError as e:
+            if len(group) == 1:
+                unavailable.append({"field": group[0], "error": e.info})
+                return
+            mid = len(group) // 2
+            fetch_group(group[:mid])
+            fetch_group(group[mid:])
+
+    # Fetch in moderate chunks first; split only on failure.
+    chunk_size = 8
+    for i in range(0, len(fields), chunk_size):
+        fetch_group(fields[i:i + chunk_size])
+    return data, unavailable
 
 
-def get_ads_with_creatives(adset_id):
-    ads = get_edge(adset_id, "ads", AD_FIELDS, limit=50)
-    out = []
+def get_edge_fields_resilient(node_id, edge, fields, limit=50, stage_prefix="edge"):
+    """Same idea as resilient node fetch, but returns rows merged by id."""
+    rows_by_id = {}
+    unavailable = []
+
+    def fetch_group(group):
+        if not group:
+            return
+        try:
+            result = graph_request(
+                "GET", f"{node_id}/{edge}",
+                {"fields": ",".join(group), "limit": limit},
+                stage=f"{stage_prefix}:{','.join(group)}"
+            )
+            for row in result.get("data", []):
+                rid = str(row.get("id"))
+                rows_by_id.setdefault(rid, {}).update(row)
+        except MetaRequestError as e:
+            if len(group) == 1:
+                unavailable.append({"field": group[0], "error": e.info})
+                return
+            mid = len(group) // 2
+            fetch_group(group[:mid])
+            fetch_group(group[mid:])
+
+    # Always include id so rows can be merged.
+    fields = list(dict.fromkeys(["id"] + list(fields)))
+    chunk_size = 6
+    for i in range(0, len(fields), chunk_size):
+        fetch_group(fields[i:i + chunk_size])
+    return list(rows_by_id.values()), unavailable
+
+
+def get_ads_with_creatives_resilient(adset_id, stage_prefix):
+    ads, ad_unavailable = get_edge_fields_resilient(
+        adset_id, "ads", AD_FIELDS, limit=50, stage_prefix=f"{stage_prefix}:ads"
+    )
+    creative_unavailable = []
     for ad in ads:
-        ad = dict(ad)
         creative_ref = ad.get("creative") or {}
         creative_id = creative_ref.get("id") if isinstance(creative_ref, dict) else None
-        creative = None
         if creative_id:
-            try:
-                creative = get_node(creative_id, CREATIVE_FIELDS)
-            except Exception as e:
-                creative = {"id": creative_id, "_fetch_error": str(e)}
-        ad["_creative_full"] = creative
-        out.append(ad)
-    return out
+            creative, unavailable = get_node_fields_resilient(
+                creative_id, CREATIVE_FIELDS, stage_prefix=f"{stage_prefix}:creative:{creative_id}"
+            )
+            ad["_creative_full"] = creative
+            for item in unavailable:
+                item = dict(item)
+                item["creative_id"] = creative_id
+                creative_unavailable.append(item)
+        else:
+            ad["_creative_full"] = None
+    return ads, ad_unavailable, creative_unavailable
 
 
 def normalized(value):
     if isinstance(value, dict):
         return {k: normalized(v) for k, v in sorted(value.items())}
     if isinstance(value, list):
-        # preserve list semantics but normalize items
         return [normalized(v) for v in value]
     return value
 
@@ -183,29 +243,26 @@ def diff_dict(src, dst, ignore=None, path=""):
         p = f"{path}.{key}" if path else key
         a, b = src.get(key), dst.get(key)
         if isinstance(a, dict) and isinstance(b, dict):
-            diffs.extend(diff_dict(a, b, ignore=set(), path=p))
+            diffs.extend(diff_dict(a, b, path=p))
         elif normalized(a) != normalized(b):
             diffs.append({"field": p, "source": a, "copy": b})
     return diffs
 
 
-def adset_diffs(src, dst):
-    return diff_dict(src, dst, ignore={
-        "id", "name", "status", "effective_status", "source_adset_id", "start_time"
-    })
-
-
-def ad_diffs(src, dst):
-    # creative refs are compared through full creative payload below
-    s = {k: v for k, v in src.items() if k != "_creative_full"}
-    d = {k: v for k, v in dst.items() if k != "_creative_full"}
-    return diff_dict(s, d, ignore={
-        "id", "name", "status", "effective_status", "adset_id", "source_ad_id", "creative"
-    })
-
-
-def creative_diffs(src, dst):
-    return diff_dict(src or {}, dst or {}, ignore={"id", "name"})
+def find_value(obj, key):
+    if isinstance(obj, dict):
+        if key in obj:
+            return obj.get(key)
+        for v in obj.values():
+            found = find_value(v, key)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for v in obj:
+            found = find_value(v, key)
+            if found is not None:
+                return found
+    return None
 
 
 def parse_ids():
@@ -224,105 +281,160 @@ def parse_ids():
     return ids
 
 
-def wait_for_ads(adset_id, expected_min=1, tries=8):
-    for i in range(tries):
-        ads = get_ads_with_creatives(adset_id)
-        if len(ads) >= expected_min:
-            return ads
-        time.sleep(3 + i * 2)
-    return get_ads_with_creatives(adset_id)
-
-
-def map_ads(copy_response, source_ads, copied_ads):
-    mappings = {}
-    for row in copy_response.get("ad_object_ids", []) or []:
-        if row.get("ad_object_type") == "ad":
-            mappings[str(row.get("source_id"))] = str(row.get("copied_id"))
-
-    copied_by_id = {str(a.get("id")): a for a in copied_ads}
-    pairs = []
+def pair_ads(source_ads, copied_ads):
+    """Prefer source_ad_id mapping; then same creative id; then position."""
+    copy_by_source = {str(a.get("source_ad_id")): a for a in copied_ads if a.get("source_ad_id")}
     used = set()
-    for s in source_ads:
-        sid = str(s.get("id"))
-        cid = mappings.get(sid)
-        c = copied_by_id.get(cid) if cid else None
-        if c:
-            used.add(str(c.get("id")))
-        pairs.append((s, c))
+    pairs = []
+    for src in source_ads:
+        src_id = str(src.get("id"))
+        dst = copy_by_source.get(src_id)
+        if dst:
+            used.add(str(dst.get("id")))
+        pairs.append([src, dst])
 
-    # fallback by position for anything not mapped
     leftovers = [a for a in copied_ads if str(a.get("id")) not in used]
-    for idx, (s, c) in enumerate(pairs):
-        if c is None and leftovers:
-            pairs[idx] = (s, leftovers.pop(0))
-    return pairs
+    for pair in pairs:
+        if pair[1] is None and leftovers:
+            pair[1] = leftovers.pop(0)
+    return [(a, b) for a, b in pairs]
 
 
-def find_value(obj, key):
-    if isinstance(obj, dict):
-        if key in obj:
-            return obj.get(key)
-        for v in obj.values():
-            found = find_value(v, key)
-            if found is not None:
-                return found
-    if isinstance(obj, list):
-        for v in obj:
-            found = find_value(v, key)
-            if found is not None:
-                return found
-    return None
+def compare_adset(src, dst):
+    return diff_dict(src, dst, ignore={
+        "id", "name", "status", "effective_status", "start_time", "end_time"
+    })
 
 
-def test_one(source_id, test_suffix):
-    print(f"\n=== SOURCE ADSET {source_id} ===", flush=True)
-    source = get_node(source_id, ADSET_FIELDS)
-    source_ads = get_ads_with_creatives(source_id)
-    if not source_ads:
-        raise RuntimeError("Source adset has no ads; deep-copy test aborted.")
-    if len(source_ads) > MAX_SYNC_CHILD_ADS:
-        raise RuntimeError(
-            f"Source has {len(source_ads)} child ads. Safety stop: sync deep-copy test allows <= {MAX_SYNC_CHILD_ADS}."
-        )
+def compare_ad(src, dst):
+    src_core = {k: v for k, v in (src or {}).items() if k != "_creative_full"}
+    dst_core = {k: v for k, v in (dst or {}).items() if k != "_creative_full"}
+    return diff_dict(src_core, dst_core, ignore={
+        "id", "name", "status", "effective_status", "adset_id", "source_ad_id", "creative"
+    })
 
-    params = {
-        "campaign_id": source.get("campaign_id"),
-        "deep_copy": "true",
-        "status_option": "PAUSED",
-        "rename_options": json.dumps({
-            "rename_strategy": "DEEP_RENAME",
-            "rename_suffix": test_suffix,
-        }, ensure_ascii=False),
+
+def compare_creative(src, dst):
+    return diff_dict(src or {}, dst or {}, ignore={"id", "name"})
+
+
+def meta_error_summary(e):
+    info = e.info if isinstance(e, MetaRequestError) else {}
+    parts = [str(e)]
+    if info.get("user_title"):
+        parts.append(f"Title: {info['user_title']}")
+    if info.get("user_msg"):
+        parts.append(f"Detail: {info['user_msg']}")
+    if info.get("fbtrace_id"):
+        parts.append(f"fbtrace_id: {info['fbtrace_id']}")
+    return " | ".join(parts)
+
+
+def test_one(source_id, suffix):
+    result = {
+        "source_adset_id": source_id,
+        "copy_created": False,
+        "copied_adset_id": None,
+        "stages": [],
+        "warnings": [],
+        "errors": [],
     }
-    copy_response = graph_request("POST", f"{source_id}/copies", params)
-    copied_id = str(copy_response.get("copied_adset_id") or "")
+
+    def stage(name, status="ok", detail=None):
+        row = {"stage": name, "status": status}
+        if detail is not None:
+            row["detail"] = detail
+        result["stages"].append(row)
+        print(f"[{source_id}] {name}: {status}" + (f" | {detail}" if detail else ""), flush=True)
+
+    # 1) Minimal/core source read. No creative inspection yet.
+    source, source_unavailable = get_node_fields_resilient(
+        source_id, ADSET_FIELDS, stage_prefix=f"source_adset:{source_id}"
+    )
+    if not source.get("campaign_id") or not source.get("account_id"):
+        raise RuntimeError("Cannot read source account_id/campaign_id; aborting before copy.")
+    stage("source_adset_read")
+    if source_unavailable:
+        result["warnings"].append({"source_adset_unavailable_fields": source_unavailable})
+        stage("source_adset_optional_fields", "warning", f"{len(source_unavailable)} unavailable")
+
+    # 2) Count/read source child ads without creative deep inspection.
+    source_ads_basic, source_ad_unavailable = get_edge_fields_resilient(
+        source_id, "ads", AD_FIELDS, limit=50, stage_prefix=f"source_ads:{source_id}"
+    )
+    if not source_ads_basic:
+        raise RuntimeError("Source adset has no readable child ads; aborting before copy.")
+    stage("source_ads_read", detail=f"{len(source_ads_basic)} ad(s)")
+    if source_ad_unavailable:
+        result["warnings"].append({"source_ads_unavailable_fields": source_ad_unavailable})
+
+    # 3) Native Meta deep-copy with the smallest supported parameter set.
+    # Same campaign is implicit; no rename_options in the copy request. This isolates
+    # the actual /copies capability from optional parameters.
+    copy_response = graph_request(
+        "POST", f"{source_id}/copies",
+        {"deep_copy": "true", "status_option": "PAUSED"},
+        stage="adset_copy_post"
+    )
+    copied_id = str(copy_response.get("copied_adset_id") or copy_response.get("id") or "")
     if not copied_id:
-        raise RuntimeError(f"Copy response has no copied_adset_id: {copy_response}")
+        raise RuntimeError(f"Copy endpoint returned no copied_adset_id: {copy_response}")
+    result["copy_created"] = True
+    result["copied_adset_id"] = copied_id
+    PARTIAL_RESULTS[source_id] = {"copied_adset_id": copied_id, "copy_created": True}
+    result["copy_response"] = copy_response
+    stage("copy_created", detail=copied_id)
 
-    # read-after-write is supported, but child ads can take a few seconds to materialize
-    time.sleep(2)
-    copied = get_node(copied_id, ADSET_FIELDS)
-    copied_ads = wait_for_ads(copied_id, expected_min=len(source_ads))
+    # 4) Rename in a separate call so rename_options cannot break the copy itself.
+    source_name = source.get("name") or f"source_{source_id}"
+    desired_name = f"{source_name}{suffix}"
+    try:
+        graph_request("POST", copied_id, {"name": desired_name, "status": "PAUSED"}, stage="rename_copy")
+        stage("copy_renamed")
+    except Exception as e:
+        result["warnings"].append({"rename_error": str(e)})
+        stage("copy_renamed", "warning", str(e))
 
-    a_diffs = adset_diffs(source, copied)
-    ad_pairs = map_ads(copy_response, source_ads, copied_ads)
+    # Give child ads a moment to materialize.
+    time.sleep(4)
+
+    # 5) Full resilient audit after copy. Optional inaccessible fields are warnings.
+    copied, copied_unavailable = get_node_fields_resilient(
+        copied_id, ADSET_FIELDS, stage_prefix=f"copied_adset:{copied_id}"
+    )
+    source_ads, src_ad_unavail, src_creative_unavail = get_ads_with_creatives_resilient(
+        source_id, stage_prefix=f"source_full:{source_id}"
+    )
+    copied_ads, dst_ad_unavail, dst_creative_unavail = get_ads_with_creatives_resilient(
+        copied_id, stage_prefix=f"copy_full:{copied_id}"
+    )
+    stage("post_copy_audit", detail=f"ads {len(source_ads)}→{len(copied_ads)}")
+
+    audit_unavailable = {
+        "copied_adset": copied_unavailable,
+        "source_ads": src_ad_unavail,
+        "source_creatives": src_creative_unavail,
+        "copied_ads": dst_ad_unavail,
+        "copied_creatives": dst_creative_unavail,
+    }
+    if any(audit_unavailable.values()):
+        result["warnings"].append({"audit_unavailable_fields": audit_unavailable})
+
+    adset_diffs = compare_adset(source, copied)
     ad_reports = []
-    for src_ad, dst_ad in ad_pairs:
+    for src_ad, dst_ad in pair_ads(source_ads, copied_ads):
         if dst_ad is None:
             ad_reports.append({
-                "source_ad_id": src_ad.get("id"),
-                "copied_ad_id": None,
-                "missing_copy": True,
-                "ad_diffs": [],
-                "creative_diffs": [],
+                "source_ad_id": src_ad.get("id"), "copied_ad_id": None,
+                "missing_copy": True, "ad_diffs": [], "creative_diffs": []
             })
             continue
         ad_reports.append({
             "source_ad_id": src_ad.get("id"),
             "copied_ad_id": dst_ad.get("id"),
             "missing_copy": False,
-            "ad_diffs": ad_diffs(src_ad, dst_ad),
-            "creative_diffs": creative_diffs(src_ad.get("_creative_full"), dst_ad.get("_creative_full")),
+            "ad_diffs": compare_ad(src_ad, dst_ad),
+            "creative_diffs": compare_creative(src_ad.get("_creative_full"), dst_ad.get("_creative_full")),
             "source_creative_id": (src_ad.get("creative") or {}).get("id"),
             "copied_creative_id": (dst_ad.get("creative") or {}).get("id"),
         })
@@ -332,13 +444,11 @@ def test_one(source_id, test_suffix):
     source_product_set = find_value(source.get("promoted_object"), "product_set_id")
     copied_product_set = find_value(copied.get("promoted_object"), "product_set_id")
 
-    result = {
-        "source_adset_id": source_id,
-        "copied_adset_id": copied_id,
-        "source_name": source.get("name"),
-        "copied_name": copied.get("name"),
+    result.update({
         "account_id": source.get("account_id"),
         "campaign_id": source.get("campaign_id"),
+        "source_name": source.get("name"),
+        "copied_name": copied.get("name"),
         "source_status": source.get("status"),
         "copied_status": copied.get("status"),
         "source_ads_count": len(source_ads),
@@ -349,60 +459,85 @@ def test_one(source_id, test_suffix):
         "source_product_set_id": source_product_set,
         "copied_product_set_id": copied_product_set,
         "product_set_match": source_product_set == copied_product_set,
-        "adset_diffs": a_diffs,
+        "adset_diffs": adset_diffs,
         "ads": ad_reports,
-        "copy_response": copy_response,
         "source_adset": source,
         "copied_adset": copied,
-    }
+    })
+
     result["critical_ok"] = (
         copied.get("status") == "PAUSED"
         and len(source_ads) == len(copied_ads)
         and result["pixel_match"]
         and result["product_set_match"]
-        and not a_diffs
-        and all(not x.get("missing_copy") and not x.get("ad_diffs") and not x.get("creative_diffs") for x in ad_reports)
+        and not adset_diffs
+        and all(
+            not x.get("missing_copy") and not x.get("ad_diffs") and not x.get("creative_diffs")
+            for x in ad_reports
+        )
     )
     return result
 
 
 def compact_summary(result):
-    diff_count = len(result.get("adset_diffs", []))
-    creative_diff_count = sum(len(x.get("creative_diffs", [])) for x in result.get("ads", []))
+    adset_diff_count = len(result.get("adset_diffs", []))
     ad_diff_count = sum(len(x.get("ad_diffs", [])) for x in result.get("ads", []))
+    creative_diff_count = sum(len(x.get("creative_diffs", [])) for x in result.get("ads", []))
     icon = "✅" if result.get("critical_ok") else "⚠️"
     return (
-        f"{icon} <b>Duplicate test</b>\n"
+        f"{icon} <b>Duplicate test v2</b>\n"
         f"Account: <code>{esc(result.get('account_id'))}</code>\n"
         f"Source Adset: <code>{esc(result.get('source_adset_id'))}</code>\n"
         f"Copy Adset: <code>{esc(result.get('copied_adset_id'))}</code> (PAUSED)\n"
         f"Ads: {result.get('source_ads_count')} → {result.get('copied_ads_count')}\n"
         f"Pixel: <code>{esc(result.get('source_pixel_id'))}</code> → <code>{esc(result.get('copied_pixel_id'))}</code> {'✅' if result.get('pixel_match') else '❌'}\n"
         f"Product set: <code>{esc(result.get('source_product_set_id'))}</code> → <code>{esc(result.get('copied_product_set_id'))}</code> {'✅' if result.get('product_set_match') else '❌'}\n"
-        f"Diffs: adset={diff_count}, ad={ad_diff_count}, creative={creative_diff_count}"
+        f"Diffs: adset={adset_diff_count}, ad={ad_diff_count}, creative={creative_diff_count}\n"
+        f"Warnings: {len(result.get('warnings', []))}"
+    )
+
+
+def error_summary(source_id, e, partial=None):
+    partial = partial or {}
+    copy_line = ""
+    if partial.get("copied_adset_id"):
+        copy_line = f"\n⚠️ Copy may already exist: <code>{esc(partial['copied_adset_id'])}</code> (should be PAUSED)"
+    stage = e.stage if isinstance(e, MetaRequestError) else None
+    detail = meta_error_summary(e) if isinstance(e, MetaRequestError) else str(e)
+    return (
+        f"❌ <b>Duplicate test v2 error</b>\n"
+        f"Source Adset: <code>{esc(source_id)}</code>\n"
+        f"Stage: <b>{esc(stage or 'unknown')}</b>"
+        f"{copy_line}\n"
+        f"{esc(detail)}"
     )
 
 
 def main():
     if not ACCESS_TOKEN:
         raise SystemExit("FB_ACCESS_TOKEN is missing")
+
     ids = parse_ids()
     now = datetime.now(POLAND_TZ)
     suffix = f" [PYTEST {now.strftime('%Y%m%d-%H%M')}]"
     report = {
         "created_at": now.isoformat(),
         "api_version": API_VER,
-        "mode": "REAL_COPY_PAUSED",
+        "mode": "REAL_COPY_PAUSED_V2",
         "source_ids": ids,
         "results": [],
         "errors": [],
     }
 
-    print("FB duplicate test: REAL copies will be created, but always PAUSED.", flush=True)
+    print("FB duplicate test v2: native deep-copy, always PAUSED.", flush=True)
+    print("Important: v2 uses minimal copy params and stage-aware diagnostics.", flush=True)
     print(f"IDs: {ids}", flush=True)
+
     for source_id in ids:
+        partial = {"source_adset_id": source_id, "copied_adset_id": None}
         try:
             result = test_one(source_id, suffix)
+            partial.update(result)
             report["results"].append(result)
             print(json.dumps({
                 "source": source_id,
@@ -411,19 +546,28 @@ def main():
                 "pixel_match": result.get("pixel_match"),
                 "product_set_match": result.get("product_set_match"),
                 "adset_diffs": len(result.get("adset_diffs", [])),
+                "warnings": len(result.get("warnings", [])),
             }, ensure_ascii=False, indent=2), flush=True)
             send_telegram(compact_summary(result))
         except Exception as e:
-            msg = f"Source adset {source_id}: {e}"
-            report["errors"].append(msg)
-            print(f"ERROR: {msg}", flush=True)
-            send_telegram(f"❌ <b>Duplicate test error</b>\nAdset: <code>{esc(source_id)}</code>\n{esc(e)}")
+            partial.update(PARTIAL_RESULTS.get(source_id, {}))
+            err_row = {
+                "source_adset_id": source_id,
+                "error": str(e),
+                "stage": e.stage if isinstance(e, MetaRequestError) else None,
+                "meta": e.info if isinstance(e, MetaRequestError) else None,
+                "copied_adset_id": partial.get("copied_adset_id"),
+            }
+            report["errors"].append(err_row)
+            print(f"ERROR [{source_id}]: {err_row}", flush=True)
+            send_telegram(error_summary(source_id, e, partial=partial))
 
     with open(REPORT_FILE, "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
 
     print(f"\nReport saved: {REPORT_FILE}", flush=True)
-    print("All created test copies are PAUSED. Inspect them in Ads Manager before deleting.", flush=True)
+    print("Any copy created by this test is PAUSED. Inspect in Ads Manager before deleting.", flush=True)
+
     if report["errors"]:
         sys.exit(1)
 
