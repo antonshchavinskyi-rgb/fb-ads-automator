@@ -1,0 +1,488 @@
+import os
+import urllib.request
+import urllib.parse
+import urllib.error
+import json
+import time
+import html
+from collections import defaultdict
+from datetime import datetime, timedelta
+
+from fb_config import (
+    ACCOUNTS,
+    OFFERS,
+    API_VER,
+    POLAND_TZ,
+    ATTRIBUTION_WINDOW,
+    REVIVE_RECENT_TWO_PLUS_CPL_FACTOR,
+    REVIVE_RECENT_ONE_CPL_FACTOR,
+    REVIVE_DEEP_IDLE_DAYS,
+    REVIVE_DEEP_HISTORY_DAYS,
+    REVIVE_DEEP_TWO_PLUS_CPL_FACTOR,
+    REVIVE_DEEP_ONE_CPL_FACTOR,
+    REVIVE_DEEP_CAP_PER_OFFER,
+    currency_rate,
+    currency_symbol,
+)
+
+ACCESS_TOKEN = os.environ.get('FB_ACCESS_TOKEN')
+TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
+TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
+
+
+def esc(text):
+    return html.escape(str(text), quote=False)
+
+
+def send_telegram(message):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print(" ⚠️ TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID не задані — сповіщення пропущено.", flush=True)
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    data = urllib.parse.urlencode({
+        'chat_id': TELEGRAM_CHAT_ID,
+        'text': message,
+        'parse_mode': 'HTML',
+        'disable_web_page_preview': 'true',
+    }).encode('utf-8')
+    try:
+        req = urllib.request.Request(url, data=data)
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as e:
+        print(f" ⚠️ Не вдалося надіслати Telegram-повідомлення: {e}", flush=True)
+
+
+def send_telegram_lines(header, lines, max_chars=3800):
+    """Надсилає один або кілька компактних повідомлень без ризику перевищити Telegram limit."""
+    if not lines:
+        send_telegram(header)
+        return
+
+    chunks = []
+    current = header
+    for line in lines:
+        candidate = current + "\n\n" + line
+        if len(candidate) > max_chars and current != header:
+            chunks.append(current)
+            current = header + "\n\n" + line
+        else:
+            current = candidate
+    chunks.append(current)
+
+    for chunk in chunks:
+        send_telegram(chunk)
+
+
+def fetch_data(endpoint, params, errors=None, context=""):
+    params = dict(params)
+    params['access_token'] = ACCESS_TOKEN
+    query_string = urllib.parse.urlencode(params)
+    url = f"{endpoint}?{query_string}"
+
+    results = []
+    while url:
+        time.sleep(0.1)
+        try:
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req) as response:
+                data = json.loads(response.read().decode('utf-8'))
+                results.extend(data.get('data', []))
+                url = data.get('paging', {}).get('next') if 'paging' in data else None
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode('utf-8')
+            if 'User request limit reached' in error_body or '"code":17' in error_body:
+                print(" ⏳ Ліміт запитів Meta (Code 17). Пауза 15 сек...", flush=True)
+                time.sleep(15)
+                continue
+            msg = f"API Meta HTTP {e.code} {context}: {error_body}"
+            print(f" ❌ {msg}", flush=True)
+            if errors is not None:
+                errors.append(msg)
+            break
+        except Exception as e:
+            msg = f"Помилка з'єднання {context}: {e}"
+            print(f" ⚠️ {msg}", flush=True)
+            if errors is not None:
+                errors.append(msg)
+            break
+    return results
+
+
+def get_leads(actions_list):
+    for action in actions_list:
+        if action.get('action_type') in ['offsite_conversion.fb_pixel_lead', 'lead']:
+            return int(float(action.get('value', 0)))
+    return 0
+
+
+def change_entity_status(entity_id, new_status, errors=None, context=""):
+    time.sleep(0.1)
+    url = f"https://graph.facebook.com/{API_VER}/{entity_id}"
+    data = urllib.parse.urlencode({'status': new_status, 'access_token': ACCESS_TOKEN}).encode('utf-8')
+    try:
+        req = urllib.request.Request(url, data=data)
+        with urllib.request.urlopen(req):
+            return True
+    except urllib.error.HTTPError as e:
+        body = e.read().decode('utf-8')
+        msg = f"HTTP {e.code} при зміні статусу {context or entity_id}: {body}"
+        print(f" ❌ {msg}", flush=True)
+        if errors is not None:
+            errors.append(msg)
+        return False
+    except Exception as e:
+        msg = f"Помилка зміни статусу {context or entity_id}: {e}"
+        print(f" ❌ {msg}", flush=True)
+        if errors is not None:
+            errors.append(msg)
+        return False
+
+
+def parse_campaign(campaign_name):
+    """
+    Повертає (offer_id, category, is_catalog).
+    Звичайна: 1389 - зал - ...
+    Каталог: бро - ктг - ...
+    """
+    parts = [p.strip().lower() for p in campaign_name.split('-')]
+    is_catalog = 'ктг' in parts
+
+    if is_catalog:
+        category = parts[0] if parts and parts[0] in OFFERS else None
+        return None, category, True
+
+    offer_id = parts[0] if parts and parts[0].isdigit() else None
+    category = parts[1] if len(parts) >= 2 and parts[1] in OFFERS else None
+
+    if not category:
+        for part in parts:
+            if part in OFFERS:
+                category = part
+                break
+
+    return offer_id, category, False
+
+
+def build_time_ranges(now_poland):
+    today = now_poland.date()
+
+    # Recent Restart: два повні попередні дні
+    recent_since = today - timedelta(days=2)
+    recent_until = today - timedelta(days=1)
+
+    # Deep Revive: останні 7 повних днів — тільки перевірка відсутності показів
+    idle_since = today - timedelta(days=REVIVE_DEEP_IDLE_DAYS)
+    idle_until = today - timedelta(days=1)
+
+    # Історія 14 днів безпосередньо перед 7-денним idle-вікном
+    hist_until = today - timedelta(days=REVIVE_DEEP_IDLE_DAYS + 1)
+    hist_since = hist_until - timedelta(days=REVIVE_DEEP_HISTORY_DAYS - 1)
+
+    def tr(since, until):
+        return json.dumps({'since': since.isoformat(), 'until': until.isoformat()})
+
+    return {
+        'recent': tr(recent_since, recent_until),
+        'idle': tr(idle_since, idle_until),
+        'history': tr(hist_since, hist_until),
+        'recent_label': f"{recent_since.isoformat()}–{recent_until.isoformat()}",
+        'idle_label': f"{idle_since.isoformat()}–{idle_until.isoformat()}",
+        'history_label': f"{hist_since.isoformat()}–{hist_until.isoformat()}",
+    }
+
+
+def get_account_state(acc_id, currency, time_ranges, errors):
+    campaigns_raw = fetch_data(
+        f"https://graph.facebook.com/{API_VER}/act_{acc_id}/campaigns",
+        {'fields': 'id,name,status,effective_status', 'limit': 250},
+        errors,
+        f"campaigns account {acc_id}",
+    )
+
+    active_campaigns = {
+        c['id']: c
+        for c in campaigns_raw
+        if c.get('effective_status') == 'ACTIVE'
+    }
+
+    adsets_raw = fetch_data(
+        f"https://graph.facebook.com/{API_VER}/act_{acc_id}/adsets",
+        {'fields': 'id,name,status,effective_status,campaign_id', 'limit': 250},
+        errors,
+        f"adsets account {acc_id}",
+    )
+
+    candidates = {}
+    rate = currency_rate(currency)
+
+    for adset in adsets_raw:
+        # Потрібен саме PAUSED адсет у ACTIVE кампанії.
+        if adset.get('status') != 'PAUSED':
+            continue
+
+        campaign_id = adset.get('campaign_id')
+        campaign = active_campaigns.get(campaign_id)
+        if not campaign:
+            continue
+
+        offer_id, category, is_catalog = parse_campaign(campaign.get('name', ''))
+        if not category:
+            continue
+
+        be = OFFERS[category] * rate
+        candidates[adset['id']] = {
+            'account_id': acc_id,
+            'currency': currency,
+            'adset_id': adset['id'],
+            'adset_name': adset.get('name', ''),
+            'campaign_id': campaign_id,
+            'campaign_name': campaign.get('name', ''),
+            'offer_id': offer_id,
+            'category': category,
+            'is_catalog': is_catalog,
+            'be': be,
+            'recent_spend': 0.0,
+            'recent_leads': 0,
+            'idle_impressions': 0,
+            'hist_spend': 0.0,
+            'hist_leads': 0,
+        }
+
+    if not candidates:
+        return candidates, defaultdict(list)
+
+    insights_endpoint = f"https://graph.facebook.com/{API_VER}/act_{acc_id}/insights"
+
+    recent = fetch_data(
+        insights_endpoint,
+        {
+            'level': 'adset',
+            'fields': 'adset_id,spend,actions',
+            'time_range': time_ranges['recent'],
+            'action_attribution_windows': json.dumps(ATTRIBUTION_WINDOW),
+            'limit': 250,
+        },
+        errors,
+        f"recent insights account {acc_id}",
+    )
+    for row in recent:
+        aid = row.get('adset_id')
+        if aid in candidates:
+            candidates[aid]['recent_spend'] = float(row.get('spend', 0))
+            candidates[aid]['recent_leads'] = get_leads(row.get('actions', []))
+
+    idle = fetch_data(
+        insights_endpoint,
+        {
+            'level': 'adset',
+            'fields': 'adset_id,impressions',
+            'time_range': time_ranges['idle'],
+            'limit': 250,
+        },
+        errors,
+        f"idle insights account {acc_id}",
+    )
+    for row in idle:
+        aid = row.get('adset_id')
+        if aid in candidates:
+            candidates[aid]['idle_impressions'] = int(row.get('impressions', 0))
+
+    history = fetch_data(
+        insights_endpoint,
+        {
+            'level': 'adset',
+            'fields': 'adset_id,spend,actions',
+            'time_range': time_ranges['history'],
+            'action_attribution_windows': json.dumps(ATTRIBUTION_WINDOW),
+            'limit': 250,
+        },
+        errors,
+        f"history insights account {acc_id}",
+    )
+    for row in history:
+        aid = row.get('adset_id')
+        if aid in candidates:
+            candidates[aid]['hist_spend'] = float(row.get('spend', 0))
+            candidates[aid]['hist_leads'] = get_leads(row.get('actions', []))
+
+    ads_raw = fetch_data(
+        f"https://graph.facebook.com/{API_VER}/act_{acc_id}/ads",
+        {'fields': 'id,name,status,effective_status,adset_id', 'limit': 250},
+        errors,
+        f"ads account {acc_id}",
+    )
+    ads_by_adset = defaultdict(list)
+    for ad in ads_raw:
+        aid = ad.get('adset_id')
+        if aid in candidates:
+            ads_by_adset[aid].append(ad)
+
+    return candidates, ads_by_adset
+
+
+def qualifies_recent(candidate):
+    leads = candidate['recent_leads']
+    spend = candidate['recent_spend']
+    be = candidate['be']
+
+    if leads <= 0:
+        return False, 0.0
+
+    cpl = spend / leads
+    if leads >= 2:
+        return cpl < be * REVIVE_RECENT_TWO_PLUS_CPL_FACTOR, cpl
+    if leads == 1:
+        return cpl <= be * REVIVE_RECENT_ONE_CPL_FACTOR, cpl
+    return False, cpl
+
+
+def qualifies_deep(candidate):
+    if candidate['idle_impressions'] > 0:
+        return False, 0.0
+
+    leads = candidate['hist_leads']
+    spend = candidate['hist_spend']
+    be = candidate['be']
+
+    if leads <= 0:
+        return False, 0.0
+
+    cpl = spend / leads
+    if leads >= 2:
+        return cpl <= be * REVIVE_DEEP_TWO_PLUS_CPL_FACTOR, cpl
+    if leads == 1:
+        return cpl <= be * REVIVE_DEEP_ONE_CPL_FACTOR, cpl
+    return False, cpl
+
+
+def activate_candidate(candidate, ads_by_adset, errors):
+    aid = candidate['adset_id']
+
+    # Спочатку вмикаємо adset. Якщо оголошення було вимкнене Hygiene — вмикаємо його після цього.
+    if not change_entity_status(aid, 'ACTIVE', errors, f"adset {aid}"):
+        return False, 0
+
+    activated_ads = 0
+    for ad in ads_by_adset.get(aid, []):
+        if ad.get('status') == 'PAUSED':
+            if change_entity_status(ad['id'], 'ACTIVE', errors, f"ad {ad['id']} / adset {aid}"):
+                activated_ads += 1
+
+    return True, activated_ads
+
+
+def main():
+    if not ACCESS_TOKEN:
+        print("❌ Помилка: FB_ACCESS_TOKEN не знайдено в змінних середовища!", flush=True)
+        return
+
+    now_poland = datetime.now(POLAND_TZ)
+    time_ranges = build_time_ranges(now_poland)
+    print(f"🌅 [FB Revive Start] {now_poland.strftime('%Y-%m-%d %H:%M:%S')} (Poland Time)", flush=True)
+    print(f"   Recent: {time_ranges['recent_label']}", flush=True)
+    print(f"   Deep idle: {time_ranges['idle_label']}", flush=True)
+    print(f"   Deep history: {time_ranges['history_label']}", flush=True)
+
+    errors = []
+    account_states = {}
+    ads_maps = {}
+
+    for acc_id, currency in ACCOUNTS.items():
+        try:
+            candidates, ads_by_adset = get_account_state(acc_id, currency, time_ranges, errors)
+            account_states[acc_id] = candidates
+            ads_maps[acc_id] = ads_by_adset
+            print(f"📊 Акаунт {acc_id} ({currency}): paused candidates = {len(candidates)}", flush=True)
+        except Exception as e:
+            msg = f"Акаунт {acc_id} ({currency}): {e}"
+            print(f" ❌ {msg}", flush=True)
+            errors.append(msg)
+
+    # 1) Recent Restart — без cap.
+    recent_selected = []
+    restarted_ids = set()
+
+    for acc_id, candidates in account_states.items():
+        for candidate in candidates.values():
+            ok, cpl = qualifies_recent(candidate)
+            if ok:
+                candidate['recent_cpl'] = cpl
+                recent_selected.append(candidate)
+
+    recent_events = []
+    for candidate in recent_selected:
+        ok, activated_ads = activate_candidate(candidate, ads_maps[candidate['account_id']], errors)
+        if not ok:
+            continue
+        restarted_ids.add(candidate['adset_id'])
+        sym = currency_symbol(candidate['currency'])
+        recent_events.append(
+            f"🟢 <b>Recent</b> [{esc(candidate['category'].upper())}] {esc(candidate['adset_name'])}\n"
+            f"   Campaign: {esc(candidate['campaign_name'])}\n"
+            f"   CID: <code>{candidate['campaign_id']}</code> | AID: <code>{candidate['adset_id']}</code>\n"
+            f"   {candidate['recent_leads']} лідів • CPL {candidate['recent_cpl']:.2f}{sym} • BE {candidate['be']:.2f}{sym}"
+            + (f" • ads +{activated_ads}" if activated_ads else "")
+        )
+
+    # 2) Deep Revive — після 7 днів без показів, max 10 на offer_id.
+    deep_groups = defaultdict(list)
+
+    for acc_id, candidates in account_states.items():
+        for candidate in candidates.values():
+            if candidate['adset_id'] in restarted_ids:
+                continue
+            ok, cpl = qualifies_deep(candidate)
+            if not ok:
+                continue
+
+            candidate['deep_cpl'] = cpl
+            candidate['deep_ratio'] = cpl / candidate['be'] if candidate['be'] else 999.0
+
+            # Звичайний товар: cap глобально по offer_id через усі акаунти.
+            # Каталог не має offer_id, тому консервативно застосовуємо той самий cap на кампанію.
+            if candidate['offer_id']:
+                key = f"offer:{candidate['offer_id']}"
+            else:
+                key = f"catalog:{candidate['account_id']}:{candidate['campaign_id']}"
+            deep_groups[key].append(candidate)
+
+    deep_selected = []
+    for group in deep_groups.values():
+        group.sort(key=lambda x: (-x['hist_leads'], x['deep_ratio'], x['adset_id']))
+        deep_selected.extend(group[:REVIVE_DEEP_CAP_PER_OFFER])
+
+    deep_events = []
+    for candidate in deep_selected:
+        ok, activated_ads = activate_candidate(candidate, ads_maps[candidate['account_id']], errors)
+        if not ok:
+            continue
+        sym = currency_symbol(candidate['currency'])
+        label = candidate['offer_id'] if candidate['offer_id'] else 'КТГ'
+        deep_events.append(
+            f"♻️ <b>Deep</b> [{esc(label)} / {esc(candidate['category'].upper())}] {esc(candidate['adset_name'])}\n"
+            f"   Campaign: {esc(candidate['campaign_name'])}\n"
+            f"   CID: <code>{candidate['campaign_id']}</code> | AID: <code>{candidate['adset_id']}</code>\n"
+            f"   {candidate['hist_leads']} лідів • CPL {candidate['deep_cpl']:.2f}{sym} • BE {candidate['be']:.2f}{sym}"
+            + (f" • ads +{activated_ads}" if activated_ads else "")
+        )
+
+    time_str = now_poland.strftime('%Y-%m-%d %H:%M')
+    summary = (
+        f"🌅 <b>FB Revive</b> ({time_str})\n"
+        f"Recent: <b>{len(recent_events)}</b> | Deep: <b>{len(deep_events)}</b> | Errors: <b>{len(errors)}</b>"
+    )
+
+    lines = []
+    lines.extend(recent_events)
+    lines.extend(deep_events)
+
+    if errors:
+        lines.append("⚠️ <b>Помилки</b>\n" + "\n".join(esc(e) for e in errors[:10]))
+
+    send_telegram_lines(summary, lines)
+
+    print(f"✅ Revive завершено. Recent={len(recent_events)}, Deep={len(deep_events)}, Errors={len(errors)}", flush=True)
+
+
+if __name__ == '__main__':
+    main()
