@@ -16,7 +16,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 MAX_TEST_ADSETS = 5
-REPORT_FILE = "duplicate_test_report.json"
+REPORT_FILE = "duplicate_test_ordinary_report.json"
 
 # Core fields we actually need to verify settings. If Meta rejects any field,
 # the resilient reader splits the request and records the exact unavailable field
@@ -95,6 +95,11 @@ def decode_meta_error(body):
             "is_transient": False, "user_title": None, "user_msg": None,
             "fbtrace_id": None, "raw": body,
         }
+
+
+class SkipSource(RuntimeError):
+    """Intentional test skip, not a failure."""
+    pass
 
 
 class MetaRequestError(RuntimeError):
@@ -449,6 +454,24 @@ def meta_error_summary(e):
     return " | ".join(parts)
 
 
+def source_is_catalog(source):
+    promoted = source.get("promoted_object") or {}
+    return bool(find_value(promoted, "product_set_id"))
+
+
+def creative_id_pairs(ad_reports):
+    rows = []
+    for row in ad_reports:
+        rows.append({
+            "source_ad_id": row.get("source_ad_id"),
+            "copied_ad_id": row.get("copied_ad_id"),
+            "source_creative_id": row.get("source_creative_id"),
+            "copied_creative_id": row.get("copied_creative_id"),
+            "creative_id_changed": bool(row.get("source_creative_id") and row.get("copied_creative_id") and str(row.get("source_creative_id")) != str(row.get("copied_creative_id"))),
+        })
+    return rows
+
+
 def test_one(source_id, suffix):
     result = {
         "source_adset_id": source_id,
@@ -472,6 +495,8 @@ def test_one(source_id, suffix):
     )
     if not source.get("campaign_id") or not source.get("account_id"):
         raise RuntimeError("Cannot read source account_id/campaign_id; aborting before copy.")
+    if source_is_catalog(source):
+        raise SkipSource("Catalog/DPA source detected by product_set_id. Ordinary-ad test intentionally skips catalogs.")
     stage("source_adset_read")
     if source_unavailable:
         result["warnings"].append({"source_adset_unavailable_fields": source_unavailable})
@@ -579,6 +604,8 @@ def test_one(source_id, suffix):
     copied_pixel = find_value(copied.get("promoted_object"), "pixel_id")
     source_product_set = find_value(source.get("promoted_object"), "product_set_id")
     copied_product_set = find_value(copied.get("promoted_object"), "product_set_id")
+    creative_pairs = creative_id_pairs(ad_reports)
+    all_creatives_new = bool(creative_pairs) and all(x.get("creative_id_changed") for x in creative_pairs)
 
     result.update({
         "account_id": source.get("account_id"),
@@ -595,6 +622,10 @@ def test_one(source_id, suffix):
         "source_product_set_id": source_product_set,
         "copied_product_set_id": copied_product_set,
         "product_set_match": source_product_set == copied_product_set,
+        "creative_id_pairs": creative_pairs,
+        "all_creatives_new": all_creatives_new,
+        "source_targeting": source.get("targeting"),
+        "copied_targeting": copied.get("targeting"),
         "adset_diffs": adset_diffs,
         "ads": ad_reports,
         "source_adset": source,
@@ -605,7 +636,9 @@ def test_one(source_id, suffix):
         copied.get("status") == "PAUSED"
         and len(source_ads) == len(copied_ads)
         and result["pixel_match"]
-        and result["product_set_match"]
+        and source_product_set is None
+        and copied_product_set is None
+        and result["all_creatives_new"]
         and not adset_diffs
         and all(
             not x.get("missing_copy") and not x.get("ad_diffs") and not x.get("creative_diffs")
@@ -620,15 +653,29 @@ def compact_summary(result):
     ad_diff_count = sum(len(x.get("ad_diffs", [])) for x in result.get("ads", []))
     creative_diff_count = sum(len(x.get("creative_diffs", [])) for x in result.get("ads", []))
     icon = "✅" if result.get("critical_ok") else "⚠️"
+    pairs = result.get("creative_id_pairs") or []
+    pair_lines = []
+    for x in pairs[:3]:
+        pair_lines.append(
+            f"Ad <code>{esc(x.get('source_ad_id'))}</code> → <code>{esc(x.get('copied_ad_id'))}</code>; "
+            f"Creative <code>{esc(x.get('source_creative_id'))}</code> → <code>{esc(x.get('copied_creative_id'))}</code> "
+            f"{'✅ NEW' if x.get('creative_id_changed') else '❌ SAME'}"
+        )
+    placement = result.get("source_targeting") or {}
+    placement_bits = []
+    for key in ("publisher_platforms", "facebook_positions", "instagram_positions", "messenger_positions", "device_platforms"):
+        if key in placement:
+            placement_bits.append(f"{key}={placement.get(key)}")
     return (
-        f"{icon} <b>Duplicate test v3</b>\n"
+        f"{icon} <b>Ordinary duplicate test v4</b>\n"
         f"Account: <code>{esc(result.get('account_id'))}</code>\n"
         f"Source Adset: <code>{esc(result.get('source_adset_id'))}</code>\n"
         f"Copy Adset: <code>{esc(result.get('copied_adset_id'))}</code> (PAUSED)\n"
         f"Ads: {result.get('source_ads_count')} → {result.get('copied_ads_count')}\n"
-        f"Pixel: <code>{esc(result.get('source_pixel_id'))}</code> → <code>{esc(result.get('copied_pixel_id'))}</code> {'✅' if result.get('pixel_match') else '❌'}\n"
-        f"Product set: <code>{esc(result.get('source_product_set_id'))}</code> → <code>{esc(result.get('copied_product_set_id'))}</code> {'✅' if result.get('product_set_match') else '❌'}\n"
-        f"Diffs: adset={adset_diff_count}, ad={ad_diff_count}, creative={creative_diff_count}\n"
+        + ("\n".join(pair_lines) + "\n" if pair_lines else "")
+        + f"Pixel: <code>{esc(result.get('source_pixel_id'))}</code> → <code>{esc(result.get('copied_pixel_id'))}</code> {'✅' if result.get('pixel_match') else '❌'}\n"
+        + (f"Placements: {esc('; '.join(placement_bits))}\n" if placement_bits else "")
+        + f"Diffs: adset={adset_diff_count}, ad={ad_diff_count}, creative={creative_diff_count}\n"
         f"Warnings: {len(result.get('warnings', []))}"
     )
 
@@ -648,7 +695,7 @@ def error_summary(source_id, e, partial=None):
     stage = e.stage if isinstance(e, MetaRequestError) else None
     detail = meta_error_summary(e) if isinstance(e, MetaRequestError) else str(e)
     return (
-        f"❌ <b>Duplicate test v3 error</b>\n"
+        f"❌ <b>Ordinary duplicate test v4 error</b>\n"
         f"Source Adset: <code>{esc(source_id)}</code>\n"
         f"Stage: <b>{esc(stage or 'unknown')}</b>"
         f"{copy_line}{access_line}\n"
@@ -667,17 +714,17 @@ def main():
     report = {
         "created_at": now.isoformat(),
         "api_version": API_VER,
-        "mode": "REAL_COPY_PAUSED_V3",
+        "mode": "ORDINARY_NATIVE_DEEP_COPY_PAUSED_V4",
         "source_ids": ids,
         "api_access": access_diag,
         "results": [],
         "errors": [],
     }
 
-    print("FB duplicate test v3: native deep-copy, always PAUSED + access diagnostics.", flush=True)
+    print("FB ordinary duplicate test v4: native deep-copy, always PAUSED; catalogs skipped.", flush=True)
     print(json.dumps({"api_access": access_diag}, ensure_ascii=False, indent=2), flush=True)
     send_telegram(access_diag_summary(access_diag))
-    print("Important: v3 adds token permissions and asset-access diagnostics before copy.", flush=True)
+    print("Important: ordinary ads only. Catalog sources are skipped. Creative IDs are audited and expected to be NEW.", flush=True)
     print(f"IDs: {ids}", flush=True)
 
     for source_id in ids:
@@ -696,6 +743,14 @@ def main():
                 "warnings": len(result.get("warnings", [])),
             }, ensure_ascii=False, indent=2), flush=True)
             send_telegram(compact_summary(result))
+        except SkipSource as e:
+            skip_row = {"source_adset_id": source_id, "skipped": True, "reason": str(e)}
+            report["results"].append(skip_row)
+            print(f"SKIP [{source_id}]: {e}", flush=True)
+            send_telegram(
+                f"⏭ <b>Ordinary duplicate test v4 — skipped</b>\n"
+                f"Source Adset: <code>{esc(source_id)}</code>\n{esc(e)}"
+            )
         except Exception as e:
             partial.update(PARTIAL_RESULTS.get(source_id, {}))
             err_row = {
