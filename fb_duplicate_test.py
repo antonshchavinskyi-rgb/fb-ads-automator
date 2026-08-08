@@ -12,12 +12,15 @@ import urllib.error
 from copy import deepcopy
 from datetime import datetime
 
-from fb_config import API_VER, POLAND_TZ
+from fb_config import POLAND_TZ
+
+# Isolated duplicate-test uses the current Marketing API without changing production scripts.
+API_VER = "v26.0"
 
 ACCESS_TOKEN = os.environ.get("FB_SCALER_ACCESS_TOKEN")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-REPORT_FILE = "duplicate_test_v11_controls_report.json"
+REPORT_FILE = "duplicate_test_v12_v26_report.json"
 
 # This test intentionally handles ONE ordinary adset per run and creates PAUSED objects only.
 # Catalog adsets are skipped in this phase.
@@ -335,23 +338,35 @@ def clean_copy_suffixes(name):
 
 
 def explicit_creative_optouts(mode):
-    """Explicitly disable the documented creative automations we do not want.
+    """Explicitly disable documented Advantage+ creative features for API v26.0.
 
-    We keep this list intentionally conservative for Marketing API v25.0.
-    Multi-advertiser ads are controlled separately via contextual_multi_ads.
+    Important:
+    - Do NOT send legacy standard_enhancements; Meta has rejected it in our account.
+    - Use the current documented field name video_filtering (not video_filter).
+    - Multi-advertiser ads are controlled separately via contextual_multi_ads.
+    - We intentionally keep the list to fields documented by Meta; unknown fields are NOT assumed to be ignored.
     """
+    opt_out = {"enroll_status": "OPT_OUT"}
     common = {
-        "site_extensions": {"enroll_status": "OPT_OUT"},
-        "biz_ai": {"enroll_status": "OPT_OUT"},
-        "text_optimizations": {"enroll_status": "OPT_OUT"},
-        "inline_comment": {"enroll_status": "OPT_OUT"},
-        "enhance_cta": {"enroll_status": "OPT_OUT"},
+        "site_extensions": deepcopy(opt_out),
+        "text_optimizations": deepcopy(opt_out),
+        "enhance_cta": deepcopy(opt_out),
+        "description_automation": deepcopy(opt_out),
     }
     if mode == "VIDEO":
-        common["video_auto_crop"] = {"enroll_status": "OPT_OUT"}
+        common.update({
+            "video_auto_crop": deepcopy(opt_out),
+            "video_filtering": deepcopy(opt_out),
+            "video_uncrop": deepcopy(opt_out),
+        })
     elif mode == "IMAGE":
-        common["image_touchups"] = {"enroll_status": "OPT_OUT"}
-        common["image_background_gen"] = {"enroll_status": "OPT_OUT"}
+        common.update({
+            "image_templates": deepcopy(opt_out),
+            "image_touchups": deepcopy(opt_out),
+            "image_background_gen": deepcopy(opt_out),
+            "image_uncrop": deepcopy(opt_out),
+            "image_animation": deepcopy(opt_out),
+        })
     return common
 
 
@@ -385,10 +400,10 @@ def build_clean_creative(source_creative, account_id, suffix, include_video_prev
     - multi-advertiser ads: OPT_OUT via contextual_multi_ads;
     - Creative Setup / Advantage+ controls: explicit OPT_OUT for the relevant v25 features;
     - legacy enhancement containers from the source are NOT copied;
-    - for video we first ask Meta to create without image_hash/image_url. If Meta requires
-      a thumbnail, caller retries with a fresh re-upload (which is an explicit/manual
-      thumbnail from the API's point of view; there is no documented v25 "Automatic"
-      thumbnail selector in video_data).
+    - for video, public API v26 still documents a thumbnail requirement. We therefore
+      create a fresh thumbnail asset instead of reusing the source image_hash. This is
+      explicit/manual from the API point of view; Ads Manager's "Automatic" thumbnail
+      mode is not exposed as a documented public API switch.
     """
     oss = deepcopy(source_creative.get("object_story_spec") or {})
     page_id = oss.get("page_id")
@@ -397,7 +412,7 @@ def build_clean_creative(source_creative, account_id, suffix, include_video_prev
 
     mode = "VIDEO" if oss.get("video_data") else "IMAGE" if oss.get("link_data") else None
     if not mode:
-        raise SkipSource("Only ordinary single video_data or link_data creatives are supported in v11.")
+        raise SkipSource("Only ordinary single video_data or link_data creatives are supported in v12.")
 
     payload = {
         "name": f"{clean_copy_suffixes(source_creative.get('name') or 'creative')}{suffix}",
@@ -580,7 +595,7 @@ def create_clean_clone(source_adset_id):
         raise SkipSource("Catalog source detected. Catalogs are intentionally skipped in ordinary-ad phase.")
 
     now = datetime.now(POLAND_TZ)
-    suffix = f" [PYTEST-V11 {now.strftime('%Y%m%d-%H%M%S')}]"
+    suffix = f" [PYTEST-V12 {now.strftime('%Y%m%d-%H%M%S')}]"
     account_id = str(source.get("account_id"))
 
     # 1) Copy only the adset. Child ad/creative are rebuilt from a minimal schema.
@@ -600,28 +615,18 @@ def create_clean_clone(source_adset_id):
     )
 
     # 2) Create NEW creative from business-essential fields only.
-    # VIDEO first attempt: deliberately omit image_hash/image_url. If Meta explicitly
-    # requires a preview, retry once with a fresh re-uploaded source thumbnail.
+    # Public API v26 still requires a video thumbnail. To save API calls and avoid a
+    # guaranteed failing POST, video creatives use a freshly re-uploaded source thumbnail.
+    # This produces a NEW image hash, but it is not the Ads Manager "Automatic" thumbnail mode.
+    source_oss = source_creative.get("object_story_spec") or {}
+    source_is_video = bool(source_oss.get("video_data"))
     creative_payload, media_audit = build_clean_creative(
-        source_creative, account_id, suffix, include_video_preview=False
+        source_creative, account_id, suffix, include_video_preview=source_is_video
     )
-    try:
-        new_creative = graph_request(
-            "POST", f"act_{account_id}/adcreatives", creative_payload,
-            stage="create_clean_creative_no_preview"
-        )
-    except MetaRequestError as first_error:
-        if media_audit.get("mode") == "VIDEO" and is_thumbnail_required_error(first_error):
-            creative_payload, media_audit = build_clean_creative(
-                source_creative, account_id, suffix, include_video_preview=True
-            )
-            media_audit["first_attempt_error"] = first_error.info
-            new_creative = graph_request(
-                "POST", f"act_{account_id}/adcreatives", creative_payload,
-                stage="create_clean_creative_preview_fallback"
-            )
-        else:
-            raise
+    new_creative = graph_request(
+        "POST", f"act_{account_id}/adcreatives", creative_payload,
+        stage="create_clean_creative_v26"
+    )
     new_creative_id = str(new_creative.get("id") or "")
     if not new_creative_id:
         raise RuntimeError(f"Creative create returned no id: {new_creative}")
@@ -745,7 +750,7 @@ def create_clean_clone(source_adset_id):
         and not ad_issues
         and not failed_delivery_checks
     )
-    # Automatic video thumbnail is a separate requirement. Marketing API v25 documents
+    # Automatic video thumbnail is a separate requirement. Marketing API v26 documents
     # explicit image_hash/image_url fields, but no flag equivalent to Ads Manager's
     # "Automatic" thumbnail selector. If Meta forces the fallback hash, the clone can be
     # structurally correct but is not yet fully scaler-ready for Anton's preferred setup.
@@ -758,7 +763,7 @@ def format_error(e, source_id):
     if isinstance(e, MetaRequestError):
         info = e.info
         parts = [
-            "❌ <b>Duplicate test v11 error</b>",
+            "❌ <b>Duplicate test v12 error</b>",
             f"Source Adset: <code>{esc(source_id)}</code>",
             f"Stage: <b>{esc(e.stage or 'unknown')}</b>",
         ]
@@ -769,7 +774,7 @@ def format_error(e, source_id):
             parts.append(f"fbtrace_id: {esc(info.get('fbtrace_id'))}")
         return "\n".join(parts)
     return (
-        "❌ <b>Duplicate test v11 error</b>\n"
+        "❌ <b>Duplicate test v12 error</b>\n"
         f"Source Adset: <code>{esc(source_id)}</code>\n"
         f"Partial: {esc(json.dumps(PARTIAL, ensure_ascii=False))}\n"
         f"{esc(str(e))}"
@@ -783,7 +788,7 @@ def summary_message(result):
     feature_statuses = result.get("requested_feature_statuses") or {}
     feature_short = ", ".join(f"{k}={v or 'NOT_RETURNED'}" for k, v in feature_statuses.items())
     lines = [
-        "✅ <b>Duplicate test v11 • CONTROLLED CLEAN REBUILD</b>",
+        "✅ <b>Duplicate test v12 • CONTROLLED CLEAN REBUILD</b>",
         f"Account: <code>{esc(result.get('account_id'))}</code>",
         f"Source Adset: <code>{esc(result.get('source_adset_id'))}</code>",
         f"Copy Adset: <code>{esc(result.get('copied_adset_id'))}</code> • {esc((result.get('copied_adset') or {}).get('name'))}",
@@ -828,7 +833,7 @@ def main():
     except SkipSource as e:
         report["error"] = {"type": "skip", "message": str(e), "partial": deepcopy(PARTIAL)}
         send_telegram(
-            "⏭ <b>Duplicate test v11 skipped</b>\n"
+            "⏭ <b>Duplicate test v12 skipped</b>\n"
             f"Source Adset: <code>{esc(source_id)}</code>\n{esc(str(e))}"
         )
         exit_code = 1
