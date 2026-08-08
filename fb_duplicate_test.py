@@ -16,7 +16,7 @@ from fb_config import API_VER, POLAND_TZ
 ACCESS_TOKEN = os.environ.get("FB_SCALER_ACCESS_TOKEN")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-REPORT_FILE = "duplicate_test_v9_preview_report.json"
+REPORT_FILE = "duplicate_test_v10_clean_report.json"
 
 # This test intentionally handles ONE ordinary adset per run and creates PAUSED objects only.
 # Catalog adsets are skipped in this phase.
@@ -256,117 +256,49 @@ def upload_image_to_ad_account(account_id, image_bytes, content_type, stage):
     return str(h), payload
 
 
-def _thumb_rows(value):
-    """Normalize Graph field-expansion response for Video.thumbnails."""
-    if isinstance(value, dict):
-        value = value.get("data", [])
-    if not isinstance(value, list):
-        return []
-    return [x for x in value if isinstance(x, dict) and x.get("uri")]
+def fresh_video_fallback_hash(source_creative, account_id):
+    """Fallback only when Meta refuses video_data without a preview image.
 
-
-def find_video_in_ad_account_library(video_id, account_id, max_pages=3, page_limit=100):
-    """Find an ad video through the ad-account /advideos edge.
-
-    A video_id used by an ad can belong to the ad account video library even when
-    GET /{video_id} is not readable by the system-user token. We therefore search
-    the account video library and expand its thumbnail connection. This is a
-    bounded lookup to protect API quota during tests.
+    We intentionally do NOT copy the old image_hash. Instead we download the
+    source creative's rendered thumbnail and upload it again to the ad account,
+    which produces a fresh image hash. This is a fallback, not the preferred path.
     """
-    params = {
-        "access_token": ACCESS_TOKEN,
-        "fields": "id,picture,thumbnails.limit(20){id,height,width,scale,uri,is_preferred}",
-        "limit": page_limit,
+    candidate_urls = [
+        source_creative.get("thumbnail_url"),
+        source_creative.get("image_url"),
+    ]
+    url = next((x for x in candidate_urls if x), None)
+    if not url:
+        raise SkipSource("Meta requires a video preview, but source creative has no downloadable thumbnail_url/image_url for fallback.")
+    image_bytes, content_type = download_bytes(url, "video_preview_fallback_download")
+    new_hash, upload_raw = upload_image_to_ad_account(
+        account_id, image_bytes, content_type, "video_preview_fallback_upload"
+    )
+    return new_hash, {
+        "strategy": "SOURCE_THUMBNAIL_REUPLOAD_FALLBACK",
+        "source_url": url,
+        "upload": upload_raw,
     }
-    url = (
-        f"https://graph.facebook.com/{API_VER}/act_{account_id}/advideos?"
-        + urllib.parse.urlencode({k: serialize_param(v) for k, v in params.items() if v is not None})
-    )
-    pages = 0
-    while url and pages < max_pages:
-        pages += 1
-        try:
-            with urllib.request.urlopen(urllib.request.Request(url), timeout=60) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            info = decode_meta_error(e.read().decode("utf-8", errors="replace"))
-            raise MetaRequestError(e.code, info, stage="account_advideos_lookup")
-        for row in payload.get("data", []):
-            if str(row.get("id")) == str(video_id):
-                return row, pages
-        url = payload.get("paging", {}).get("next")
-    return None, pages
 
 
-def fresh_video_thumbnail_hash(video_id, account_id, source_creative):
-    """Create a fresh ad-image hash for the video's thumbnail.
+def is_thumbnail_required_error(exc):
+    """Conservative detector for a failed no-thumbnail create attempt.
 
-    Preferred path: choose one of Meta's generated thumbnails from the ad-account
-    video library, then re-upload it as a fresh ad image. This gives a fresh hash
-    and can choose a different generated frame.
-
-    Fallback: re-upload the source creative's thumbnail_url. The hash is still new,
-    but the visual preview is reused. We record this explicitly in the audit.
-
-    We do NOT omit thumbnail entirely: Marketing API video_data requires a video
-    thumbnail (image_hash or image_url).
+    A failed POST is safe to retry with a thumbnail because Meta returned an
+    explicit HTTP error and did not return a created creative ID. We only retry
+    when the error text clearly points at image/thumbnail requirements.
     """
-    lookup_warning = None
-    try:
-        video_row, pages = find_video_in_ad_account_library(str(video_id), str(account_id))
-        if video_row:
-            thumbs = _thumb_rows(video_row.get("thumbnails"))
-            if thumbs:
-                # Prefer a non-preferred alternative when available, so the test can
-                # exercise a fresh generated frame rather than simply cloning the old preview.
-                alternatives = [x for x in thumbs if not x.get("is_preferred")]
-                pool = alternatives or thumbs
-                selected = random.choice(pool)
-                image_bytes, content_type = download_bytes(selected["uri"], "video_thumbnail_download")
-                new_hash, upload_raw = upload_image_to_ad_account(
-                    account_id, image_bytes, content_type, "video_thumbnail_upload"
-                )
-                return new_hash, {
-                    "strategy": "AD_ACCOUNT_GENERATED_THUMBNAIL",
-                    "video_library_pages": pages,
-                    "selected": selected,
-                    "upload": upload_raw,
-                }
-            if video_row.get("picture"):
-                image_bytes, content_type = download_bytes(video_row["picture"], "video_picture_download")
-                new_hash, upload_raw = upload_image_to_ad_account(
-                    account_id, image_bytes, content_type, "video_picture_upload"
-                )
-                return new_hash, {
-                    "strategy": "AD_ACCOUNT_VIDEO_PICTURE",
-                    "video_library_pages": pages,
-                    "source_url": video_row.get("picture"),
-                    "upload": upload_raw,
-                }
-            lookup_warning = f"Video {video_id} found in ad-account library but no usable thumbnails/picture returned."
-        else:
-            lookup_warning = f"Video {video_id} not found within bounded ad-account video-library lookup."
-    except Exception as e:
-        lookup_warning = f"Ad-account video thumbnail lookup failed: {e}"
-
-    # Safe fallback: source creative thumbnail is already readable through AdCreative.
-    fallback_url = source_creative.get("thumbnail_url") or source_creative.get("image_url")
-    if fallback_url:
-        image_bytes, content_type = download_bytes(fallback_url, "source_creative_thumbnail_download")
-        new_hash, upload_raw = upload_image_to_ad_account(
-            account_id, image_bytes, content_type, "source_creative_thumbnail_upload"
-        )
-        return new_hash, {
-            "strategy": "SOURCE_CREATIVE_THUMBNAIL_REUPLOAD",
-            "source_url": fallback_url,
-            "warning": lookup_warning,
-            "upload": upload_raw,
-        }
-
-    raise SkipSource(
-        "No API-accessible generated thumbnail and source creative has no thumbnail_url/image_url. "
-        + (lookup_warning or "")
-    )
+    if not isinstance(exc, MetaRequestError):
+        return False
+    info = exc.info or {}
+    text = " ".join(str(x or "") for x in [
+        info.get("message"), info.get("user_title"), info.get("user_msg")
+    ]).lower()
+    needles = [
+        "image_hash", "image url", "image_url", "thumbnail", "preview image",
+        "preview", "мініат", "миниат", "зображ", "изображ", "превью",
+    ]
+    return any(n in text for n in needles)
 
 def fresh_image_hash(source_creative, link_data, account_id):
     # We do not reuse the source image_hash. Download the rendered/source image and upload again.
@@ -387,7 +319,14 @@ def clean_dict(d):
     return {k: deepcopy(v) for k, v in d.items() if v not in (None, "", {}, [])}
 
 
-def build_minimal_creative(source_creative, account_id, suffix):
+def build_clean_creative(source_creative, account_id, suffix, include_video_preview=False):
+    """Build a new creative from business-essential fields only.
+
+    We intentionally do not copy legacy/Advantage+ enhancement containers.
+    For video, the first attempt omits both image_hash and image_url. If Meta
+    explicitly requires a preview, the caller retries with a freshly uploaded
+    fallback thumbnail and therefore a fresh hash.
+    """
     oss = deepcopy(source_creative.get("object_story_spec") or {})
     page_id = oss.get("page_id")
     if not page_id:
@@ -400,10 +339,11 @@ def build_minimal_creative(source_creative, account_id, suffix):
 
     audit = {
         "mode": None,
+        "preview_strategy": None,
         "source_image_hash": source_creative.get("image_hash"),
         "new_image_hash": None,
-        "thumbnail": None,
-        "omitted_enhancement_fields": [
+        "preview_meta": None,
+        "omitted_fields": [
             "asset_feed_spec", "degrees_of_freedom_spec", "creative_sourcing_spec",
             "format_transformation_spec", "generative_asset_spec", "platform_customizations",
         ],
@@ -415,21 +355,32 @@ def build_minimal_creative(source_creative, account_id, suffix):
         if not video_id:
             raise SkipSource("Video creative has no video_id.")
 
-        new_hash, thumb_meta = fresh_video_thumbnail_hash(str(video_id), str(account_id), source_creative)
         minimal_vd = clean_dict({
             "video_id": str(video_id),
             "message": vd.get("message"),
             "title": vd.get("title"),
             "link_description": vd.get("link_description"),
             "call_to_action": vd.get("call_to_action"),
-            "image_hash": new_hash,
         })
+        if include_video_preview:
+            new_hash, preview_meta = fresh_video_fallback_hash(source_creative, str(account_id))
+            minimal_vd["image_hash"] = new_hash
+            audit.update({
+                "preview_strategy": "SOURCE_THUMBNAIL_REUPLOAD_FALLBACK",
+                "new_image_hash": new_hash,
+                "preview_meta": preview_meta,
+            })
+        else:
+            audit["preview_strategy"] = "NO_IMAGE_HASH_OR_URL_REQUESTED"
+
         payload["object_story_spec"] = {"page_id": str(page_id), "video_data": minimal_vd}
-        audit.update({"mode": "VIDEO", "new_image_hash": new_hash, "thumbnail": thumb_meta})
+        audit["mode"] = "VIDEO"
         return payload, audit
 
     if oss.get("link_data"):
         ld = oss.get("link_data") or {}
+        # A static image itself needs an image asset; unlike a video thumbnail,
+        # this is the media, so we re-upload it to get a fresh hash.
         new_hash, image_meta = fresh_image_hash(source_creative, ld, str(account_id))
         minimal_ld = clean_dict({
             "link": ld.get("link"),
@@ -442,11 +393,15 @@ def build_minimal_creative(source_creative, account_id, suffix):
         if not minimal_ld.get("link"):
             raise SkipSource("Image/link creative has no destination link.")
         payload["object_story_spec"] = {"page_id": str(page_id), "link_data": minimal_ld}
-        audit.update({"mode": "IMAGE", "new_image_hash": new_hash, "thumbnail": image_meta})
+        audit.update({
+            "mode": "IMAGE",
+            "preview_strategy": "FRESH_IMAGE_REUPLOAD",
+            "new_image_hash": new_hash,
+            "preview_meta": image_meta,
+        })
         return payload, audit
 
-    raise SkipSource("Only ordinary single video_data or link_data creatives are supported in v8.")
-
+    raise SkipSource("Only ordinary single video_data or link_data creatives are supported in v10.")
 
 def find_nested(obj, key):
     if isinstance(obj, dict):
@@ -536,7 +491,7 @@ def is_catalog(source_adset, source_creative):
     return False
 
 
-def create_minimal_clone(source_adset_id):
+def create_clean_clone(source_adset_id):
     source = get_node(source_adset_id, ADSET_FIELDS, "source_adset_read")
     ads = graph_get_all(source_adset_id + "/ads", {"fields": ",".join(AD_FIELDS), "limit": 5}, "source_ads_read")
     if len(ads) != 1:
@@ -551,7 +506,7 @@ def create_minimal_clone(source_adset_id):
         raise SkipSource("Catalog source detected. Catalogs are intentionally skipped in ordinary-ad phase.")
 
     now = datetime.now(POLAND_TZ)
-    suffix = f" [PYTEST-MIN {now.strftime('%Y%m%d-%H%M%S')}]"
+    suffix = f" [PYTEST-CLEAN {now.strftime('%Y%m%d-%H%M%S')}]"
     account_id = str(source.get("account_id"))
 
     # 1) Copy only the adset. Child ad/creative are rebuilt from a minimal schema.
@@ -570,11 +525,29 @@ def create_minimal_clone(source_adset_id):
         stage="rename_copied_adset",
     )
 
-    # 2) Create NEW creative from only the fields we actually need.
-    creative_payload, media_audit = build_minimal_creative(source_creative, account_id, suffix)
-    new_creative = graph_request(
-        "POST", f"act_{account_id}/adcreatives", creative_payload, stage="create_minimal_creative"
+    # 2) Create NEW creative from business-essential fields only.
+    # VIDEO first attempt: deliberately omit image_hash/image_url. If Meta explicitly
+    # requires a preview, retry once with a fresh re-uploaded source thumbnail.
+    creative_payload, media_audit = build_clean_creative(
+        source_creative, account_id, suffix, include_video_preview=False
     )
+    try:
+        new_creative = graph_request(
+            "POST", f"act_{account_id}/adcreatives", creative_payload,
+            stage="create_clean_creative_no_preview"
+        )
+    except MetaRequestError as first_error:
+        if media_audit.get("mode") == "VIDEO" and is_thumbnail_required_error(first_error):
+            creative_payload, media_audit = build_clean_creative(
+                source_creative, account_id, suffix, include_video_preview=True
+            )
+            media_audit["first_attempt_error"] = first_error.info
+            new_creative = graph_request(
+                "POST", f"act_{account_id}/adcreatives", creative_payload,
+                stage="create_clean_creative_preview_fallback"
+            )
+        else:
+            raise
     new_creative_id = str(new_creative.get("id") or "")
     if not new_creative_id:
         raise RuntimeError(f"Creative create returned no id: {new_creative}")
@@ -617,11 +590,30 @@ def create_minimal_clone(source_adset_id):
         if copied_creative.get(k) not in (None, {}, [])
     }
 
+    def collect_enroll_statuses(obj, path=""):
+        rows = []
+        if isinstance(obj, dict):
+            if "enroll_status" in obj:
+                rows.append({"path": path or "$", "enroll_status": obj.get("enroll_status")})
+            for k, v in obj.items():
+                child = f"{path}.{k}" if path else str(k)
+                rows.extend(collect_enroll_statuses(v, child))
+        elif isinstance(obj, list):
+            for i, v in enumerate(obj):
+                rows.extend(collect_enroll_statuses(v, f"{path}[{i}]"))
+        return rows
+
+    enhancement_statuses = collect_enroll_statuses(enhancement_fields)
+    enhancement_opt_ins = [
+        x for x in enhancement_statuses
+        if str(x.get("enroll_status") or "").upper() == "OPT_IN"
+    ]
+
     source_pixel = find_nested(source.get("promoted_object") or {}, "pixel_id")
     copied_pixel = find_nested(copied_adset.get("promoted_object") or {}, "pixel_id")
 
     result = {
-        "mode": "MINIMAL_REBUILD",
+        "mode": "CLEAN_REBUILD",
         "account_id": account_id,
         "source_adset_id": source_adset_id,
         "copied_adset_id": copied_adset_id,
@@ -640,6 +632,8 @@ def create_minimal_clone(source_adset_id):
         "ad_diffs": ad_diffs,
         "creative_diffs": creative_diffs,
         "enhancement_fields_after_create": enhancement_fields,
+        "enhancement_enroll_statuses": enhancement_statuses,
+        "enhancement_opt_ins": enhancement_opt_ins,
         "source_adset": source,
         "copied_adset": copied_adset,
         "source_ad": source_ad,
@@ -656,7 +650,7 @@ def create_minimal_clone(source_adset_id):
         and not adset_diffs
         and not ad_diffs
         and not creative_diffs
-        and not enhancement_fields
+        and not enhancement_opt_ins
     )
     return result
 
@@ -665,7 +659,7 @@ def format_error(e, source_id):
     if isinstance(e, MetaRequestError):
         info = e.info
         parts = [
-            "❌ <b>Duplicate test v8 error</b>",
+            "❌ <b>Duplicate test v10 error</b>",
             f"Source Adset: <code>{esc(source_id)}</code>",
             f"Stage: <b>{esc(e.stage or 'unknown')}</b>",
         ]
@@ -676,7 +670,7 @@ def format_error(e, source_id):
             parts.append(f"fbtrace_id: {esc(info.get('fbtrace_id'))}")
         return "\n".join(parts)
     return (
-        "❌ <b>Duplicate test v8 error</b>\n"
+        "❌ <b>Duplicate test v10 error</b>\n"
         f"Source Adset: <code>{esc(source_id)}</code>\n"
         f"Partial: {esc(json.dumps(PARTIAL, ensure_ascii=False))}\n"
         f"{esc(str(e))}"
@@ -687,16 +681,17 @@ def summary_message(result):
     enhancement = result.get("enhancement_fields_after_create") or {}
     media = result.get("media_audit") or {}
     lines = [
-        "✅ <b>Duplicate test v8 • MINIMAL REBUILD</b>",
+        "✅ <b>Duplicate test v10 • CLEAN REBUILD</b>",
         f"Account: <code>{esc(result.get('account_id'))}</code>",
         f"Source Adset: <code>{esc(result.get('source_adset_id'))}</code>",
         f"Copy Adset: <code>{esc(result.get('copied_adset_id'))}</code> (PAUSED)",
         f"Source Ad → Copy Ad: <code>{esc(result.get('source_ad_id'))}</code> → <code>{esc(result.get('copied_ad_id'))}</code>",
         f"Creative: <code>{esc(result.get('source_creative_id'))}</code> → <code>{esc(result.get('copied_creative_id'))}</code> {'✅ NEW' if result.get('creative_id_changed') else '❌ SAME'}",
         f"Pixel: {esc(result.get('pixel_source'))} → {esc(result.get('pixel_copy'))} {'✅' if result.get('pixel_match') else '❌'}",
-        f"Media: {esc(media.get('mode'))} • preview: {esc((media.get('thumbnail') or {}).get('strategy'))} • new image hash: <code>{esc(media.get('new_image_hash'))}</code>", 
+        f"Media: {esc(media.get('mode'))} • preview: {esc(media.get('preview_strategy'))} • hash: <code>{esc(media.get('new_image_hash') or 'NONE')}</code>",
         f"Diffs: adset={len(result.get('adset_diffs', []))}, ad={len(result.get('ad_diffs', []))}, creative_core={len(result.get('creative_diffs', []))}",
-        f"Enhancement fields after create: {len(enhancement)} {'✅ none' if not enhancement else '⚠️ inspect'}",
+        f"Enhancement containers after create: {len(enhancement)}",
+        f"Enhancements OPT_IN: {len(result.get('enhancement_opt_ins', []))} {'✅ none' if not result.get('enhancement_opt_ins') else '⚠️ inspect'}",
         f"Critical OK: {'✅ YES' if result.get('critical_ok') else '⚠️ NO'}",
     ]
     return "\n".join(lines)
@@ -717,14 +712,14 @@ def main():
     report = {"api_access": diag, "source_adset_id": source_id, "result": None, "error": None}
 
     try:
-        result = create_minimal_clone(source_id)
+        result = create_clean_clone(source_id)
         report["result"] = result
         send_telegram(summary_message(result))
         exit_code = 0 if result.get("critical_ok") else 1
     except SkipSource as e:
         report["error"] = {"type": "skip", "message": str(e), "partial": deepcopy(PARTIAL)}
         send_telegram(
-            "⏭ <b>Duplicate test v8 skipped</b>\n"
+            "⏭ <b>Duplicate test v10 skipped</b>\n"
             f"Source Adset: <code>{esc(source_id)}</code>\n{esc(str(e))}"
         )
         exit_code = 1
