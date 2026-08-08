@@ -1,10 +1,10 @@
-name: FB Duplicate Test — Ordinary Ads v5
+name: FB Duplicate Test — Ordinary Ads v6 Compatibility
 
 on:
   workflow_dispatch:
     inputs:
       adset_id:
-        description: 'ONE ordinary adset ID. Creates one PAUSED native deep copy. Catalogs are skipped.'
+        description: 'ONE ordinary adset ID. Native deep-copy first; legacy 3858504 falls back to a NEW creative compatibility clone. Everything PAUSED.'
         required: true
         type: string
 
@@ -22,7 +22,7 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Run ordinary duplicate test v5
+      - name: Run ordinary duplicate compatibility test v6
         env:
           FB_SCALER_ACCESS_TOKEN: ${{ secrets.FB_SCALER_ACCESS_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -34,6 +34,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: fb-duplicate-test-ordinary-v5-report
-          path: duplicate_test_ordinary_v5_report.json
+          name: fb-duplicate-test-v6-compat-report
+          path: duplicate_test_v6_compat_report.json
           if-no-files-found: ignore
