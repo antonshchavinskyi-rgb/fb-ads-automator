@@ -1,10 +1,10 @@
-name: FB Duplicate Test v3 v2
+name: FB Duplicate Test — Ordinary Ads v4
 
 on:
   workflow_dispatch:
     inputs:
       adset_ids:
-        description: 'Adset IDs, comma or space separated (max 5). Creates PAUSED deep copies.'
+        description: 'Ordinary adset IDs only, comma/space separated (max 5). Catalogs are skipped. Creates PAUSED deep copies.'
         required: true
         type: string
 
@@ -22,7 +22,7 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Run duplicate test v2
+      - name: Run ordinary duplicate test v4
         env:
           FB_ACCESS_TOKEN: ${{ secrets.FB_ACCESS_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -34,6 +34,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: fb-duplicate-test-v2-report
-          path: duplicate_test_report.json
+          name: fb-duplicate-test-ordinary-v4-report
+          path: duplicate_test_ordinary_report.json
           if-no-files-found: ignore
