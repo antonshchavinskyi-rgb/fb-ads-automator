@@ -16,7 +16,7 @@ from fb_config import API_VER, POLAND_TZ
 ACCESS_TOKEN = os.environ.get("FB_SCALER_ACCESS_TOKEN")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-REPORT_FILE = "duplicate_test_v8_minimal_report.json"
+REPORT_FILE = "duplicate_test_v9_preview_report.json"
 
 # This test intentionally handles ONE ordinary adset per run and creates PAUSED objects only.
 # Catalog adsets are skipped in this phase.
@@ -256,28 +256,117 @@ def upload_image_to_ad_account(account_id, image_bytes, content_type, stage):
     return str(h), payload
 
 
-def fresh_video_thumbnail_hash(video_id, account_id):
-    thumbs = graph_get_all(
-        f"{video_id}/thumbnails",
-        {"fields": "id,height,width,scale,uri,is_preferred"},
-        stage="video_thumbnails",
-    )
-    usable = [x for x in thumbs if x.get("uri")]
-    if not usable:
-        raise SkipSource("Video has no API-accessible generated thumbnails.")
+def _thumb_rows(value):
+    """Normalize Graph field-expansion response for Video.thumbnails."""
+    if isinstance(value, dict):
+        value = value.get("data", [])
+    if not isinstance(value, list):
+        return []
+    return [x for x in value if isinstance(x, dict) and x.get("uri")]
 
-    # To avoid carrying source image_hash, select one of Meta's generated frames.
-    # Random selection approximates the user's current manual 'automatic preview' workflow,
-    # but it is not the Ads Manager automatic-thumbnail feature itself.
-    preferred = [x for x in usable if x.get("is_preferred")]
-    pool = preferred if preferred else usable
-    selected = random.choice(pool)
-    image_bytes, content_type = download_bytes(selected["uri"], "video_thumbnail_download")
-    new_hash, upload_raw = upload_image_to_ad_account(
-        account_id, image_bytes, content_type, "video_thumbnail_upload"
-    )
-    return new_hash, {"selected": selected, "upload": upload_raw}
 
+def find_video_in_ad_account_library(video_id, account_id, max_pages=3, page_limit=100):
+    """Find an ad video through the ad-account /advideos edge.
+
+    A video_id used by an ad can belong to the ad account video library even when
+    GET /{video_id} is not readable by the system-user token. We therefore search
+    the account video library and expand its thumbnail connection. This is a
+    bounded lookup to protect API quota during tests.
+    """
+    params = {
+        "access_token": ACCESS_TOKEN,
+        "fields": "id,picture,thumbnails.limit(20){id,height,width,scale,uri,is_preferred}",
+        "limit": page_limit,
+    }
+    url = (
+        f"https://graph.facebook.com/{API_VER}/act_{account_id}/advideos?"
+        + urllib.parse.urlencode({k: serialize_param(v) for k, v in params.items() if v is not None})
+    )
+    pages = 0
+    while url and pages < max_pages:
+        pages += 1
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url), timeout=60) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            info = decode_meta_error(e.read().decode("utf-8", errors="replace"))
+            raise MetaRequestError(e.code, info, stage="account_advideos_lookup")
+        for row in payload.get("data", []):
+            if str(row.get("id")) == str(video_id):
+                return row, pages
+        url = payload.get("paging", {}).get("next")
+    return None, pages
+
+
+def fresh_video_thumbnail_hash(video_id, account_id, source_creative):
+    """Create a fresh ad-image hash for the video's thumbnail.
+
+    Preferred path: choose one of Meta's generated thumbnails from the ad-account
+    video library, then re-upload it as a fresh ad image. This gives a fresh hash
+    and can choose a different generated frame.
+
+    Fallback: re-upload the source creative's thumbnail_url. The hash is still new,
+    but the visual preview is reused. We record this explicitly in the audit.
+
+    We do NOT omit thumbnail entirely: Marketing API video_data requires a video
+    thumbnail (image_hash or image_url).
+    """
+    lookup_warning = None
+    try:
+        video_row, pages = find_video_in_ad_account_library(str(video_id), str(account_id))
+        if video_row:
+            thumbs = _thumb_rows(video_row.get("thumbnails"))
+            if thumbs:
+                # Prefer a non-preferred alternative when available, so the test can
+                # exercise a fresh generated frame rather than simply cloning the old preview.
+                alternatives = [x for x in thumbs if not x.get("is_preferred")]
+                pool = alternatives or thumbs
+                selected = random.choice(pool)
+                image_bytes, content_type = download_bytes(selected["uri"], "video_thumbnail_download")
+                new_hash, upload_raw = upload_image_to_ad_account(
+                    account_id, image_bytes, content_type, "video_thumbnail_upload"
+                )
+                return new_hash, {
+                    "strategy": "AD_ACCOUNT_GENERATED_THUMBNAIL",
+                    "video_library_pages": pages,
+                    "selected": selected,
+                    "upload": upload_raw,
+                }
+            if video_row.get("picture"):
+                image_bytes, content_type = download_bytes(video_row["picture"], "video_picture_download")
+                new_hash, upload_raw = upload_image_to_ad_account(
+                    account_id, image_bytes, content_type, "video_picture_upload"
+                )
+                return new_hash, {
+                    "strategy": "AD_ACCOUNT_VIDEO_PICTURE",
+                    "video_library_pages": pages,
+                    "source_url": video_row.get("picture"),
+                    "upload": upload_raw,
+                }
+            lookup_warning = f"Video {video_id} found in ad-account library but no usable thumbnails/picture returned."
+        else:
+            lookup_warning = f"Video {video_id} not found within bounded ad-account video-library lookup."
+    except Exception as e:
+        lookup_warning = f"Ad-account video thumbnail lookup failed: {e}"
+
+    # Safe fallback: source creative thumbnail is already readable through AdCreative.
+    fallback_url = source_creative.get("thumbnail_url") or source_creative.get("image_url")
+    if fallback_url:
+        image_bytes, content_type = download_bytes(fallback_url, "source_creative_thumbnail_download")
+        new_hash, upload_raw = upload_image_to_ad_account(
+            account_id, image_bytes, content_type, "source_creative_thumbnail_upload"
+        )
+        return new_hash, {
+            "strategy": "SOURCE_CREATIVE_THUMBNAIL_REUPLOAD",
+            "source_url": fallback_url,
+            "warning": lookup_warning,
+            "upload": upload_raw,
+        }
+
+    raise SkipSource(
+        "No API-accessible generated thumbnail and source creative has no thumbnail_url/image_url. "
+        + (lookup_warning or "")
+    )
 
 def fresh_image_hash(source_creative, link_data, account_id):
     # We do not reuse the source image_hash. Download the rendered/source image and upload again.
@@ -326,7 +415,7 @@ def build_minimal_creative(source_creative, account_id, suffix):
         if not video_id:
             raise SkipSource("Video creative has no video_id.")
 
-        new_hash, thumb_meta = fresh_video_thumbnail_hash(str(video_id), str(account_id))
+        new_hash, thumb_meta = fresh_video_thumbnail_hash(str(video_id), str(account_id), source_creative)
         minimal_vd = clean_dict({
             "video_id": str(video_id),
             "message": vd.get("message"),
@@ -605,7 +694,7 @@ def summary_message(result):
         f"Source Ad → Copy Ad: <code>{esc(result.get('source_ad_id'))}</code> → <code>{esc(result.get('copied_ad_id'))}</code>",
         f"Creative: <code>{esc(result.get('source_creative_id'))}</code> → <code>{esc(result.get('copied_creative_id'))}</code> {'✅ NEW' if result.get('creative_id_changed') else '❌ SAME'}",
         f"Pixel: {esc(result.get('pixel_source'))} → {esc(result.get('pixel_copy'))} {'✅' if result.get('pixel_match') else '❌'}",
-        f"Media: {esc(media.get('mode'))} • new thumbnail/image hash: <code>{esc(media.get('new_image_hash'))}</code>",
+        f"Media: {esc(media.get('mode'))} • preview: {esc((media.get('thumbnail') or {}).get('strategy'))} • new image hash: <code>{esc(media.get('new_image_hash'))}</code>", 
         f"Diffs: adset={len(result.get('adset_diffs', []))}, ad={len(result.get('ad_diffs', []))}, creative_core={len(result.get('creative_diffs', []))}",
         f"Enhancement fields after create: {len(enhancement)} {'✅ none' if not enhancement else '⚠️ inspect'}",
         f"Critical OK: {'✅ YES' if result.get('critical_ok') else '⚠️ NO'}",
