@@ -11,12 +11,12 @@ from datetime import datetime
 
 from fb_config import API_VER, POLAND_TZ
 
-ACCESS_TOKEN = os.environ.get("FB_ACCESS_TOKEN")
+ACCESS_TOKEN = os.environ.get("FB_SCALER_ACCESS_TOKEN")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-MAX_TEST_ADSETS = 5
-REPORT_FILE = "duplicate_test_ordinary_report.json"
+MAX_TEST_ADSETS = 1
+REPORT_FILE = "duplicate_test_ordinary_v5_report.json"
 
 # Core fields we actually need to verify settings. If Meta rejects any field,
 # the resilient reader splits the request and records the exact unavailable field
@@ -115,13 +115,21 @@ class MetaRequestError(RuntimeError):
         super().__init__(text)
 
 
-def graph_request(method, path, params=None, retries=3, stage=None):
+def graph_request(method, path, params=None, retries=1, stage=None):
+    """Conservative Graph API request helper for duplicate testing.
+
+    Safety rules:
+    - POST requests are NEVER retried automatically, because a copy/create call may
+      have succeeded even if the response was lost; retrying could create duplicates.
+    - Error 17 / app-rate-limit errors stop immediately; we do not hammer Meta.
+    - GET requests may retry once after 30s only for generic transient server errors.
+    """
     params = dict(params or {})
     params["access_token"] = ACCESS_TOKEN
     url = f"https://graph.facebook.com/{API_VER}/{path.lstrip('/')}"
-    delays = [5, 15, 45]
 
-    for attempt in range(retries + 1):
+    max_attempts = 1 if method != "GET" else (retries + 1)
+    for attempt in range(max_attempts):
         try:
             if method == "GET":
                 full_url = url + "?" + urllib.parse.urlencode(params)
@@ -135,11 +143,15 @@ def graph_request(method, path, params=None, retries=3, stage=None):
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
             info = decode_meta_error(body)
-            transient = info.get("is_transient") or info.get("code") in TRANSIENT_CODES
-            if transient and attempt < retries:
-                delay = delays[min(attempt, len(delays) - 1)]
-                print(f"[{stage or 'request'}] Meta transient error {info.get('code')}; retry in {delay}s", flush=True)
-                time.sleep(delay)
+            code = info.get("code")
+            # User/app/business rate limits: stop immediately, no retry storm.
+            if code in {4, 17, 80004}:
+                raise MetaRequestError(e.code, info, stage=stage)
+            # Generic transient GET error: one calm retry after 30s.
+            transient = info.get("is_transient") or code in {1, 2}
+            if method == "GET" and transient and attempt < max_attempts - 1:
+                print(f"[{stage or 'request'}] Meta transient error {code}; retry once in 30s", flush=True)
+                time.sleep(30)
                 continue
             raise MetaRequestError(e.code, info, stage=stage)
 
@@ -705,7 +717,7 @@ def error_summary(source_id, e, partial=None):
 
 def main():
     if not ACCESS_TOKEN:
-        raise SystemExit("FB_ACCESS_TOKEN is missing")
+        raise SystemExit("FB_SCALER_ACCESS_TOKEN is missing")
 
     ids = parse_ids()
     now = datetime.now(POLAND_TZ)
@@ -721,10 +733,10 @@ def main():
         "errors": [],
     }
 
-    print("FB ordinary duplicate test v4: native deep-copy, always PAUSED; catalogs skipped.", flush=True)
+    print("FB ordinary duplicate test v5: dedicated for_scaler token, 1 adset/run, native deep-copy, always PAUSED; catalogs skipped.", flush=True)
     print(json.dumps({"api_access": access_diag}, ensure_ascii=False, indent=2), flush=True)
     send_telegram(access_diag_summary(access_diag))
-    print("Important: ordinary ads only. Catalog sources are skipped. Creative IDs are audited and expected to be NEW.", flush=True)
+    print("Important: ordinary ads only. One source per run. Catalog sources are skipped. Creative IDs are audited and expected to be NEW.", flush=True)
     print(f"IDs: {ids}", flush=True)
 
     for source_id in ids:
