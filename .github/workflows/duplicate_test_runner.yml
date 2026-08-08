@@ -1,4 +1,4 @@
-name: FB Duplicate Test — Minimal Ordinary Ad v8
+name: FB Duplicate Test — Minimal Ordinary Ad v9 — Preview
 
 on:
   workflow_dispatch:
@@ -21,7 +21,7 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Run minimal duplicate test v8
+      - name: Run minimal duplicate test v9
         env:
           FB_SCALER_ACCESS_TOKEN: ${{ secrets.FB_SCALER_ACCESS_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -33,6 +33,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: duplicate-test-v8-report
-          path: duplicate_test_v8_minimal_report.json
+          name: duplicate-test-v9-report
+          path: duplicate_test_v9_preview_report.json
           if-no-files-found: ignore
