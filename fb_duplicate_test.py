@@ -7,6 +7,7 @@ import re
 import urllib.request
 import urllib.parse
 import urllib.error
+from copy import deepcopy
 from datetime import datetime
 
 from fb_config import API_VER, POLAND_TZ
@@ -16,11 +17,9 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 MAX_TEST_ADSETS = 1
-REPORT_FILE = "duplicate_test_ordinary_v5_report.json"
+REPORT_FILE = "duplicate_test_v6_compat_report.json"
 
-# Core fields we actually need to verify settings. If Meta rejects any field,
-# the resilient reader splits the request and records the exact unavailable field
-# instead of aborting the whole test.
+# Ordinary ads only for this phase. Catalogs are intentionally skipped.
 ADSET_FIELDS = [
     "id", "name", "account_id", "campaign_id", "status", "effective_status",
     "bid_strategy", "bid_amount", "bid_constraints", "billing_event",
@@ -35,21 +34,53 @@ AD_FIELDS = [
     "source_ad_id",
 ]
 
-# Fields most relevant to checking whether Meta silently changes creative automation/
-# Advantage+ enhancements. These are optional probes: lack of permission for one field
-# does not abort the duplicate test.
+# Readable fields useful for source diagnosis and post-create audit.
 CREATIVE_FIELDS = [
-    "id", "name", "object_story_id", "object_story_spec", "asset_feed_spec",
-    "degrees_of_freedom_spec", "creative_sourcing_spec", "format_transformation_spec",
-    "generative_asset_spec", "product_set_id", "url_tags", "instagram_user_id",
-    "source_facebook_post_id", "source_instagram_media_id", "template_url",
-    "template_url_spec", "platform_customizations", "dynamic_ad_voice",
-    "product_suggestion_settings", "recommender_settings", "place_page_set_id",
-    "destination_set_id", "destination_spec", "omnichannel_link_spec",
-    "contextual_multi_ads",
+    "id", "name", "account_id", "object_story_id", "effective_object_story_id",
+    "object_story_spec", "asset_feed_spec", "degrees_of_freedom_spec",
+    "creative_sourcing_spec", "format_transformation_spec", "generative_asset_spec",
+    "url_tags", "instagram_user_id", "platform_customizations", "contextual_multi_ads",
+    "dynamic_ad_voice", "destination_set_id", "destination_spec",
+    "omnichannel_link_spec", "place_page_set_id", "product_suggestion_settings",
+    "recommender_settings", "template_url", "template_url_spec",
+    "use_page_actor_override", "source_facebook_post_id", "source_instagram_media_id",
+    "image_hash", "image_url", "video_id", "thumbnail_url", "title", "body",
 ]
 
-TRANSIENT_CODES = {4, 17, 80004}
+# Fields Meta's current create-ad-creative endpoint accepts and that can be sensibly
+# cloned from an existing ordinary creative. We only send fields actually present.
+CREATIVE_CREATE_ALLOWLIST = {
+    "object_story_spec",
+    "asset_feed_spec",
+    "degrees_of_freedom_spec",
+    "creative_sourcing_spec",
+    "format_transformation_spec",
+    "generative_asset_spec",
+    "url_tags",
+    "instagram_user_id",
+    "platform_customizations",
+    "contextual_multi_ads",
+    "dynamic_ad_voice",
+    "destination_set_id",
+    "destination_spec",
+    "omnichannel_link_spec",
+    "place_page_set_id",
+    "product_suggestion_settings",
+    "recommender_settings",
+    "template_url",
+    "template_url_spec",
+    "use_page_actor_override",
+}
+
+# Legacy field explicitly rejected by Meta with subcode 3858504.
+LEGACY_KEYS_TO_REMOVE = {"standard_enhancements"}
+
+RELEVANT_PERMISSION_NAMES = {
+    "ads_management", "ads_read", "business_management",
+    "pages_show_list", "pages_read_engagement", "pages_manage_ads",
+    "instagram_basic", "instagram_manage_insights",
+}
+
 PARTIAL_RESULTS = {}
 
 
@@ -98,7 +129,6 @@ def decode_meta_error(body):
 
 
 class SkipSource(RuntimeError):
-    """Intentional test skip, not a failure."""
     pass
 
 
@@ -115,14 +145,21 @@ class MetaRequestError(RuntimeError):
         super().__init__(text)
 
 
-def graph_request(method, path, params=None, retries=1, stage=None):
-    """Conservative Graph API request helper for duplicate testing.
+def serialize_param(value):
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return value
 
-    Safety rules:
-    - POST requests are NEVER retried automatically, because a copy/create call may
-      have succeeded even if the response was lost; retrying could create duplicates.
-    - Error 17 / app-rate-limit errors stop immediately; we do not hammer Meta.
-    - GET requests may retry once after 30s only for generic transient server errors.
+
+def graph_request(method, path, params=None, retries=0, stage=None):
+    """Conservative Graph API helper.
+
+    - POST is never retried automatically: create/copy may have succeeded even if
+      the response was lost, so automatic retry could create duplicates.
+    - Rate-limit errors stop immediately.
+    - GET may retry only when retries>0 and Meta marks the error transient.
     """
     params = dict(params or {})
     params["access_token"] = ACCESS_TOKEN
@@ -131,11 +168,12 @@ def graph_request(method, path, params=None, retries=1, stage=None):
     max_attempts = 1 if method != "GET" else (retries + 1)
     for attempt in range(max_attempts):
         try:
+            encoded = {k: serialize_param(v) for k, v in params.items() if v is not None}
             if method == "GET":
-                full_url = url + "?" + urllib.parse.urlencode(params)
+                full_url = url + "?" + urllib.parse.urlencode(encoded)
                 req = urllib.request.Request(full_url, method="GET")
             else:
-                data = urllib.parse.urlencode(params).encode("utf-8")
+                data = urllib.parse.urlencode(encoded).encode("utf-8")
                 req = urllib.request.Request(url, data=data, method="POST")
             with urllib.request.urlopen(req, timeout=60) as resp:
                 body = resp.read().decode("utf-8")
@@ -144,27 +182,17 @@ def graph_request(method, path, params=None, retries=1, stage=None):
             body = e.read().decode("utf-8", errors="replace")
             info = decode_meta_error(body)
             code = info.get("code")
-            # User/app/business rate limits: stop immediately, no retry storm.
             if code in {4, 17, 80004}:
                 raise MetaRequestError(e.code, info, stage=stage)
-            # Generic transient GET error: one calm retry after 30s.
             transient = info.get("is_transient") or code in {1, 2}
             if method == "GET" and transient and attempt < max_attempts - 1:
-                print(f"[{stage or 'request'}] Meta transient error {code}; retry once in 30s", flush=True)
+                print(f"[{stage or 'request'}] Meta transient error {code}; retry in 30s", flush=True)
                 time.sleep(30)
                 continue
             raise MetaRequestError(e.code, info, stage=stage)
 
 
-RELEVANT_PERMISSION_NAMES = {
-    "ads_management", "ads_read", "business_management",
-    "pages_show_list", "pages_read_engagement", "pages_manage_ads",
-    "instagram_basic", "instagram_manage_insights",
-}
-
-
 def get_api_access_diagnostics():
-    """Read token identity + granted/declined OAuth permissions. No extra secret required."""
     diag = {
         "identity": None,
         "permissions": [],
@@ -174,16 +202,11 @@ def get_api_access_diagnostics():
         "errors": [],
     }
     try:
-        diag["identity"] = graph_request(
-            "GET", "me", {"fields": "id,name"}, stage="access_diag:me"
-        )
+        diag["identity"] = graph_request("GET", "me", {"fields": "id,name"}, stage="access_diag:me")
     except Exception as e:
         diag["errors"].append({"stage": "me", "error": str(e)})
-
     try:
-        rows = graph_request(
-            "GET", "me/permissions", {}, stage="access_diag:permissions"
-        ).get("data", [])
+        rows = graph_request("GET", "me/permissions", {}, stage="access_diag:permissions").get("data", [])
         diag["permissions"] = rows
         for row in rows:
             name = row.get("permission")
@@ -215,68 +238,10 @@ def access_diag_summary(diag):
     ]
     if diag.get("errors"):
         lines.append(f"Diagnostic errors: {len(diag['errors'])}")
-    lines.append("ℹ️ OAuth scopes ≠ asset-level access. Page/Instagram access is probed separately per source adset.")
     return "\n".join(lines)
 
 
-def extract_identity_ids_from_ads(ads):
-    page_ids = set()
-    instagram_ids = set()
-    creative_ids = []
-    for ad in ads or []:
-        creative_ref = ad.get("creative") or {}
-        cid = creative_ref.get("id") if isinstance(creative_ref, dict) else None
-        if not cid:
-            continue
-        creative_ids.append(str(cid))
-        creative, _ = get_node_fields_resilient(
-            cid, ["id", "object_story_id", "object_story_spec", "instagram_user_id"],
-            stage_prefix=f"access_diag:creative:{cid}"
-        )
-        spec = creative.get("object_story_spec") or {}
-        if isinstance(spec, dict) and spec.get("page_id"):
-            page_ids.add(str(spec.get("page_id")))
-        story_id = creative.get("object_story_id")
-        if story_id and "_" in str(story_id):
-            # object_story_id normally starts with the Page ID. Use as fallback only.
-            page_ids.add(str(story_id).split("_", 1)[0])
-        if creative.get("instagram_user_id"):
-            instagram_ids.add(str(creative.get("instagram_user_id")))
-    return sorted(page_ids), sorted(instagram_ids), creative_ids
-
-
-def probe_asset(node_id, kind):
-    try:
-        data = graph_request(
-            "GET", str(node_id), {"fields": "id,name"}, stage=f"access_diag:{kind}:{node_id}"
-        )
-        return {"id": str(node_id), "kind": kind, "accessible": True, "data": data}
-    except MetaRequestError as e:
-        return {
-            "id": str(node_id), "kind": kind, "accessible": False,
-            "error": {
-                "message": e.info.get("message"), "code": e.info.get("code"),
-                "subcode": e.info.get("subcode"), "user_title": e.info.get("user_title"),
-                "user_msg": e.info.get("user_msg"),
-            },
-        }
-
-
-def get_source_asset_access(source_ads_basic):
-    page_ids, instagram_ids, creative_ids = extract_identity_ids_from_ads(source_ads_basic)
-    pages = [probe_asset(x, "page") for x in page_ids]
-    instagram = [probe_asset(x, "instagram") for x in instagram_ids]
-    return {
-        "creative_ids": creative_ids,
-        "page_ids": page_ids,
-        "instagram_ids": instagram_ids,
-        "pages": pages,
-        "instagram": instagram,
-    }
-
-
 def get_node_fields_resilient(node_id, fields, stage_prefix):
-    """Fetch as many requested fields as possible without one protected field killing the test."""
     data = {"id": str(node_id)}
     unavailable = []
 
@@ -297,15 +262,13 @@ def get_node_fields_resilient(node_id, fields, stage_prefix):
             fetch_group(group[:mid])
             fetch_group(group[mid:])
 
-    # Fetch in moderate chunks first; split only on failure.
     chunk_size = 8
     for i in range(0, len(fields), chunk_size):
         fetch_group(fields[i:i + chunk_size])
     return data, unavailable
 
 
-def get_edge_fields_resilient(node_id, edge, fields, limit=50, stage_prefix="edge"):
-    """Same idea as resilient node fetch, but returns rows merged by id."""
+def get_edge_fields_resilient(node_id, edge, fields, limit=20, stage_prefix="edge"):
     rows_by_id = {}
     unavailable = []
 
@@ -329,7 +292,6 @@ def get_edge_fields_resilient(node_id, edge, fields, limit=50, stage_prefix="edg
             fetch_group(group[:mid])
             fetch_group(group[mid:])
 
-    # Always include id so rows can be merged.
     fields = list(dict.fromkeys(["id"] + list(fields)))
     chunk_size = 6
     for i in range(0, len(fields), chunk_size):
@@ -337,32 +299,11 @@ def get_edge_fields_resilient(node_id, edge, fields, limit=50, stage_prefix="edg
     return list(rows_by_id.values()), unavailable
 
 
-def get_ads_with_creatives_resilient(adset_id, stage_prefix):
-    ads, ad_unavailable = get_edge_fields_resilient(
-        adset_id, "ads", AD_FIELDS, limit=50, stage_prefix=f"{stage_prefix}:ads"
-    )
-    creative_unavailable = []
-    for ad in ads:
-        creative_ref = ad.get("creative") or {}
-        creative_id = creative_ref.get("id") if isinstance(creative_ref, dict) else None
-        if creative_id:
-            creative, unavailable = get_node_fields_resilient(
-                creative_id, CREATIVE_FIELDS, stage_prefix=f"{stage_prefix}:creative:{creative_id}"
-            )
-            ad["_creative_full"] = creative
-            for item in unavailable:
-                item = dict(item)
-                item["creative_id"] = creative_id
-                creative_unavailable.append(item)
-        else:
-            ad["_creative_full"] = None
-    return ads, ad_unavailable, creative_unavailable
-
-
 def normalized(value):
     if isinstance(value, dict):
         return {k: normalized(v) for k, v in sorted(value.items())}
     if isinstance(value, list):
+        # Preserve list order; Meta list semantics may be positional.
         return [normalized(v) for v in value]
     return value
 
@@ -408,32 +349,91 @@ def parse_ids():
     ids = [x for x in re.split(r"[\s,;]+", raw.strip()) if x]
     ids = list(dict.fromkeys(ids))
     if not ids:
-        raise SystemExit("No adset IDs. Pass CLI IDs or DUPLICATE_TEST_ADSET_IDS.")
+        raise SystemExit("No adset ID. Pass CLI ID or DUPLICATE_TEST_ADSET_IDS.")
     if len(ids) > MAX_TEST_ADSETS:
-        raise SystemExit(f"Safety limit: max {MAX_TEST_ADSETS} adsets per test run.")
-    for x in ids:
-        if not x.isdigit():
-            raise SystemExit(f"Invalid adset ID: {x}")
+        raise SystemExit(f"Safety limit: max {MAX_TEST_ADSETS} adset per run.")
+    if not ids[0].isdigit():
+        raise SystemExit(f"Invalid adset ID: {ids[0]}")
     return ids
 
 
-def pair_ads(source_ads, copied_ads):
-    """Prefer source_ad_id mapping; then same creative id; then position."""
-    copy_by_source = {str(a.get("source_ad_id")): a for a in copied_ads if a.get("source_ad_id")}
-    used = set()
-    pairs = []
-    for src in source_ads:
-        src_id = str(src.get("id"))
-        dst = copy_by_source.get(src_id)
-        if dst:
-            used.add(str(dst.get("id")))
-        pairs.append([src, dst])
+def source_is_catalog(source):
+    promoted = source.get("promoted_object") or {}
+    return bool(find_value(promoted, "product_set_id"))
 
-    leftovers = [a for a in copied_ads if str(a.get("id")) not in used]
-    for pair in pairs:
-        if pair[1] is None and leftovers:
-            pair[1] = leftovers.pop(0)
-    return [(a, b) for a, b in pairs]
+
+def remove_legacy_keys(obj, path=""):
+    """Remove only explicitly known legacy keys; return sanitized object + removed paths."""
+    removed = []
+    if isinstance(obj, dict):
+        out = {}
+        for key, value in obj.items():
+            p = f"{path}.{key}" if path else key
+            if key in LEGACY_KEYS_TO_REMOVE:
+                removed.append(p)
+                continue
+            clean, nested_removed = remove_legacy_keys(value, p)
+            removed.extend(nested_removed)
+            # Drop empty maps/lists created only by removing a legacy field.
+            if clean == {} or clean == [] or clean is None:
+                continue
+            out[key] = clean
+        return out, removed
+    if isinstance(obj, list):
+        out = []
+        for idx, value in enumerate(obj):
+            clean, nested_removed = remove_legacy_keys(value, f"{path}[{idx}]")
+            removed.extend(nested_removed)
+            if clean == {} or clean == [] or clean is None:
+                continue
+            out.append(clean)
+        return out, removed
+    return obj, removed
+
+
+def build_compat_creative_payload(source_creative, suffix):
+    """Build a NEW creative using source object_story_spec and supported fields.
+
+    We intentionally do NOT fall back to object_story_id. Meta documents that reusing an
+    object_story_id can return the already-existing creative, which would defeat our goal
+    of getting a new creative ID for every duplicate.
+    """
+    if not source_creative.get("object_story_spec"):
+        raise SkipSource(
+            "Compatibility clone needs object_story_spec to guarantee a NEW creative ID. "
+            "Source only exposes an existing story/post or insufficient creative structure."
+        )
+
+    payload = {
+        "name": f"{source_creative.get('name') or 'creative'}{suffix}",
+    }
+    removed_paths = []
+    for field in CREATIVE_CREATE_ALLOWLIST:
+        if field not in source_creative or source_creative.get(field) in (None, {}, []):
+            continue
+        clean, removed = remove_legacy_keys(deepcopy(source_creative.get(field)), field)
+        removed_paths.extend(removed)
+        if clean not in (None, {}, []):
+            payload[field] = clean
+
+    if not payload.get("object_story_spec"):
+        raise SkipSource("object_story_spec became empty during compatibility sanitization.")
+
+    return payload, sorted(set(removed_paths))
+
+
+def build_new_ad_payload(source_ad, copied_adset_id, new_creative_id, suffix):
+    payload = {
+        "name": f"{source_ad.get('name') or 'ad'}{suffix}",
+        "adset_id": str(copied_adset_id),
+        "creative": {"creative_id": str(new_creative_id)},
+        "status": "PAUSED",
+    }
+    for field in ("tracking_specs", "conversion_specs", "conversion_domain"):
+        value = source_ad.get(field)
+        if value not in (None, {}, [], ""):
+            payload[field] = deepcopy(value)
+    return payload
 
 
 def compare_adset(src, dst):
@@ -443,15 +443,16 @@ def compare_adset(src, dst):
 
 
 def compare_ad(src, dst):
-    src_core = {k: v for k, v in (src or {}).items() if k != "_creative_full"}
-    dst_core = {k: v for k, v in (dst or {}).items() if k != "_creative_full"}
-    return diff_dict(src_core, dst_core, ignore={
-        "id", "name", "status", "effective_status", "adset_id", "source_ad_id", "creative"
+    return diff_dict(src or {}, dst or {}, ignore={
+        "id", "name", "status", "effective_status", "adset_id", "campaign_id",
+        "source_ad_id", "creative"
     })
 
 
-def compare_creative(src, dst):
-    return diff_dict(src or {}, dst or {}, ignore={"id", "name"})
+def compare_expected_creative_payload(expected_payload, created_creative):
+    expected = {k: v for k, v in expected_payload.items() if k != "name"}
+    actual = {k: created_creative.get(k) for k in expected.keys()}
+    return diff_dict(expected, actual)
 
 
 def meta_error_summary(e):
@@ -466,253 +467,274 @@ def meta_error_summary(e):
     return " | ".join(parts)
 
 
-def source_is_catalog(source):
-    promoted = source.get("promoted_object") or {}
-    return bool(find_value(promoted, "product_set_id"))
-
-
-def creative_id_pairs(ad_reports):
-    rows = []
-    for row in ad_reports:
-        rows.append({
-            "source_ad_id": row.get("source_ad_id"),
-            "copied_ad_id": row.get("copied_ad_id"),
-            "source_creative_id": row.get("source_creative_id"),
-            "copied_creative_id": row.get("copied_creative_id"),
-            "creative_id_changed": bool(row.get("source_creative_id") and row.get("copied_creative_id") and str(row.get("source_creative_id")) != str(row.get("copied_creative_id"))),
-        })
-    return rows
-
-
-def test_one(source_id, suffix):
-    result = {
-        "source_adset_id": source_id,
-        "copy_created": False,
-        "copied_adset_id": None,
-        "stages": [],
-        "warnings": [],
-        "errors": [],
-    }
-
-    def stage(name, status="ok", detail=None):
-        row = {"stage": name, "status": status}
-        if detail is not None:
-            row["detail"] = detail
-        result["stages"].append(row)
-        print(f"[{source_id}] {name}: {status}" + (f" | {detail}" if detail else ""), flush=True)
-
-    # 1) Minimal/core source read. No creative inspection yet.
-    source, source_unavailable = get_node_fields_resilient(
-        source_id, ADSET_FIELDS, stage_prefix=f"source_adset:{source_id}"
-    )
-    if not source.get("campaign_id") or not source.get("account_id"):
-        raise RuntimeError("Cannot read source account_id/campaign_id; aborting before copy.")
-    if source_is_catalog(source):
-        raise SkipSource("Catalog/DPA source detected by product_set_id. Ordinary-ad test intentionally skips catalogs.")
-    stage("source_adset_read")
-    if source_unavailable:
-        result["warnings"].append({"source_adset_unavailable_fields": source_unavailable})
-        stage("source_adset_optional_fields", "warning", f"{len(source_unavailable)} unavailable")
-
-    # 2) Count/read source child ads without creative deep inspection.
-    source_ads_basic, source_ad_unavailable = get_edge_fields_resilient(
-        source_id, "ads", AD_FIELDS, limit=50, stage_prefix=f"source_ads:{source_id}"
-    )
-    if not source_ads_basic:
-        raise RuntimeError("Source adset has no readable child ads; aborting before copy.")
-    stage("source_ads_read", detail=f"{len(source_ads_basic)} ad(s)")
-    if source_ad_unavailable:
-        result["warnings"].append({"source_ads_unavailable_fields": source_ad_unavailable})
-
-    # Asset-level diagnostics: OAuth scopes alone do not prove access to the Page/IG identity
-    # used by the ad. Probe those identities before attempting the copy.
-    asset_access = get_source_asset_access(source_ads_basic)
-    result["asset_access"] = asset_access
-    PARTIAL_RESULTS[source_id] = {
-        "source_adset_id": source_id,
-        "account_id": source.get("account_id"),
-        "campaign_id": source.get("campaign_id"),
-        "asset_access": asset_access,
-    }
-    inaccessible_assets = [x for x in asset_access.get("pages", []) + asset_access.get("instagram", []) if not x.get("accessible")]
-    if inaccessible_assets:
-        result["warnings"].append({"inaccessible_assets": inaccessible_assets})
-        stage("source_identity_access", "warning", f"{len(inaccessible_assets)} inaccessible Page/IG asset(s)")
-    else:
-        stage("source_identity_access", detail=f"pages={len(asset_access.get('page_ids', []))}, ig={len(asset_access.get('instagram_ids', []))}")
-
-    # 3) Native Meta deep-copy with the smallest supported parameter set.
-    # Same campaign is implicit; no rename_options in the copy request. This isolates
-    # the actual /copies capability from optional parameters.
-    copy_response = graph_request(
-        "POST", f"{source_id}/copies",
-        {"deep_copy": "true", "status_option": "PAUSED"},
-        stage="adset_copy_post"
-    )
-    copied_id = str(copy_response.get("copied_adset_id") or copy_response.get("id") or "")
-    if not copied_id:
-        raise RuntimeError(f"Copy endpoint returned no copied_adset_id: {copy_response}")
-    result["copy_created"] = True
-    result["copied_adset_id"] = copied_id
-    PARTIAL_RESULTS[source_id] = {"copied_adset_id": copied_id, "copy_created": True}
-    result["copy_response"] = copy_response
-    stage("copy_created", detail=copied_id)
-
-    # 4) Rename in a separate call so rename_options cannot break the copy itself.
-    source_name = source.get("name") or f"source_{source_id}"
-    desired_name = f"{source_name}{suffix}"
-    try:
-        graph_request("POST", copied_id, {"name": desired_name, "status": "PAUSED"}, stage="rename_copy")
-        stage("copy_renamed")
-    except Exception as e:
-        result["warnings"].append({"rename_error": str(e)})
-        stage("copy_renamed", "warning", str(e))
-
-    # Give child ads a moment to materialize.
+def audit_result(source, source_ad, source_creative, copied_adset_id, copied_ad_id, copied_creative_id,
+                 expected_creative_payload, mode, removed_legacy_paths):
     time.sleep(4)
-
-    # 5) Full resilient audit after copy. Optional inaccessible fields are warnings.
-    copied, copied_unavailable = get_node_fields_resilient(
-        copied_id, ADSET_FIELDS, stage_prefix=f"copied_adset:{copied_id}"
+    copied, copied_unavail = get_node_fields_resilient(
+        copied_adset_id, ADSET_FIELDS, stage_prefix=f"audit:copied_adset:{copied_adset_id}"
     )
-    source_ads, src_ad_unavail, src_creative_unavail = get_ads_with_creatives_resilient(
-        source_id, stage_prefix=f"source_full:{source_id}"
+    copied_ad, ad_unavail = get_node_fields_resilient(
+        copied_ad_id, AD_FIELDS, stage_prefix=f"audit:copied_ad:{copied_ad_id}"
     )
-    copied_ads, dst_ad_unavail, dst_creative_unavail = get_ads_with_creatives_resilient(
-        copied_id, stage_prefix=f"copy_full:{copied_id}"
+    copied_creative, creative_unavail = get_node_fields_resilient(
+        copied_creative_id, CREATIVE_FIELDS, stage_prefix=f"audit:copied_creative:{copied_creative_id}"
     )
-    stage("post_copy_audit", detail=f"ads {len(source_ads)}→{len(copied_ads)}")
-
-    audit_unavailable = {
-        "copied_adset": copied_unavailable,
-        "source_ads": src_ad_unavail,
-        "source_creatives": src_creative_unavail,
-        "copied_ads": dst_ad_unavail,
-        "copied_creatives": dst_creative_unavail,
-    }
-    if any(audit_unavailable.values()):
-        result["warnings"].append({"audit_unavailable_fields": audit_unavailable})
 
     adset_diffs = compare_adset(source, copied)
-    ad_reports = []
-    for src_ad, dst_ad in pair_ads(source_ads, copied_ads):
-        if dst_ad is None:
-            ad_reports.append({
-                "source_ad_id": src_ad.get("id"), "copied_ad_id": None,
-                "missing_copy": True, "ad_diffs": [], "creative_diffs": []
-            })
-            continue
-        ad_reports.append({
-            "source_ad_id": src_ad.get("id"),
-            "copied_ad_id": dst_ad.get("id"),
-            "missing_copy": False,
-            "ad_diffs": compare_ad(src_ad, dst_ad),
-            "creative_diffs": compare_creative(src_ad.get("_creative_full"), dst_ad.get("_creative_full")),
-            "source_creative_id": (src_ad.get("creative") or {}).get("id"),
-            "copied_creative_id": (dst_ad.get("creative") or {}).get("id"),
-        })
+    ad_diffs = compare_ad(source_ad, copied_ad)
+    creative_payload_diffs = compare_expected_creative_payload(expected_creative_payload, copied_creative)
 
     source_pixel = find_value(source.get("promoted_object"), "pixel_id")
     copied_pixel = find_value(copied.get("promoted_object"), "pixel_id")
-    source_product_set = find_value(source.get("promoted_object"), "product_set_id")
-    copied_product_set = find_value(copied.get("promoted_object"), "product_set_id")
-    creative_pairs = creative_id_pairs(ad_reports)
-    all_creatives_new = bool(creative_pairs) and all(x.get("creative_id_changed") for x in creative_pairs)
 
-    result.update({
+    result = {
+        "mode": mode,
         "account_id": source.get("account_id"),
         "campaign_id": source.get("campaign_id"),
-        "source_name": source.get("name"),
-        "copied_name": copied.get("name"),
-        "source_status": source.get("status"),
-        "copied_status": copied.get("status"),
-        "source_ads_count": len(source_ads),
-        "copied_ads_count": len(copied_ads),
-        "source_pixel_id": source_pixel,
-        "copied_pixel_id": copied_pixel,
+        "source_adset_id": source.get("id"),
+        "copied_adset_id": copied_adset_id,
+        "source_ad_id": source_ad.get("id"),
+        "copied_ad_id": copied_ad_id,
+        "source_creative_id": (source_ad.get("creative") or {}).get("id"),
+        "copied_creative_id": copied_creative_id,
+        "creative_id_changed": str((source_ad.get("creative") or {}).get("id")) != str(copied_creative_id),
+        "source_effective_story_id": source_creative.get("effective_object_story_id"),
+        "copied_effective_story_id": copied_creative.get("effective_object_story_id"),
+        "pixel_source": source_pixel,
+        "pixel_copy": copied_pixel,
         "pixel_match": source_pixel == copied_pixel,
-        "source_product_set_id": source_product_set,
-        "copied_product_set_id": copied_product_set,
-        "product_set_match": source_product_set == copied_product_set,
-        "creative_id_pairs": creative_pairs,
-        "all_creatives_new": all_creatives_new,
-        "source_targeting": source.get("targeting"),
-        "copied_targeting": copied.get("targeting"),
         "adset_diffs": adset_diffs,
-        "ads": ad_reports,
+        "ad_diffs": ad_diffs,
+        "creative_payload_diffs": creative_payload_diffs,
+        "removed_legacy_paths": removed_legacy_paths,
+        "unavailable_fields": {
+            "copied_adset": copied_unavail,
+            "copied_ad": ad_unavail,
+            "copied_creative": creative_unavail,
+        },
         "source_adset": source,
         "copied_adset": copied,
-    })
-
+        "source_ad": source_ad,
+        "copied_ad": copied_ad,
+        "source_creative": source_creative,
+        "copied_creative": copied_creative,
+        "expected_creative_payload": expected_creative_payload,
+    }
     result["critical_ok"] = (
         copied.get("status") == "PAUSED"
-        and len(source_ads) == len(copied_ads)
+        and copied_ad.get("status") == "PAUSED"
+        and result["creative_id_changed"]
         and result["pixel_match"]
-        and source_product_set is None
-        and copied_product_set is None
-        and result["all_creatives_new"]
         and not adset_diffs
-        and all(
-            not x.get("missing_copy") and not x.get("ad_diffs") and not x.get("creative_diffs")
-            for x in ad_reports
-        )
+        and not ad_diffs
+        and not creative_payload_diffs
     )
     return result
 
 
-def compact_summary(result):
-    adset_diff_count = len(result.get("adset_diffs", []))
-    ad_diff_count = sum(len(x.get("ad_diffs", [])) for x in result.get("ads", []))
-    creative_diff_count = sum(len(x.get("creative_diffs", [])) for x in result.get("ads", []))
-    icon = "✅" if result.get("critical_ok") else "⚠️"
-    pairs = result.get("creative_id_pairs") or []
-    pair_lines = []
-    for x in pairs[:3]:
-        pair_lines.append(
-            f"Ad <code>{esc(x.get('source_ad_id'))}</code> → <code>{esc(x.get('copied_ad_id'))}</code>; "
-            f"Creative <code>{esc(x.get('source_creative_id'))}</code> → <code>{esc(x.get('copied_creative_id'))}</code> "
-            f"{'✅ NEW' if x.get('creative_id_changed') else '❌ SAME'}"
+def native_deep_copy(source, source_ad, source_creative, suffix):
+    source_id = str(source.get("id"))
+    response = graph_request(
+        "POST", f"{source_id}/copies",
+        {"deep_copy": True, "status_option": "PAUSED"},
+        stage="native_deep_copy_post"
+    )
+    copied_adset_id = str(response.get("copied_adset_id") or response.get("id") or "")
+    if not copied_adset_id:
+        raise RuntimeError(f"Native copy returned no copied_adset_id: {response}")
+    PARTIAL_RESULTS[source_id] = {"copied_adset_id": copied_adset_id, "mode": "native"}
+
+    graph_request(
+        "POST", copied_adset_id,
+        {"name": f"{source.get('name') or source_id}{suffix}", "status": "PAUSED"},
+        stage="native_rename_adset"
+    )
+    time.sleep(4)
+    copied_ads, _ = get_edge_fields_resilient(
+        copied_adset_id, "ads", AD_FIELDS, limit=5, stage_prefix="native:copied_ads"
+    )
+    if len(copied_ads) != 1:
+        raise RuntimeError(f"Expected exactly 1 copied ad, got {len(copied_ads)}")
+    copied_ad = copied_ads[0]
+    copied_creative_id = str((copied_ad.get("creative") or {}).get("id") or "")
+    if not copied_creative_id:
+        raise RuntimeError("Native copied ad has no creative id")
+
+    # Native deep-copy expected payload is the source readable payload after removing
+    # read-only/non-create fields; this is only for targeted comparison.
+    expected_payload = {"name": f"{source_creative.get('name') or 'creative'}{suffix}"}
+    for field in CREATIVE_CREATE_ALLOWLIST:
+        if source_creative.get(field) not in (None, {}, []):
+            expected_payload[field] = deepcopy(source_creative.get(field))
+
+    return audit_result(
+        source, source_ad, source_creative,
+        copied_adset_id, str(copied_ad.get("id")), copied_creative_id,
+        expected_payload, "NATIVE_DEEP_COPY", []
+    )
+
+
+def compatibility_clone(source, source_ad, source_creative, suffix):
+    source_id = str(source.get("id"))
+    account_id = str(source.get("account_id"))
+
+    # Step 1: copy ONLY the adset; no child ad/creative recreation by Meta.
+    response = graph_request(
+        "POST", f"{source_id}/copies",
+        {"deep_copy": False, "status_option": "PAUSED"},
+        stage="compat_adset_only_copy_post"
+    )
+    copied_adset_id = str(response.get("copied_adset_id") or response.get("id") or "")
+    if not copied_adset_id:
+        raise RuntimeError(f"Adset-only copy returned no copied_adset_id: {response}")
+    PARTIAL_RESULTS[source_id] = {"copied_adset_id": copied_adset_id, "mode": "compat"}
+    graph_request(
+        "POST", copied_adset_id,
+        {"name": f"{source.get('name') or source_id}{suffix} [COMPAT]", "status": "PAUSED"},
+        stage="compat_rename_adset"
+    )
+
+    # Step 2: create a NEW creative from supported source structure, removing only
+    # the explicitly rejected legacy standard_enhancements key.
+    creative_payload, removed_paths = build_compat_creative_payload(source_creative, suffix)
+    creative_response = graph_request(
+        "POST", f"act_{account_id}/adcreatives", creative_payload,
+        stage="compat_create_creative"
+    )
+    new_creative_id = str(creative_response.get("id") or "")
+    if not new_creative_id:
+        raise RuntimeError(f"Creative create returned no id: {creative_response}")
+    PARTIAL_RESULTS[source_id].update({"copied_creative_id": new_creative_id})
+
+    source_creative_id = str((source_ad.get("creative") or {}).get("id") or "")
+    if new_creative_id == source_creative_id:
+        raise RuntimeError(
+            "Compatibility creative returned SAME creative_id as source. "
+            "Test stops because duplicate strategy requires a new creative entity."
         )
-    placement = result.get("source_targeting") or {}
-    placement_bits = []
-    for key in ("publisher_platforms", "facebook_positions", "instagram_positions", "messenger_positions", "device_platforms"):
-        if key in placement:
-            placement_bits.append(f"{key}={placement.get(key)}")
+
+    # Step 3: create a NEW ad inside the copied adset using the NEW creative.
+    ad_payload = build_new_ad_payload(source_ad, copied_adset_id, new_creative_id, suffix)
+    ad_response = graph_request(
+        "POST", f"act_{account_id}/ads", ad_payload,
+        stage="compat_create_ad"
+    )
+    new_ad_id = str(ad_response.get("id") or "")
+    if not new_ad_id:
+        raise RuntimeError(f"Ad create returned no id: {ad_response}")
+    PARTIAL_RESULTS[source_id].update({"copied_ad_id": new_ad_id})
+
+    return audit_result(
+        source, source_ad, source_creative,
+        copied_adset_id, new_ad_id, new_creative_id,
+        creative_payload, "COMPAT_NEW_CREATIVE", removed_paths
+    )
+
+
+def compact_summary(result):
+    icon = "✅" if result.get("critical_ok") else "⚠️"
+    story_note = ""
+    if result.get("source_effective_story_id") or result.get("copied_effective_story_id"):
+        story_note = (
+            f"\nStory: <code>{esc(result.get('source_effective_story_id'))}</code> → "
+            f"<code>{esc(result.get('copied_effective_story_id'))}</code>"
+        )
+    removed = result.get("removed_legacy_paths") or []
+    removed_note = f"\nRemoved legacy: {esc(', '.join(removed))}" if removed else ""
     return (
-        f"{icon} <b>Ordinary duplicate test v4</b>\n"
+        f"{icon} <b>Duplicate test v6 • {esc(result.get('mode'))}</b>\n"
         f"Account: <code>{esc(result.get('account_id'))}</code>\n"
         f"Source Adset: <code>{esc(result.get('source_adset_id'))}</code>\n"
         f"Copy Adset: <code>{esc(result.get('copied_adset_id'))}</code> (PAUSED)\n"
-        f"Ads: {result.get('source_ads_count')} → {result.get('copied_ads_count')}\n"
-        + ("\n".join(pair_lines) + "\n" if pair_lines else "")
-        + f"Pixel: <code>{esc(result.get('source_pixel_id'))}</code> → <code>{esc(result.get('copied_pixel_id'))}</code> {'✅' if result.get('pixel_match') else '❌'}\n"
-        + (f"Placements: {esc('; '.join(placement_bits))}\n" if placement_bits else "")
-        + f"Diffs: adset={adset_diff_count}, ad={ad_diff_count}, creative={creative_diff_count}\n"
-        f"Warnings: {len(result.get('warnings', []))}"
+        f"Ad: <code>{esc(result.get('source_ad_id'))}</code> → <code>{esc(result.get('copied_ad_id'))}</code>\n"
+        f"Creative: <code>{esc(result.get('source_creative_id'))}</code> → "
+        f"<code>{esc(result.get('copied_creative_id'))}</code> "
+        f"{'✅ NEW' if result.get('creative_id_changed') else '❌ SAME'}\n"
+        f"Pixel: <code>{esc(result.get('pixel_source'))}</code> → <code>{esc(result.get('pixel_copy'))}</code> "
+        f"{'✅' if result.get('pixel_match') else '❌'}"
+        f"{story_note}{removed_note}\n"
+        f"Diffs: adset={len(result.get('adset_diffs', []))}, "
+        f"ad={len(result.get('ad_diffs', []))}, "
+        f"creative_payload={len(result.get('creative_payload_diffs', []))}"
     )
 
 
 def error_summary(source_id, e, partial=None):
     partial = partial or {}
-    copy_line = ""
-    if partial.get("copied_adset_id"):
-        copy_line = f"\n⚠️ Copy may already exist: <code>{esc(partial['copied_adset_id'])}</code> (should be PAUSED)"
-    access_line = ""
-    asset_access = partial.get("asset_access") or {}
-    if asset_access:
-        page_bits = [f"{x.get('id')}={'OK' if x.get('accessible') else 'NO'}" for x in asset_access.get("pages", [])]
-        ig_bits = [f"{x.get('id')}={'OK' if x.get('accessible') else 'NO'}" for x in asset_access.get("instagram", [])]
-        if page_bits or ig_bits:
-            access_line = "\nAsset access: " + esc("; ".join((["Page " + ", ".join(page_bits)] if page_bits else []) + (["IG " + ", ".join(ig_bits)] if ig_bits else [])))
+    copy_lines = []
+    for label, key in (
+        ("Copy Adset", "copied_adset_id"),
+        ("Copy Ad", "copied_ad_id"),
+        ("Copy Creative", "copied_creative_id"),
+    ):
+        if partial.get(key):
+            copy_lines.append(f"{label}: <code>{esc(partial[key])}</code> (PAUSED where applicable)")
     stage = e.stage if isinstance(e, MetaRequestError) else None
     detail = meta_error_summary(e) if isinstance(e, MetaRequestError) else str(e)
     return (
-        f"❌ <b>Ordinary duplicate test v4 error</b>\n"
+        f"❌ <b>Duplicate test v6 error</b>\n"
         f"Source Adset: <code>{esc(source_id)}</code>\n"
-        f"Stage: <b>{esc(stage or 'unknown')}</b>"
-        f"{copy_line}{access_line}\n"
-        f"{esc(detail)}"
+        f"Stage: <b>{esc(stage or 'unknown')}</b>\n"
+        + ("\n".join(copy_lines) + "\n" if copy_lines else "")
+        + f"{esc(detail)}"
     )
+
+
+def test_one(source_id, suffix):
+    source, source_unavailable = get_node_fields_resilient(
+        source_id, ADSET_FIELDS, stage_prefix=f"source_adset:{source_id}"
+    )
+    if not source.get("campaign_id") or not source.get("account_id"):
+        raise RuntimeError("Cannot read source account_id/campaign_id")
+    if source_is_catalog(source):
+        raise SkipSource("Catalog/DPA source detected. Catalog tests are intentionally postponed.")
+
+    source_ads, ad_unavailable = get_edge_fields_resilient(
+        source_id, "ads", AD_FIELDS, limit=5, stage_prefix=f"source_ads:{source_id}"
+    )
+    if len(source_ads) != 1:
+        raise SkipSource(f"This test expects exactly 1 source ad; found {len(source_ads)}")
+    source_ad = source_ads[0]
+    source_creative_id = str((source_ad.get("creative") or {}).get("id") or "")
+    if not source_creative_id:
+        raise RuntimeError("Source ad has no creative id")
+    source_creative, creative_unavailable = get_node_fields_resilient(
+        source_creative_id, CREATIVE_FIELDS, stage_prefix=f"source_creative:{source_creative_id}"
+    )
+
+    base_report = {
+        "source_unavailable": source_unavailable,
+        "source_ad_unavailable": ad_unavailable,
+        "source_creative_unavailable": creative_unavailable,
+        "source_adset": source,
+        "source_ad": source_ad,
+        "source_creative": source_creative,
+    }
+
+    # First choice: Meta native deep-copy. If it works, that is the cleanest path.
+    try:
+        result = native_deep_copy(source, source_ad, source_creative, suffix)
+        result.update(base_report)
+        result["native_error"] = None
+        return result
+    except MetaRequestError as e:
+        if e.info.get("subcode") != 3858504:
+            raise
+        native_error = {
+            "stage": e.stage,
+            "message": str(e),
+            "meta": e.info,
+        }
+        print(
+            f"[{source_id}] native deep-copy rejected by legacy standard_enhancements; switching to compatibility clone",
+            flush=True,
+        )
+
+    # Fallback ONLY for the known legacy creative problem 3858504.
+    result = compatibility_clone(source, source_ad, source_creative, suffix)
+    result.update(base_report)
+    result["native_error"] = native_error
+    return result
 
 
 def main():
@@ -720,67 +742,70 @@ def main():
         raise SystemExit("FB_SCALER_ACCESS_TOKEN is missing")
 
     ids = parse_ids()
+    source_id = ids[0]
     now = datetime.now(POLAND_TZ)
-    suffix = f" [PYTEST {now.strftime('%Y%m%d-%H%M')}]"
+    suffix = f" [PYTEST6 {now.strftime('%Y%m%d-%H%M')}]"
     access_diag = get_api_access_diagnostics()
+
     report = {
         "created_at": now.isoformat(),
         "api_version": API_VER,
-        "mode": "ORDINARY_NATIVE_DEEP_COPY_PAUSED_V4",
+        "mode": "ORDINARY_NATIVE_THEN_COMPAT_V6",
         "source_ids": ids,
         "api_access": access_diag,
         "results": [],
         "errors": [],
     }
 
-    print("FB ordinary duplicate test v5: dedicated for_scaler token, 1 adset/run, native deep-copy, always PAUSED; catalogs skipped.", flush=True)
+    print("FB duplicate test v6: ordinary ad only; native deep-copy first, 3858504 => compatibility clone. All new entities PAUSED.", flush=True)
     print(json.dumps({"api_access": access_diag}, ensure_ascii=False, indent=2), flush=True)
     send_telegram(access_diag_summary(access_diag))
-    print("Important: ordinary ads only. One source per run. Catalog sources are skipped. Creative IDs are audited and expected to be NEW.", flush=True)
-    print(f"IDs: {ids}", flush=True)
 
-    for source_id in ids:
-        partial = {"source_adset_id": source_id, "copied_adset_id": None}
-        try:
-            result = test_one(source_id, suffix)
-            partial.update(result)
-            report["results"].append(result)
-            print(json.dumps({
-                "source": source_id,
-                "copy": result.get("copied_adset_id"),
-                "critical_ok": result.get("critical_ok"),
-                "pixel_match": result.get("pixel_match"),
-                "product_set_match": result.get("product_set_match"),
-                "adset_diffs": len(result.get("adset_diffs", [])),
-                "warnings": len(result.get("warnings", [])),
-            }, ensure_ascii=False, indent=2), flush=True)
-            send_telegram(compact_summary(result))
-        except SkipSource as e:
-            skip_row = {"source_adset_id": source_id, "skipped": True, "reason": str(e)}
-            report["results"].append(skip_row)
-            print(f"SKIP [{source_id}]: {e}", flush=True)
-            send_telegram(
-                f"⏭ <b>Ordinary duplicate test v4 — skipped</b>\n"
-                f"Source Adset: <code>{esc(source_id)}</code>\n{esc(e)}"
-            )
-        except Exception as e:
-            partial.update(PARTIAL_RESULTS.get(source_id, {}))
-            err_row = {
-                "source_adset_id": source_id,
-                "error": str(e),
-                "stage": e.stage if isinstance(e, MetaRequestError) else None,
-                "meta": e.info if isinstance(e, MetaRequestError) else None,
-                "copied_adset_id": partial.get("copied_adset_id"),
-            }
-            report["errors"].append(err_row)
-            print(f"ERROR [{source_id}]: {err_row}", flush=True)
-            send_telegram(error_summary(source_id, e, partial=partial))
+    partial = {"source_adset_id": source_id}
+    try:
+        result = test_one(source_id, suffix)
+        partial.update(result)
+        report["results"].append(result)
+        print(json.dumps({
+            "source": source_id,
+            "mode": result.get("mode"),
+            "copy_adset": result.get("copied_adset_id"),
+            "copy_ad": result.get("copied_ad_id"),
+            "copy_creative": result.get("copied_creative_id"),
+            "creative_id_changed": result.get("creative_id_changed"),
+            "critical_ok": result.get("critical_ok"),
+            "removed_legacy_paths": result.get("removed_legacy_paths"),
+            "adset_diffs": len(result.get("adset_diffs", [])),
+            "ad_diffs": len(result.get("ad_diffs", [])),
+            "creative_payload_diffs": len(result.get("creative_payload_diffs", [])),
+        }, ensure_ascii=False, indent=2), flush=True)
+        send_telegram(compact_summary(result))
+    except SkipSource as e:
+        row = {"source_adset_id": source_id, "skipped": True, "reason": str(e)}
+        report["results"].append(row)
+        print(f"SKIP [{source_id}]: {e}", flush=True)
+        send_telegram(
+            f"⏭ <b>Duplicate test v6 — skipped</b>\n"
+            f"Source Adset: <code>{esc(source_id)}</code>\n{esc(e)}"
+        )
+    except Exception as e:
+        partial.update(PARTIAL_RESULTS.get(source_id, {}))
+        row = {
+            "source_adset_id": source_id,
+            "error": str(e),
+            "stage": e.stage if isinstance(e, MetaRequestError) else None,
+            "meta": e.info if isinstance(e, MetaRequestError) else None,
+            "partial": partial,
+        }
+        report["errors"].append(row)
+        print(f"ERROR [{source_id}]: {json.dumps(row, ensure_ascii=False)}", flush=True)
+        send_telegram(error_summary(source_id, e, partial=partial))
 
     with open(REPORT_FILE, "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
 
-    print(f"\nReport saved: {REPORT_FILE}", flush=True)
-    print("Any copy created by this test is PAUSED. Inspect in Ads Manager before deleting.", flush=True)
+    print(f"Report saved: {REPORT_FILE}", flush=True)
+    print("Any entity created by this test is PAUSED. Inspect it in Ads Manager before deleting.", flush=True)
 
     if report["errors"]:
         sys.exit(1)
