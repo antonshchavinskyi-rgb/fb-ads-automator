@@ -1,10 +1,10 @@
-name: FB Duplicate Test — Ordinary Ads v4
+name: FB Duplicate Test — Ordinary Ads v5
 
 on:
   workflow_dispatch:
     inputs:
-      adset_ids:
-        description: 'Ordinary adset IDs only, comma/space separated (max 5). Catalogs are skipped. Creates PAUSED deep copies.'
+      adset_id:
+        description: 'ONE ordinary adset ID. Creates one PAUSED native deep copy. Catalogs are skipped.'
         required: true
         type: string
 
@@ -22,18 +22,18 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Run ordinary duplicate test v4
+      - name: Run ordinary duplicate test v5
         env:
-          FB_ACCESS_TOKEN: ${{ secrets.FB_ACCESS_TOKEN }}
+          FB_SCALER_ACCESS_TOKEN: ${{ secrets.FB_SCALER_ACCESS_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          DUPLICATE_TEST_ADSET_IDS: ${{ inputs.adset_ids }}
+          DUPLICATE_TEST_ADSET_IDS: ${{ inputs.adset_id }}
         run: python fb_duplicate_test.py
 
       - name: Upload audit report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: fb-duplicate-test-ordinary-v4-report
-          path: duplicate_test_ordinary_report.json
+          name: fb-duplicate-test-ordinary-v5-report
+          path: duplicate_test_ordinary_v5_report.json
           if-no-files-found: ignore
