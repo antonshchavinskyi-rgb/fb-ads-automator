@@ -1,18 +1,17 @@
-name: FB Duplicate Test — Ordinary Ads v6 Compatibility
+name: FB Duplicate Test — Minimal Ordinary Ad v8
 
 on:
   workflow_dispatch:
     inputs:
       adset_id:
-        description: 'ONE ordinary adset ID. Native deep-copy first; legacy 3858504 falls back to a NEW creative compatibility clone. Everything PAUSED.'
+        description: 'ONE ordinary Adset ID to duplicate as PAUSED'
         required: true
         type: string
 
 jobs:
   duplicate-test:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    timeout-minutes: 15
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -22,18 +21,18 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Run ordinary duplicate compatibility test v6
+      - name: Run minimal duplicate test v8
         env:
           FB_SCALER_ACCESS_TOKEN: ${{ secrets.FB_SCALER_ACCESS_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          DUPLICATE_TEST_ADSET_IDS: ${{ inputs.adset_id }}
+          TEST_ADSET_ID: ${{ inputs.adset_id }}
         run: python fb_duplicate_test.py
 
       - name: Upload audit report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: fb-duplicate-test-v6-compat-report
-          path: duplicate_test_v6_compat_report.json
+          name: duplicate-test-v8-report
+          path: duplicate_test_v8_minimal_report.json
           if-no-files-found: ignore
