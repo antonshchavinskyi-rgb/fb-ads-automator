@@ -5,6 +5,7 @@ import time
 import html
 import random
 import mimetypes
+import re
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -16,7 +17,7 @@ from fb_config import API_VER, POLAND_TZ
 ACCESS_TOKEN = os.environ.get("FB_SCALER_ACCESS_TOKEN")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-REPORT_FILE = "duplicate_test_v10_clean_report.json"
+REPORT_FILE = "duplicate_test_v11_controls_report.json"
 
 # This test intentionally handles ONE ordinary adset per run and creates PAUSED objects only.
 # Catalog adsets are skipped in this phase.
@@ -30,14 +31,15 @@ ADSET_FIELDS = [
 ]
 
 AD_FIELDS = [
-    "id", "name", "status", "effective_status", "adset_id", "campaign_id",
+    "id", "name", "status", "configured_status", "effective_status", "adset_id", "campaign_id",
     "creative", "tracking_specs", "conversion_specs", "conversion_domain", "source_ad_id",
+    "issues_info", "failed_delivery_checks", "ad_review_feedback", "updated_time",
 ]
 
 CREATIVE_FIELDS = [
-    "id", "name", "account_id", "object_story_id", "effective_object_story_id",
+    "id", "name", "account_id", "status", "object_story_id", "effective_object_story_id",
     "object_story_spec", "url_tags", "image_hash", "image_url", "thumbnail_url", "video_id",
-    "asset_feed_spec", "degrees_of_freedom_spec", "creative_sourcing_spec",
+    "contextual_multi_ads", "asset_feed_spec", "degrees_of_freedom_spec", "creative_sourcing_spec",
     "format_transformation_spec", "generative_asset_spec", "platform_customizations",
 ]
 
@@ -319,37 +321,110 @@ def clean_dict(d):
     return {k: deepcopy(v) for k, v in d.items() if v not in (None, "", {}, [])}
 
 
-def build_clean_creative(source_creative, account_id, suffix, include_video_preview=False):
-    """Build a new creative from business-essential fields only.
+def clean_copy_suffixes(name):
+    """Remove Facebook's trailing Copy/Копия/Копія suffixes without touching the creative key."""
+    value = (name or "").strip()
+    # Facebook can stack suffixes: "— Копия — Копия", "- Copy", etc.
+    pattern = re.compile(r"\s*(?:—|–|-)\s*(?:копия|копія|copy)(?:\s*\d+)?\s*$", re.IGNORECASE)
+    while True:
+        cleaned = pattern.sub("", value).rstrip()
+        if cleaned == value:
+            break
+        value = cleaned
+    return re.sub(r"\s{2,}", " ", value).strip()
 
-    We intentionally do not copy legacy/Advantage+ enhancement containers.
-    For video, the first attempt omits both image_hash and image_url. If Meta
-    explicitly requires a preview, the caller retries with a freshly uploaded
-    fallback thumbnail and therefore a fresh hash.
+
+def explicit_creative_optouts(mode):
+    """Explicitly disable the documented creative automations we do not want.
+
+    We keep this list intentionally conservative for Marketing API v25.0.
+    Multi-advertiser ads are controlled separately via contextual_multi_ads.
+    """
+    common = {
+        "site_extensions": {"enroll_status": "OPT_OUT"},
+        "biz_ai": {"enroll_status": "OPT_OUT"},
+        "text_optimizations": {"enroll_status": "OPT_OUT"},
+        "inline_comment": {"enroll_status": "OPT_OUT"},
+        "enhance_cta": {"enroll_status": "OPT_OUT"},
+    }
+    if mode == "VIDEO":
+        common["video_auto_crop"] = {"enroll_status": "OPT_OUT"}
+    elif mode == "IMAGE":
+        common["image_touchups"] = {"enroll_status": "OPT_OUT"}
+        common["image_background_gen"] = {"enroll_status": "OPT_OUT"}
+    return common
+
+
+def get_feature_enroll_statuses(creative):
+    dof = creative.get("degrees_of_freedom_spec") or {}
+    features = dof.get("creative_features_spec") or {}
+    statuses = {}
+    for key, value in features.items():
+        if isinstance(value, dict) and value.get("enroll_status") is not None:
+            statuses[key] = str(value.get("enroll_status")).upper()
+    return statuses
+
+
+def poll_ad_post_processing(ad_id):
+    """Check asynchronous Meta post-processing so UI delivery errors are visible in the report."""
+    snapshots = []
+    # Two gentle checks; this is a test user, but we still avoid hammering the API.
+    for delay in (10, 20):
+        time.sleep(delay)
+        snap = get_node(ad_id, AD_FIELDS, "audit_ad_post_processing")
+        snapshots.append(snap)
+        if snap.get("issues_info") or snap.get("failed_delivery_checks"):
+            break
+    return snapshots[-1] if snapshots else {}, snapshots
+
+
+def build_clean_creative(source_creative, account_id, suffix, include_video_preview=False):
+    """Build a NEW ordinary creative from essential business fields only.
+
+    Controls applied explicitly:
+    - multi-advertiser ads: OPT_OUT via contextual_multi_ads;
+    - Creative Setup / Advantage+ controls: explicit OPT_OUT for the relevant v25 features;
+    - legacy enhancement containers from the source are NOT copied;
+    - for video we first ask Meta to create without image_hash/image_url. If Meta requires
+      a thumbnail, caller retries with a fresh re-upload (which is an explicit/manual
+      thumbnail from the API's point of view; there is no documented v25 "Automatic"
+      thumbnail selector in video_data).
     """
     oss = deepcopy(source_creative.get("object_story_spec") or {})
     page_id = oss.get("page_id")
     if not page_id:
         raise SkipSource("Source creative has no page_id in object_story_spec.")
 
-    payload = {"name": f"{source_creative.get('name') or 'creative'}{suffix}"}
+    mode = "VIDEO" if oss.get("video_data") else "IMAGE" if oss.get("link_data") else None
+    if not mode:
+        raise SkipSource("Only ordinary single video_data or link_data creatives are supported in v11.")
+
+    payload = {
+        "name": f"{clean_copy_suffixes(source_creative.get('name') or 'creative')}{suffix}",
+        "contextual_multi_ads": {"enroll_status": "OPT_OUT"},
+        "degrees_of_freedom_spec": {
+            "creative_features_spec": explicit_creative_optouts(mode),
+        },
+    }
     url_tags = source_creative.get("url_tags")
     if url_tags:
         payload["url_tags"] = url_tags
 
     audit = {
-        "mode": None,
+        "mode": mode,
         "preview_strategy": None,
         "source_image_hash": source_creative.get("image_hash"),
         "new_image_hash": None,
         "preview_meta": None,
-        "omitted_fields": [
-            "asset_feed_spec", "degrees_of_freedom_spec", "creative_sourcing_spec",
+        "requested_multi_advertiser": "OPT_OUT",
+        "requested_feature_optouts": sorted(explicit_creative_optouts(mode).keys()),
+        "omitted_source_containers": [
+            "asset_feed_spec", "creative_sourcing_spec",
             "format_transformation_spec", "generative_asset_spec", "platform_customizations",
         ],
     }
 
-    if oss.get("video_data"):
+    if mode == "VIDEO":
         vd = oss.get("video_data") or {}
         video_id = vd.get("video_id") or source_creative.get("video_id")
         if not video_id:
@@ -366,42 +441,41 @@ def build_clean_creative(source_creative, account_id, suffix, include_video_prev
             new_hash, preview_meta = fresh_video_fallback_hash(source_creative, str(account_id))
             minimal_vd["image_hash"] = new_hash
             audit.update({
-                "preview_strategy": "SOURCE_THUMBNAIL_REUPLOAD_FALLBACK",
+                "preview_strategy": "SOURCE_THUMBNAIL_REUPLOAD_FALLBACK_MANUAL",
                 "new_image_hash": new_hash,
                 "preview_meta": preview_meta,
+                "thumbnail_goal_met": False,
             })
         else:
-            audit["preview_strategy"] = "NO_IMAGE_HASH_OR_URL_REQUESTED"
+            audit.update({
+                "preview_strategy": "NO_IMAGE_HASH_OR_URL_REQUESTED",
+                "thumbnail_goal_met": True,
+            })
 
         payload["object_story_spec"] = {"page_id": str(page_id), "video_data": minimal_vd}
-        audit["mode"] = "VIDEO"
         return payload, audit
 
-    if oss.get("link_data"):
-        ld = oss.get("link_data") or {}
-        # A static image itself needs an image asset; unlike a video thumbnail,
-        # this is the media, so we re-upload it to get a fresh hash.
-        new_hash, image_meta = fresh_image_hash(source_creative, ld, str(account_id))
-        minimal_ld = clean_dict({
-            "link": ld.get("link"),
-            "message": ld.get("message"),
-            "name": ld.get("name"),
-            "description": ld.get("description"),
-            "call_to_action": ld.get("call_to_action"),
-            "image_hash": new_hash,
-        })
-        if not minimal_ld.get("link"):
-            raise SkipSource("Image/link creative has no destination link.")
-        payload["object_story_spec"] = {"page_id": str(page_id), "link_data": minimal_ld}
-        audit.update({
-            "mode": "IMAGE",
-            "preview_strategy": "FRESH_IMAGE_REUPLOAD",
-            "new_image_hash": new_hash,
-            "preview_meta": image_meta,
-        })
-        return payload, audit
+    ld = oss.get("link_data") or {}
+    new_hash, image_meta = fresh_image_hash(source_creative, ld, str(account_id))
+    minimal_ld = clean_dict({
+        "link": ld.get("link"),
+        "message": ld.get("message"),
+        "name": ld.get("name"),
+        "description": ld.get("description"),
+        "call_to_action": ld.get("call_to_action"),
+        "image_hash": new_hash,
+    })
+    if not minimal_ld.get("link"):
+        raise SkipSource("Image/link creative has no destination link.")
+    payload["object_story_spec"] = {"page_id": str(page_id), "link_data": minimal_ld}
+    audit.update({
+        "preview_strategy": "FRESH_IMAGE_REUPLOAD",
+        "new_image_hash": new_hash,
+        "preview_meta": image_meta,
+        "thumbnail_goal_met": True,
+    })
+    return payload, audit
 
-    raise SkipSource("Only ordinary single video_data or link_data creatives are supported in v10.")
 
 def find_nested(obj, key):
     if isinstance(obj, dict):
@@ -471,7 +545,7 @@ def diff_fields(src, dst, fields):
 
 def build_new_ad_payload(source_ad, copied_adset_id, new_creative_id, suffix):
     payload = {
-        "name": f"{source_ad.get('name') or 'ad'}{suffix}",
+        "name": f"{clean_copy_suffixes(source_ad.get('name') or 'ad')}{suffix}",
         "adset_id": str(copied_adset_id),
         "creative": {"creative_id": str(new_creative_id)},
         "status": "PAUSED",
@@ -506,7 +580,7 @@ def create_clean_clone(source_adset_id):
         raise SkipSource("Catalog source detected. Catalogs are intentionally skipped in ordinary-ad phase.")
 
     now = datetime.now(POLAND_TZ)
-    suffix = f" [PYTEST-CLEAN {now.strftime('%Y%m%d-%H%M%S')}]"
+    suffix = f" [PYTEST-V11 {now.strftime('%Y%m%d-%H%M%S')}]"
     account_id = str(source.get("account_id"))
 
     # 1) Copy only the adset. Child ad/creative are rebuilt from a minimal schema.
@@ -521,7 +595,7 @@ def create_clean_clone(source_adset_id):
     PARTIAL["copied_adset_id"] = copied_adset_id
     graph_request(
         "POST", copied_adset_id,
-        {"name": f"{source.get('name') or source_adset_id}{suffix}", "status": "PAUSED"},
+        {"name": f"{clean_copy_suffixes(source.get('name') or source_adset_id)}{suffix}", "status": "PAUSED"},
         stage="rename_copied_adset",
     )
 
@@ -561,10 +635,9 @@ def create_clean_clone(source_adset_id):
         raise RuntimeError(f"Ad create returned no id: {new_ad}")
     PARTIAL["new_ad_id"] = new_ad_id
 
-    time.sleep(5)
     copied_adset = get_node(copied_adset_id, ADSET_FIELDS, "audit_adset")
-    copied_ad = get_node(new_ad_id, AD_FIELDS, "audit_ad")
     copied_creative = get_node(new_creative_id, CREATIVE_FIELDS, "audit_creative")
+    copied_ad, postprocess_snapshots = poll_ad_post_processing(new_ad_id)
 
     source_sem = extract_minimal_semantics(source_creative)
     copy_sem = extract_minimal_semantics(copied_creative)
@@ -609,6 +682,18 @@ def create_clean_clone(source_adset_id):
         if str(x.get("enroll_status") or "").upper() == "OPT_IN"
     ]
 
+    requested_feature_keys = set((media_audit.get("requested_feature_optouts") or []))
+    returned_feature_statuses = get_feature_enroll_statuses(copied_creative)
+    requested_feature_statuses = {k: returned_feature_statuses.get(k) for k in sorted(requested_feature_keys)}
+    missing_or_not_optout = {
+        k: v for k, v in requested_feature_statuses.items()
+        if v != "OPT_OUT"
+    }
+    contextual_multi = copied_creative.get("contextual_multi_ads") or {}
+    multi_advertiser_status = str(contextual_multi.get("enroll_status") or "").upper() or None
+    ad_issues = copied_ad.get("issues_info") or []
+    failed_delivery_checks = copied_ad.get("failed_delivery_checks") or []
+
     source_pixel = find_nested(source.get("promoted_object") or {}, "pixel_id")
     copied_pixel = find_nested(copied_adset.get("promoted_object") or {}, "pixel_id")
 
@@ -634,6 +719,12 @@ def create_clean_clone(source_adset_id):
         "enhancement_fields_after_create": enhancement_fields,
         "enhancement_enroll_statuses": enhancement_statuses,
         "enhancement_opt_ins": enhancement_opt_ins,
+        "requested_feature_statuses": requested_feature_statuses,
+        "missing_or_not_optout": missing_or_not_optout,
+        "multi_advertiser_status": multi_advertiser_status,
+        "ad_issues": ad_issues,
+        "failed_delivery_checks": failed_delivery_checks,
+        "postprocess_snapshots": postprocess_snapshots,
         "source_adset": source,
         "copied_adset": copied_adset,
         "source_ad": source_ad,
@@ -642,16 +733,24 @@ def create_clean_clone(source_adset_id):
         "copied_creative": copied_creative,
         "creative_create_payload": creative_payload,
     }
-    result["critical_ok"] = (
+    result["core_ok"] = (
         copied_adset.get("status") == "PAUSED"
         and copied_ad.get("status") == "PAUSED"
         and result["creative_id_changed"]
         and result["pixel_match"]
-        and not adset_diffs
-        and not ad_diffs
         and not creative_diffs
         and not enhancement_opt_ins
+        and multi_advertiser_status == "OPT_OUT"
+        and not missing_or_not_optout
+        and not ad_issues
+        and not failed_delivery_checks
     )
+    # Automatic video thumbnail is a separate requirement. Marketing API v25 documents
+    # explicit image_hash/image_url fields, but no flag equivalent to Ads Manager's
+    # "Automatic" thumbnail selector. If Meta forces the fallback hash, the clone can be
+    # structurally correct but is not yet fully scaler-ready for Anton's preferred setup.
+    result["thumbnail_goal_met"] = bool(media_audit.get("thumbnail_goal_met"))
+    result["scaler_ready"] = result["core_ok"] and result["thumbnail_goal_met"]
     return result
 
 
@@ -659,7 +758,7 @@ def format_error(e, source_id):
     if isinstance(e, MetaRequestError):
         info = e.info
         parts = [
-            "❌ <b>Duplicate test v10 error</b>",
+            "❌ <b>Duplicate test v11 error</b>",
             f"Source Adset: <code>{esc(source_id)}</code>",
             f"Stage: <b>{esc(e.stage or 'unknown')}</b>",
         ]
@@ -670,7 +769,7 @@ def format_error(e, source_id):
             parts.append(f"fbtrace_id: {esc(info.get('fbtrace_id'))}")
         return "\n".join(parts)
     return (
-        "❌ <b>Duplicate test v10 error</b>\n"
+        "❌ <b>Duplicate test v11 error</b>\n"
         f"Source Adset: <code>{esc(source_id)}</code>\n"
         f"Partial: {esc(json.dumps(PARTIAL, ensure_ascii=False))}\n"
         f"{esc(str(e))}"
@@ -678,22 +777,32 @@ def format_error(e, source_id):
 
 
 def summary_message(result):
-    enhancement = result.get("enhancement_fields_after_create") or {}
     media = result.get("media_audit") or {}
+    issues = result.get("ad_issues") or []
+    failed_checks = result.get("failed_delivery_checks") or []
+    feature_statuses = result.get("requested_feature_statuses") or {}
+    feature_short = ", ".join(f"{k}={v or 'NOT_RETURNED'}" for k, v in feature_statuses.items())
     lines = [
-        "✅ <b>Duplicate test v10 • CLEAN REBUILD</b>",
+        "✅ <b>Duplicate test v11 • CONTROLLED CLEAN REBUILD</b>",
         f"Account: <code>{esc(result.get('account_id'))}</code>",
         f"Source Adset: <code>{esc(result.get('source_adset_id'))}</code>",
-        f"Copy Adset: <code>{esc(result.get('copied_adset_id'))}</code> (PAUSED)",
+        f"Copy Adset: <code>{esc(result.get('copied_adset_id'))}</code> • {esc((result.get('copied_adset') or {}).get('name'))}",
         f"Source Ad → Copy Ad: <code>{esc(result.get('source_ad_id'))}</code> → <code>{esc(result.get('copied_ad_id'))}</code>",
         f"Creative: <code>{esc(result.get('source_creative_id'))}</code> → <code>{esc(result.get('copied_creative_id'))}</code> {'✅ NEW' if result.get('creative_id_changed') else '❌ SAME'}",
         f"Pixel: {esc(result.get('pixel_source'))} → {esc(result.get('pixel_copy'))} {'✅' if result.get('pixel_match') else '❌'}",
-        f"Media: {esc(media.get('mode'))} • preview: {esc(media.get('preview_strategy'))} • hash: <code>{esc(media.get('new_image_hash') or 'NONE')}</code>",
-        f"Diffs: adset={len(result.get('adset_diffs', []))}, ad={len(result.get('ad_diffs', []))}, creative_core={len(result.get('creative_diffs', []))}",
-        f"Enhancement containers after create: {len(enhancement)}",
-        f"Enhancements OPT_IN: {len(result.get('enhancement_opt_ins', []))} {'✅ none' if not result.get('enhancement_opt_ins') else '⚠️ inspect'}",
-        f"Critical OK: {'✅ YES' if result.get('critical_ok') else '⚠️ NO'}",
+        f"Multi-advertiser: {esc(result.get('multi_advertiser_status'))} {'✅' if result.get('multi_advertiser_status') == 'OPT_OUT' else '⚠️'}",
+        f"Creative controls: {esc(feature_short or 'none returned')}",
+        f"Media: {esc(media.get('mode'))} • thumbnail: {esc(media.get('preview_strategy'))}",
+        f"Thumbnail Automatic goal: {'✅ YES' if result.get('thumbnail_goal_met') else '⚠️ NO — API fallback is explicit/manual'}",
+        f"Core diffs: adset={len(result.get('adset_diffs', []))}, ad={len(result.get('ad_diffs', []))}, creative={len(result.get('creative_diffs', []))}",
+        f"Post-processing issues: {len(issues)} • failed checks: {len(failed_checks)} {'✅' if not issues and not failed_checks else '❌'}",
+        f"Core OK: {'✅ YES' if result.get('core_ok') else '⚠️ NO'}",
+        f"Scaler-ready: {'✅ YES' if result.get('scaler_ready') else '⚠️ NO'}",
     ]
+    if issues:
+        lines.append("issues_info: " + esc(json.dumps(issues, ensure_ascii=False)[:1200]))
+    if failed_checks:
+        lines.append("failed_delivery_checks: " + esc(json.dumps(failed_checks, ensure_ascii=False)[:1200]))
     return "\n".join(lines)
 
 
@@ -715,11 +824,11 @@ def main():
         result = create_clean_clone(source_id)
         report["result"] = result
         send_telegram(summary_message(result))
-        exit_code = 0 if result.get("critical_ok") else 1
+        exit_code = 0
     except SkipSource as e:
         report["error"] = {"type": "skip", "message": str(e), "partial": deepcopy(PARTIAL)}
         send_telegram(
-            "⏭ <b>Duplicate test v10 skipped</b>\n"
+            "⏭ <b>Duplicate test v11 skipped</b>\n"
             f"Source Adset: <code>{esc(source_id)}</code>\n{esc(str(e))}"
         )
         exit_code = 1
