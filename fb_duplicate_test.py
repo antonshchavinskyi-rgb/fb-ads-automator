@@ -20,7 +20,7 @@ API_VER = "v26.0"
 ACCESS_TOKEN = os.environ.get("FB_SCALER_ACCESS_TOKEN")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-REPORT_FILE = "duplicate_test_v15_source_video_hash_report.json"
+REPORT_FILE = "duplicate_test_v16_source_video_image_url_report.json"
 
 # This test intentionally handles ONE ordinary adset per run and creates PAUSED objects only.
 # Catalog adsets are skipped in this phase.
@@ -368,7 +368,7 @@ def build_clean_creative(source_creative, account_id, suffix):
 
     mode = "VIDEO" if oss.get("video_data") else "IMAGE" if oss.get("link_data") else None
     if not mode:
-        raise SkipSource("Only ordinary single video_data or link_data creatives are supported in v15.")
+        raise SkipSource("Only ordinary single video_data or link_data creatives are supported in v16.")
 
     payload = {
         "name": f"{clean_copy_suffixes(source_creative.get('name') or 'creative')}{suffix}",
@@ -408,24 +408,26 @@ def build_clean_creative(source_creative, account_id, suffix):
             "link_description": vd.get("link_description"),
             "call_to_action": vd.get("call_to_action"),
         })
-        # v15 deliberately reuses ONLY the source video's existing image_hash.
-        # The source ad is already publishable with this video+thumbnail pairing, while
-        # re-uploading the rendered thumbnail as a fresh generic ad image produced
-        # publishing error #2643026 in our tests. We do NOT copy image_url alongside it.
-        # This is not the Ads Manager UI "Automatic" thumbnail mode; it is a safe
-        # publish-ready baseline that requires no manual intervention.
-        source_video_hash = vd.get("image_hash") or source_creative.get("image_hash")
-        if not source_video_hash:
+        # v16: do NOT reuse the source image_hash. Our v15 test showed that the old hash can
+        # be accepted at creative-create time but still fail during Meta's asynchronous publish
+        # processing (#2643026). The source object_story_spec for this ad exposes image_url as
+        # well. Meta documents video_data.image_url as a supported thumbnail input and says the
+        # image at that URL is saved to the ad account image library. We therefore pass ONLY the
+        # source video_data.image_url and let Meta create a fresh backing image asset.
+        # Never send image_hash and image_url together: Meta rejects that as redundant.
+        source_video_image_url = vd.get("image_url")
+        if not source_video_image_url:
             raise SkipSource(
-                "Source video creative has no image_hash. v15 intentionally skips instead of "
-                "creating a potentially unpublishable ad with a generic re-uploaded thumbnail."
+                "Source video_data has no image_url. v16 intentionally skips instead of reusing "
+                "the old image_hash that previously produced publishing error #2643026."
             )
-        minimal_vd["image_hash"] = str(source_video_hash)
+        minimal_vd["image_url"] = str(source_video_image_url)
         audit.update({
-            "preview_strategy": "SOURCE_VIDEO_IMAGE_HASH_EXACT",
-            "new_image_hash": str(source_video_hash),
+            "preview_strategy": "SOURCE_VIDEO_IMAGE_URL_ONLY",
+            "new_image_hash": None,
             "preview_meta": {
-                "note": "Exact source video thumbnail hash reused; no image_url and no generic re-upload."
+                "source_image_url": str(source_video_image_url),
+                "note": "Only source video_data.image_url is sent; old image_hash is intentionally omitted."
             },
             "thumbnail_ui_automatic": False,
             "thumbnail_no_manual_intervention": True,
@@ -560,7 +562,7 @@ def create_clean_clone(source_adset_id):
         raise SkipSource("Catalog source detected. Catalogs are intentionally skipped in ordinary-ad phase.")
 
     now = datetime.now(POLAND_TZ)
-    suffix = f" [PYTEST-V14 {now.strftime('%Y%m%d-%H%M%S')}]"
+    suffix = f" [PYTEST-V16 {now.strftime('%Y%m%d-%H%M%S')}]"
     account_id = str(source.get("account_id"))
 
     # 1) Copy only the adset. Child ad/creative are rebuilt from a minimal schema.
@@ -581,12 +583,12 @@ def create_clean_clone(source_adset_id):
 
     # 2) Create NEW creative from business-essential fields only.
     # For video, resolve the source AdVideo through the ad account /advideos (or /video_ads) edge
-    # and use Meta's own `picture` URL as video_data.image_url. We do not call the
-    # standalone /{video_id}/thumbnails edge because this ad-video ID may not support it.
+    # For video, use only the source object_story_spec.video_data.image_url.
+    # The old image_hash is intentionally not reused because it produced publish error #2643026.
     creative_payload, media_audit = build_clean_creative(source_creative, account_id, suffix)
     new_creative = graph_request(
         "POST", f"act_{account_id}/adcreatives", creative_payload,
-        stage="create_clean_creative_v26_account_video_picture"
+        stage="create_clean_creative_v26_source_video_image_url"
     )
     new_creative_id = str(new_creative.get("id") or "")
     if not new_creative_id:
@@ -724,7 +726,7 @@ def format_error(e, source_id):
     if isinstance(e, MetaRequestError):
         info = e.info
         parts = [
-            "❌ <b>Duplicate test v15 error</b>",
+            "❌ <b>Duplicate test v16 error</b>",
             f"Source Adset: <code>{esc(source_id)}</code>",
             f"Stage: <b>{esc(e.stage or 'unknown')}</b>",
         ]
@@ -735,7 +737,7 @@ def format_error(e, source_id):
             parts.append(f"fbtrace_id: {esc(info.get('fbtrace_id'))}")
         return "\n".join(parts)
     return (
-        "❌ <b>Duplicate test v15 error</b>\n"
+        "❌ <b>Duplicate test v16 error</b>\n"
         f"Source Adset: <code>{esc(source_id)}</code>\n"
         f"Partial: {esc(json.dumps(PARTIAL, ensure_ascii=False))}\n"
         f"{esc(str(e))}"
@@ -749,7 +751,7 @@ def summary_message(result):
     feature_statuses = result.get("requested_feature_statuses") or {}
     feature_short = ", ".join(f"{k}={v or 'NOT_RETURNED'}" for k, v in feature_statuses.items())
     lines = [
-        "✅ <b>Duplicate test v15 • SOURCE VIDEO HASH</b>",
+        "✅ <b>Duplicate test v16 • SOURCE VIDEO IMAGE URL</b>",
         f"Account: <code>{esc(result.get('account_id'))}</code>",
         f"Source Adset: <code>{esc(result.get('source_adset_id'))}</code>",
         f"Copy Adset: <code>{esc(result.get('copied_adset_id'))}</code> • {esc((result.get('copied_adset') or {}).get('name'))}",
@@ -795,7 +797,7 @@ def main():
     except SkipSource as e:
         report["error"] = {"type": "skip", "message": str(e), "partial": deepcopy(PARTIAL)}
         send_telegram(
-            "⏭ <b>Duplicate test v15 skipped</b>\n"
+            "⏭ <b>Duplicate test v16 skipped</b>\n"
             f"Source Adset: <code>{esc(source_id)}</code>\n{esc(str(e))}"
         )
         exit_code = 1
