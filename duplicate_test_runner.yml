@@ -1,0 +1,38 @@
+name: FB Duplicate Test — Controlled Ordinary Ad v14 — API v26
+
+on:
+  workflow_dispatch:
+    inputs:
+      adset_id:
+        description: 'ONE ordinary Adset ID to duplicate as PAUSED'
+        required: true
+        type: string
+
+jobs:
+  duplicate-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run controlled duplicate test v14 (API v26)
+        env:
+          FB_SCALER_ACCESS_TOKEN: ${{ secrets.FB_SCALER_ACCESS_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TEST_ADSET_ID: ${{ inputs.adset_id }}
+        run: python fb_duplicate_test.py
+
+      - name: Upload audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: duplicate-test-v14-v26-report
+          path: duplicate_test_v14_account_video_preview_report.json
+          if-no-files-found: ignore
