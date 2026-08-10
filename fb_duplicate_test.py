@@ -20,7 +20,7 @@ API_VER = "v26.0"
 ACCESS_TOKEN = os.environ.get("FB_SCALER_ACCESS_TOKEN")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-REPORT_FILE = "duplicate_test_v14_account_video_preview_report.json"
+REPORT_FILE = "duplicate_test_v15_source_video_hash_report.json"
 
 # This test intentionally handles ONE ordinary adset per run and creates PAUSED objects only.
 # Catalog adsets are skipped in this phase.
@@ -261,123 +261,6 @@ def upload_image_to_ad_account(account_id, image_bytes, content_type, stage):
     return str(h), payload
 
 
-def _scan_video_edge_for_id(path, video_id, stage, max_pages=10, page_limit=100):
-    """Find an AdVideo through an ad-account edge instead of addressing the video node directly.
-
-    Some ad-video IDs used by an existing creative cannot be queried as a standalone
-    Graph Video node by the system user (code 100/subcode 33), even though the ad account
-    can still enumerate that video through /advideos or /video_ads. We therefore resolve
-    the preview from the owning ad account edge.
-    """
-    params = {
-        "fields": "id,picture,source,title,status",
-        "limit": page_limit,
-        "access_token": ACCESS_TOKEN,
-    }
-    url = f"https://graph.facebook.com/{API_VER}/{path.lstrip('/')}?" + urllib.parse.urlencode(
-        {k: serialize_param(v) for k, v in params.items() if v is not None}
-    )
-    page = 0
-    while url and page < max_pages:
-        page += 1
-        try:
-            with urllib.request.urlopen(urllib.request.Request(url), timeout=60) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            info = decode_meta_error(e.read().decode("utf-8", errors="replace"))
-            raise MetaRequestError(e.code, info, stage=stage)
-        for row in payload.get("data", []):
-            if str(row.get("id")) == str(video_id):
-                row["_resolver_edge"] = path
-                row["_resolver_page"] = page
-                return row
-        url = payload.get("paging", {}).get("next")
-    return None
-
-
-def resolve_ad_video_preview(video_id, account_id):
-    """Resolve a Meta-generated preview URL for an ad video via ad-account edges.
-
-    We intentionally do NOT call /{video_id}/thumbnails: current AdVideo SDK exposes
-    account-level /advideos and /video_ads, while the source ad-video may not support the
-    standalone Graph Video thumbnails edge for this system user.
-    """
-    video = _scan_video_edge_for_id(
-        f"act_{account_id}/advideos",
-        video_id,
-        "account_advideos_lookup",
-        max_pages=10,
-        page_limit=100,
-    )
-    if not video:
-        video = _scan_video_edge_for_id(
-            f"act_{account_id}/video_ads",
-            video_id,
-            "account_video_ads_lookup",
-            max_pages=5,
-            page_limit=100,
-        )
-    if not video:
-        raise SkipSource(
-            f"Video {video_id} is used by the source creative but was not found through "
-            f"act_{account_id}/advideos or /video_ads within the scan limits."
-        )
-    picture = video.get("picture")
-    if not picture:
-        raise SkipSource(
-            f"Video {video_id} was found via {video.get('_resolver_edge')} but Meta returned no picture URL."
-        )
-    return picture, {
-        "strategy": "ACCOUNT_ADVIDEO_PICTURE_URL",
-        "video": video,
-        "resolver_edge": video.get("_resolver_edge"),
-        "resolver_page": video.get("_resolver_page"),
-    }
-
-def fresh_video_fallback_hash(source_creative, account_id):
-    """Fallback only when Meta refuses video_data without a preview image.
-
-    We intentionally do NOT copy the old image_hash. Instead we download the
-    source creative's rendered thumbnail and upload it again to the ad account,
-    which produces a fresh image hash. This is a fallback, not the preferred path.
-    """
-    candidate_urls = [
-        source_creative.get("thumbnail_url"),
-        source_creative.get("image_url"),
-    ]
-    url = next((x for x in candidate_urls if x), None)
-    if not url:
-        raise SkipSource("Meta requires a video preview, but source creative has no downloadable thumbnail_url/image_url for fallback.")
-    image_bytes, content_type = download_bytes(url, "video_preview_fallback_download")
-    new_hash, upload_raw = upload_image_to_ad_account(
-        account_id, image_bytes, content_type, "video_preview_fallback_upload"
-    )
-    return new_hash, {
-        "strategy": "SOURCE_THUMBNAIL_REUPLOAD_FALLBACK",
-        "source_url": url,
-        "upload": upload_raw,
-    }
-
-
-def is_thumbnail_required_error(exc):
-    """Conservative detector for a failed no-thumbnail create attempt.
-
-    A failed POST is safe to retry with a thumbnail because Meta returned an
-    explicit HTTP error and did not return a created creative ID. We only retry
-    when the error text clearly points at image/thumbnail requirements.
-    """
-    if not isinstance(exc, MetaRequestError):
-        return False
-    info = exc.info or {}
-    text = " ".join(str(x or "") for x in [
-        info.get("message"), info.get("user_title"), info.get("user_msg")
-    ]).lower()
-    needles = [
-        "image_hash", "image url", "image_url", "thumbnail", "preview image",
-        "preview", "мініат", "миниат", "зображ", "изображ", "превью",
-    ]
-    return any(n in text for n in needles)
-
 def fresh_image_hash(source_creative, link_data, account_id):
     # We do not reuse the source image_hash. Download the rendered/source image and upload again.
     candidate_urls = [
@@ -485,7 +368,7 @@ def build_clean_creative(source_creative, account_id, suffix):
 
     mode = "VIDEO" if oss.get("video_data") else "IMAGE" if oss.get("link_data") else None
     if not mode:
-        raise SkipSource("Only ordinary single video_data or link_data creatives are supported in v14.")
+        raise SkipSource("Only ordinary single video_data or link_data creatives are supported in v15.")
 
     payload = {
         "name": f"{clean_copy_suffixes(source_creative.get('name') or 'creative')}{suffix}",
@@ -525,17 +408,25 @@ def build_clean_creative(source_creative, account_id, suffix):
             "link_description": vd.get("link_description"),
             "call_to_action": vd.get("call_to_action"),
         })
-        preview_url, preview_meta = resolve_ad_video_preview(str(video_id), str(account_id))
-        # Use Meta's own ad-video picture URL directly as video_data.image_url.
-        # Do not upload/reuse a generic ad-image hash; the previous hash-based fallback
-        # created an ad that Ads Manager refused to publish until a video thumbnail was
-        # selected manually.
-        minimal_vd["image_url"] = preview_url
+        # v15 deliberately reuses ONLY the source video's existing image_hash.
+        # The source ad is already publishable with this video+thumbnail pairing, while
+        # re-uploading the rendered thumbnail as a fresh generic ad image produced
+        # publishing error #2643026 in our tests. We do NOT copy image_url alongside it.
+        # This is not the Ads Manager UI "Automatic" thumbnail mode; it is a safe
+        # publish-ready baseline that requires no manual intervention.
+        source_video_hash = vd.get("image_hash") or source_creative.get("image_hash")
+        if not source_video_hash:
+            raise SkipSource(
+                "Source video creative has no image_hash. v15 intentionally skips instead of "
+                "creating a potentially unpublishable ad with a generic re-uploaded thumbnail."
+            )
+        minimal_vd["image_hash"] = str(source_video_hash)
         audit.update({
-            "preview_strategy": preview_meta.get("strategy"),
-            "new_image_hash": None,
-            "preview_url": preview_url,
-            "preview_meta": preview_meta,
+            "preview_strategy": "SOURCE_VIDEO_IMAGE_HASH_EXACT",
+            "new_image_hash": str(source_video_hash),
+            "preview_meta": {
+                "note": "Exact source video thumbnail hash reused; no image_url and no generic re-upload."
+            },
             "thumbnail_ui_automatic": False,
             "thumbnail_no_manual_intervention": True,
         })
@@ -833,7 +724,7 @@ def format_error(e, source_id):
     if isinstance(e, MetaRequestError):
         info = e.info
         parts = [
-            "❌ <b>Duplicate test v14 error</b>",
+            "❌ <b>Duplicate test v15 error</b>",
             f"Source Adset: <code>{esc(source_id)}</code>",
             f"Stage: <b>{esc(e.stage or 'unknown')}</b>",
         ]
@@ -844,7 +735,7 @@ def format_error(e, source_id):
             parts.append(f"fbtrace_id: {esc(info.get('fbtrace_id'))}")
         return "\n".join(parts)
     return (
-        "❌ <b>Duplicate test v14 error</b>\n"
+        "❌ <b>Duplicate test v15 error</b>\n"
         f"Source Adset: <code>{esc(source_id)}</code>\n"
         f"Partial: {esc(json.dumps(PARTIAL, ensure_ascii=False))}\n"
         f"{esc(str(e))}"
@@ -858,7 +749,7 @@ def summary_message(result):
     feature_statuses = result.get("requested_feature_statuses") or {}
     feature_short = ", ".join(f"{k}={v or 'NOT_RETURNED'}" for k, v in feature_statuses.items())
     lines = [
-        "✅ <b>Duplicate test v14 • ACCOUNT VIDEO PREVIEW</b>",
+        "✅ <b>Duplicate test v15 • SOURCE VIDEO HASH</b>",
         f"Account: <code>{esc(result.get('account_id'))}</code>",
         f"Source Adset: <code>{esc(result.get('source_adset_id'))}</code>",
         f"Copy Adset: <code>{esc(result.get('copied_adset_id'))}</code> • {esc((result.get('copied_adset') or {}).get('name'))}",
@@ -904,7 +795,7 @@ def main():
     except SkipSource as e:
         report["error"] = {"type": "skip", "message": str(e), "partial": deepcopy(PARTIAL)}
         send_telegram(
-            "⏭ <b>Duplicate test v14 skipped</b>\n"
+            "⏭ <b>Duplicate test v15 skipped</b>\n"
             f"Source Adset: <code>{esc(source_id)}</code>\n{esc(str(e))}"
         )
         exit_code = 1
