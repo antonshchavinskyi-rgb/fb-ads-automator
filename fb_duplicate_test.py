@@ -20,7 +20,7 @@ API_VER = "v26.0"
 ACCESS_TOKEN = os.environ.get("FB_SCALER_ACCESS_TOKEN")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-REPORT_FILE = "duplicate_test_v16_source_video_image_url_report.json"
+REPORT_FILE = "duplicate_test_v17_page_preferred_thumb_report.json"
 
 # This test intentionally handles ONE ordinary adset per run and creates PAUSED objects only.
 # Catalog adsets are skipped in this phase.
@@ -118,9 +118,9 @@ def serialize_param(value):
     return value
 
 
-def graph_request(method, path, params=None, stage=None, get_retry=False):
+def graph_request(method, path, params=None, stage=None, get_retry=False, token=None):
     params = dict(params or {})
-    params["access_token"] = ACCESS_TOKEN
+    params["access_token"] = token or ACCESS_TOKEN
     url = f"https://graph.facebook.com/{API_VER}/{path.lstrip('/')}"
     attempts = 2 if (method == "GET" and get_retry) else 1
 
@@ -147,9 +147,9 @@ def graph_request(method, path, params=None, stage=None, get_retry=False):
             raise MetaRequestError(e.code, info, stage=stage)
 
 
-def graph_get_all(path, params=None, stage=None):
+def graph_get_all(path, params=None, stage=None, token=None):
     params = dict(params or {})
-    params["access_token"] = ACCESS_TOKEN
+    params["access_token"] = token or ACCESS_TOKEN
     url = f"https://graph.facebook.com/{API_VER}/{path.lstrip('/')}?" + urllib.parse.urlencode(
         {k: serialize_param(v) for k, v in params.items() if v is not None}
     )
@@ -188,6 +188,126 @@ def send_access_diag(diag):
 
 def get_node(node_id, fields, stage):
     return graph_request("GET", str(node_id), {"fields": ",".join(fields)}, stage=stage, get_retry=True)
+
+
+
+
+def get_page_access_token(page_id):
+    """Resolve a Page access token from the scaler system-user token.
+
+    Meta documents Page access tokens for Page-level Graph operations. We first ask the
+    Page node directly, then fall back to /me/accounts. Nothing is persisted.
+    """
+    page_id = str(page_id)
+    try:
+        page = graph_request(
+            "GET", page_id, {"fields": "id,name,access_token"},
+            stage="page_access_token_direct", get_retry=True,
+        )
+        if page.get("access_token"):
+            return str(page["access_token"]), {"method": "page_node", "page": page}
+    except Exception:
+        pass
+
+    rows = graph_get_all(
+        "me/accounts", {"fields": "id,name,access_token", "limit": 200},
+        stage="page_access_token_accounts",
+    )
+    for row in rows:
+        if str(row.get("id")) == page_id and row.get("access_token"):
+            return str(row["access_token"]), {"method": "me_accounts", "page": row}
+    raise SkipSource(
+        f"Could not resolve a Page access token for page {page_id}. "
+        "The system user may have ads access but not Page-level token access."
+    )
+
+
+def create_preferred_video_thumbnail(video_id, page_token, source_url):
+    """Create a preferred thumbnail on the Page-associated video from the source ad's
+    existing thumbnail image. This deliberately keeps the visual thumbnail the same while
+    giving the video object an explicit preferred thumbnail via the documented edge.
+    """
+    image_bytes, content_type = download_bytes(source_url, "preferred_thumbnail_download")
+    ext = mimetypes.guess_extension(content_type) or ".jpg"
+    filename = f"preferred_thumb_{video_id}{ext}"
+    body, multipart_type = multipart_encode(
+        {"access_token": page_token, "is_preferred": "true"},
+        "source", filename, image_bytes, content_type,
+    )
+    url = f"https://graph.facebook.com/{API_VER}/{video_id}/thumbnails"
+    req = urllib.request.Request(url, data=body, method="POST", headers={"Content-Type": multipart_type})
+    try:
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        info = decode_meta_error(e.read().decode("utf-8", errors="replace"))
+        raise MetaRequestError(e.code, info, stage="create_video_preferred_thumbnail")
+
+
+def prepare_page_preferred_thumbnail(source_creative):
+    """Resolve/set a preferred thumbnail through Page-level video access.
+
+    Official Meta docs expose GET/POST /{video_id}/thumbnails and `is_preferred`.
+    We do not claim this is Ads Manager's exact internal per-placement call; v17 tests
+    whether video-level preferred-thumbnail state is the missing publish prerequisite.
+    """
+    oss = deepcopy(source_creative.get("object_story_spec") or {})
+    page_id = oss.get("page_id")
+    vd = oss.get("video_data") or {}
+    video_id = vd.get("video_id") or source_creative.get("video_id")
+    if not page_id or not video_id:
+        raise SkipSource("Video creative is missing page_id or video_id.")
+
+    page_token, token_meta = get_page_access_token(page_id)
+
+    def read_rows():
+        return graph_get_all(
+            f"{video_id}/thumbnails",
+            {"fields": "id,uri,is_preferred,height,width,scale", "limit": 100},
+            stage="page_video_thumbnails_read",
+            token=page_token,
+        )
+
+    rows = read_rows()
+    preferred = next((r for r in rows if r.get("is_preferred") is True), None)
+    created_preferred = False
+    create_raw = None
+
+    if preferred is None:
+        source_url = vd.get("image_url") or source_creative.get("thumbnail_url") or source_creative.get("image_url")
+        if not source_url:
+            raise SkipSource(
+                "Video has no preferred thumbnail and source creative has no thumbnail URL to recreate one safely."
+            )
+        create_raw = create_preferred_video_thumbnail(str(video_id), page_token, str(source_url))
+        created_preferred = True
+        time.sleep(2)
+        rows = read_rows()
+        preferred = next((r for r in rows if r.get("is_preferred") is True), None)
+
+    if preferred is None:
+        raise SkipSource(
+            f"Video {video_id} still has no is_preferred thumbnail after Page-level thumbnail operation."
+        )
+
+    selected_id = str(preferred.get("id") or "")
+    selected_uri = preferred.get("uri")
+    if not selected_id or not selected_uri:
+        raise SkipSource("Preferred VideoThumbnail did not return both id and uri.")
+
+    return {
+        "page_id": str(page_id),
+        "video_id": str(video_id),
+        "page_token_method": token_meta.get("method"),
+        "thumbnail_count": len(rows),
+        "selected_thumbnail_id": selected_id,
+        "selected_thumbnail_uri": str(selected_uri),
+        "already_preferred": not created_preferred,
+        "created_preferred": created_preferred,
+        "thumbnail_create_raw": create_raw,
+        "selected_thumbnail": preferred,
+    }
 
 
 def download_bytes(url, stage):
@@ -349,17 +469,12 @@ def poll_ad_post_processing(ad_id):
     return snapshots[-1] if snapshots else {}, snapshots
 
 
-def build_clean_creative(source_creative, account_id, suffix):
+def build_clean_creative(source_creative, account_id, suffix, video_thumb=None):
     """Build a NEW ordinary creative from essential business fields only.
 
-    Controls applied explicitly:
-    - multi-advertiser ads: OPT_OUT via contextual_multi_ads;
-    - Creative Setup / Advantage+ controls: explicit OPT_OUT for the relevant v25 features;
-    - legacy enhancement containers from the source are NOT copied;
-    - for video, resolve the AdVideo through the owning ad account and use its Meta-generated
-      `picture` URL directly as `video_data.image_url`; no generic ad-image hash is created.
-      Ads Manager may still label this as Manual because the public API does not expose
-      the UI's Automatic selector as a documented switch.
+    For video in v17, the thumbnail must come from Meta's native thumbnail list read
+    with a Page access token. We use that thumbnail URI in video_data.image_url and
+    explicitly keep all documented creative enhancements opted out.
     """
     oss = deepcopy(source_creative.get("object_story_spec") or {})
     page_id = oss.get("page_id")
@@ -368,7 +483,7 @@ def build_clean_creative(source_creative, account_id, suffix):
 
     mode = "VIDEO" if oss.get("video_data") else "IMAGE" if oss.get("link_data") else None
     if not mode:
-        raise SkipSource("Only ordinary single video_data or link_data creatives are supported in v16.")
+        raise SkipSource("Only ordinary single video_data or link_data creatives are supported in v17.")
 
     payload = {
         "name": f"{clean_copy_suffixes(source_creative.get('name') or 'creative')}{suffix}",
@@ -400,6 +515,8 @@ def build_clean_creative(source_creative, account_id, suffix):
         video_id = vd.get("video_id") or source_creative.get("video_id")
         if not video_id:
             raise SkipSource("Video creative has no video_id.")
+        if not video_thumb or str(video_thumb.get("video_id")) != str(video_id):
+            raise SkipSource("v17 requires a prepared Page-level preferred thumbnail for this video.")
 
         minimal_vd = clean_dict({
             "video_id": str(video_id),
@@ -407,32 +524,15 @@ def build_clean_creative(source_creative, account_id, suffix):
             "title": vd.get("title"),
             "link_description": vd.get("link_description"),
             "call_to_action": vd.get("call_to_action"),
+            "image_url": video_thumb.get("selected_thumbnail_uri"),
         })
-        # v16: do NOT reuse the source image_hash. Our v15 test showed that the old hash can
-        # be accepted at creative-create time but still fail during Meta's asynchronous publish
-        # processing (#2643026). The source object_story_spec for this ad exposes image_url as
-        # well. Meta documents video_data.image_url as a supported thumbnail input and says the
-        # image at that URL is saved to the ad account image library. We therefore pass ONLY the
-        # source video_data.image_url and let Meta create a fresh backing image asset.
-        # Never send image_hash and image_url together: Meta rejects that as redundant.
-        source_video_image_url = vd.get("image_url")
-        if not source_video_image_url:
-            raise SkipSource(
-                "Source video_data has no image_url. v16 intentionally skips instead of reusing "
-                "the old image_hash that previously produced publishing error #2643026."
-            )
-        minimal_vd["image_url"] = str(source_video_image_url)
         audit.update({
-            "preview_strategy": "SOURCE_VIDEO_IMAGE_URL_ONLY",
+            "preview_strategy": "PAGE_VIDEO_PREFERRED_THUMBNAIL_URI",
             "new_image_hash": None,
-            "preview_meta": {
-                "source_image_url": str(source_video_image_url),
-                "note": "Only source video_data.image_url is sent; old image_hash is intentionally omitted."
-            },
+            "preview_meta": deepcopy(video_thumb),
             "thumbnail_ui_automatic": False,
             "thumbnail_no_manual_intervention": True,
         })
-
         payload["object_story_spec"] = {"page_id": str(page_id), "video_data": minimal_vd}
         return payload, audit
 
@@ -562,8 +662,15 @@ def create_clean_clone(source_adset_id):
         raise SkipSource("Catalog source detected. Catalogs are intentionally skipped in ordinary-ad phase.")
 
     now = datetime.now(POLAND_TZ)
-    suffix = f" [PYTEST-V16 {now.strftime('%Y%m%d-%H%M%S')}]"
+    suffix = f" [PYTEST-V17 {now.strftime('%Y%m%d-%H%M%S')}]"
     account_id = str(source.get("account_id"))
+
+    # v17: resolve Page-level native video thumbnails BEFORE creating any copy,
+    # so a permission/thumbnail failure does not leave an orphan copied adset.
+    video_thumb = None
+    oss = source_creative.get("object_story_spec") or {}
+    if oss.get("video_data"):
+        video_thumb = prepare_page_preferred_thumbnail(source_creative)
 
     # 1) Copy only the adset. Child ad/creative are rebuilt from a minimal schema.
     copy_resp = graph_request(
@@ -585,10 +692,10 @@ def create_clean_clone(source_adset_id):
     # For video, resolve the source AdVideo through the ad account /advideos (or /video_ads) edge
     # For video, use only the source object_story_spec.video_data.image_url.
     # The old image_hash is intentionally not reused because it produced publish error #2643026.
-    creative_payload, media_audit = build_clean_creative(source_creative, account_id, suffix)
+    creative_payload, media_audit = build_clean_creative(source_creative, account_id, suffix, video_thumb=video_thumb)
     new_creative = graph_request(
         "POST", f"act_{account_id}/adcreatives", creative_payload,
-        stage="create_clean_creative_v26_source_video_image_url"
+        stage="create_clean_creative_v26_page_preferred_thumbnail"
     )
     new_creative_id = str(new_creative.get("id") or "")
     if not new_creative_id:
@@ -726,7 +833,7 @@ def format_error(e, source_id):
     if isinstance(e, MetaRequestError):
         info = e.info
         parts = [
-            "❌ <b>Duplicate test v16 error</b>",
+            "❌ <b>Duplicate test v17 error</b>",
             f"Source Adset: <code>{esc(source_id)}</code>",
             f"Stage: <b>{esc(e.stage or 'unknown')}</b>",
         ]
@@ -737,7 +844,7 @@ def format_error(e, source_id):
             parts.append(f"fbtrace_id: {esc(info.get('fbtrace_id'))}")
         return "\n".join(parts)
     return (
-        "❌ <b>Duplicate test v16 error</b>\n"
+        "❌ <b>Duplicate test v17 error</b>\n"
         f"Source Adset: <code>{esc(source_id)}</code>\n"
         f"Partial: {esc(json.dumps(PARTIAL, ensure_ascii=False))}\n"
         f"{esc(str(e))}"
@@ -751,7 +858,7 @@ def summary_message(result):
     feature_statuses = result.get("requested_feature_statuses") or {}
     feature_short = ", ".join(f"{k}={v or 'NOT_RETURNED'}" for k, v in feature_statuses.items())
     lines = [
-        "✅ <b>Duplicate test v16 • SOURCE VIDEO IMAGE URL</b>",
+        "✅ <b>Duplicate test v17 • PAGE PREFERRED THUMBNAIL</b>",
         f"Account: <code>{esc(result.get('account_id'))}</code>",
         f"Source Adset: <code>{esc(result.get('source_adset_id'))}</code>",
         f"Copy Adset: <code>{esc(result.get('copied_adset_id'))}</code> • {esc((result.get('copied_adset') or {}).get('name'))}",
@@ -797,7 +904,7 @@ def main():
     except SkipSource as e:
         report["error"] = {"type": "skip", "message": str(e), "partial": deepcopy(PARTIAL)}
         send_telegram(
-            "⏭ <b>Duplicate test v16 skipped</b>\n"
+            "⏭ <b>Duplicate test v17 skipped</b>\n"
             f"Source Adset: <code>{esc(source_id)}</code>\n{esc(str(e))}"
         )
         exit_code = 1
