@@ -1,26 +1,17 @@
-name: FB Creative Compare v21 — READ ONLY by Adset
+name: FB Duplicate Test — Controlled Ordinary Ad v22 — API v26
 
 on:
   workflow_dispatch:
     inputs:
-      source_adset_id:
-        description: 'Working original/source Adset ID'
+      adset_id:
+        description: 'ONE ordinary Adset ID to duplicate as PAUSED'
         required: true
-        type: string
-      fixed_adset_id:
-        description: 'Clone Adset ID whose ad was manually fixed + successfully published'
-        required: true
-        type: string
-      broken_adset_id:
-        description: 'Optional: clone Adset ID whose ad still has #2643026'
-        required: false
         type: string
 
 jobs:
-  creative-compare:
+  duplicate-test:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-
+    timeout-minutes: 15
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -30,20 +21,18 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Run READ ONLY creative compare v21 by Adset
+      - name: Run controlled duplicate test v22 (API v26)
         env:
           FB_SCALER_ACCESS_TOKEN: ${{ secrets.FB_SCALER_ACCESS_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          SOURCE_ADSET_ID: ${{ inputs.source_adset_id }}
-          FIXED_ADSET_ID: ${{ inputs.fixed_adset_id }}
-          BROKEN_ADSET_ID: ${{ inputs.broken_adset_id }}
+          TEST_ADSET_ID: ${{ inputs.adset_id }}
         run: python fb_duplicate_test.py
 
-      - name: Upload compare report
+      - name: Upload audit report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: creative-compare-v21-report
-          path: duplicate_test_v21_compare_by_adset_report.json
+          name: duplicate-test-v22-auto-tracking-report
+          path: duplicate_test_v22_auto_tracking_report.json
           if-no-files-found: ignore
