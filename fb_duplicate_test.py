@@ -13,25 +13,24 @@ ACCESS_TOKEN = os.environ.get("FB_SCALER_ACCESS_TOKEN")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-SOURCE_AD_ID = (os.environ.get("SOURCE_AD_ID") or "").strip()
-FIXED_AD_ID = (os.environ.get("FIXED_AD_ID") or "").strip()
-BROKEN_AD_ID = (os.environ.get("BROKEN_AD_ID") or "").strip()
+SOURCE_ADSET_ID = (os.environ.get("SOURCE_ADSET_ID") or "").strip()
+FIXED_ADSET_ID = (os.environ.get("FIXED_ADSET_ID") or "").strip()
+BROKEN_ADSET_ID = (os.environ.get("BROKEN_ADSET_ID") or "").strip()
 
-REPORT_FILE = "duplicate_test_v20_compare_report.json"
+REPORT_FILE = "duplicate_test_v21_compare_by_adset_report.json"
 
-# Keep the required GET deliberately small. Meta v26 currently rejects adset_id
-# on this Ad node in the user's runtime, even though SDK codegen still exposes it.
-AD_REQUIRED = ["id", "name", "status", "effective_status", "creative"]
-AD_OPTIONAL = [
-    "account_id",
+AD_FIELDS = [
+    "id",
+    "name",
+    "status",
+    "effective_status",
+    "creative",
     "tracking_specs",
     "conversion_specs",
     "conversion_domain",
     "issues_info",
     "failed_delivery_checks",
     "ad_review_feedback",
-    "preview_shareable_link",
-    "source_ad_id",
 ]
 
 CREATIVE_REQUIRED = ["id", "name", "object_story_spec"]
@@ -89,10 +88,8 @@ def parse_meta_error(body):
         err = payload.get("error", {})
         return {
             "message": err.get("message", body),
-            "type": err.get("type"),
             "code": err.get("code"),
             "subcode": err.get("error_subcode"),
-            "fbtrace_id": err.get("fbtrace_id"),
             "raw": payload,
         }
     except Exception:
@@ -105,12 +102,7 @@ class GraphError(RuntimeError):
         self.stage = stage
         super().__init__(f"{stage}: HTTP {status}: {info.get('message')}")
 
-def graph_get(node_id, fields, stage):
-    params = {
-        "fields": ",".join(fields),
-        "access_token": ACCESS_TOKEN,
-    }
-    url = f"https://graph.facebook.com/{API_VER}/{node_id}?" + urllib.parse.urlencode(params)
+def graph_get_url(url, stage):
     try:
         with urllib.request.urlopen(urllib.request.Request(url), timeout=60) as resp:
             return json.loads(resp.read().decode("utf-8"))
@@ -118,14 +110,32 @@ def graph_get(node_id, fields, stage):
         body = e.read().decode("utf-8", errors="replace")
         raise GraphError(e.code, parse_meta_error(body), stage)
 
+def graph_get(node_id, fields, stage):
+    params = {
+        "fields": ",".join(fields),
+        "access_token": ACCESS_TOKEN,
+    }
+    url = f"https://graph.facebook.com/{API_VER}/{node_id}?" + urllib.parse.urlencode(params)
+    return graph_get_url(url, stage)
+
+def graph_get_edge(node_id, edge, fields, stage, limit=10):
+    params = {
+        "fields": ",".join(fields),
+        "limit": limit,
+        "access_token": ACCESS_TOKEN,
+    }
+    url = f"https://graph.facebook.com/{API_VER}/{node_id}/{edge}?" + urllib.parse.urlencode(params)
+    payload = graph_get_url(url, stage)
+    return payload.get("data", [])
+
 def is_missing_field_error(err):
     if not isinstance(err, GraphError):
         return False
     msg = (err.info.get("message") or "").lower()
     return err.info.get("code") == 100 and (
-        "nonexisting field" in msg or
-        "non-existing field" in msg or
-        "tried accessing" in msg
+        "nonexisting field" in msg
+        or "non-existing field" in msg
+        or "tried accessing" in msg
     )
 
 def fetch_optional_tolerant(node_id, fields, stage_prefix, out, unsupported):
@@ -147,40 +157,58 @@ def fetch_optional_tolerant(node_id, fields, stage_prefix, out, unsupported):
         fetch_optional_tolerant(node_id, fields[:mid], stage_prefix + "_a", out, unsupported)
         fetch_optional_tolerant(node_id, fields[mid:], stage_prefix + "_b", out, unsupported)
 
-def tolerant_get(node_id, required_fields, optional_fields, label):
-    data = graph_get(node_id, required_fields, f"{label}_required")
-    unsupported = {}
-    fetch_optional_tolerant(node_id, optional_fields, f"{label}_optional", data, unsupported)
-    return {"data": data, "unsupported_fields": unsupported}
+def get_one_ad_from_adset(adset_id, label):
+    ads = graph_get_edge(
+        adset_id,
+        "ads",
+        AD_FIELDS,
+        f"{label}_adset_ads",
+        limit=10,
+    )
+    if not ads:
+        raise RuntimeError(f"{label}: no ads found under adset {adset_id}")
+    if len(ads) != 1:
+        raise RuntimeError(
+            f"{label}: expected exactly 1 ad under adset {adset_id}, got {len(ads)}"
+        )
 
-def fetch_ad_and_creative(ad_id, label):
-    ad_result = tolerant_get(ad_id, AD_REQUIRED, AD_OPTIONAL, f"{label}_ad")
-    ad = ad_result["data"]
-
+    ad = ads[0]
     creative_id = (ad.get("creative") or {}).get("id")
     if not creative_id:
-        raise RuntimeError(f"{label}: ad has no creative id")
+        raise RuntimeError(
+            f"{label}: ad {ad.get('id')} returned via adset edge has no creative id"
+        )
 
-    creative_result = tolerant_get(
+    creative = graph_get(
         creative_id,
         CREATIVE_REQUIRED,
-        CREATIVE_OPTIONAL,
-        f"{label}_creative",
+        f"{label}_creative_required",
     )
+    unsupported = {}
+    fetch_optional_tolerant(
+        creative_id,
+        CREATIVE_OPTIONAL,
+        f"{label}_creative_optional",
+        creative,
+        unsupported,
+    )
+
     return {
+        "adset_id": adset_id,
         "ad": ad,
-        "creative": creative_result["data"],
-        "unsupported": {
-            "ad": ad_result["unsupported_fields"],
-            "creative": creative_result["unsupported_fields"],
-        },
+        "creative": creative,
+        "unsupported_creative_fields": unsupported,
     }
 
 IGNORE_KEYS = {
-    "id", "name", "account_id",
-    "status", "effective_status",
-    "effective_object_story_id", "object_story_id", "source_facebook_post_id",
-    "preview_shareable_link",
+    "id",
+    "name",
+    "status",
+    "effective_status",
+    "account_id",
+    "object_story_id",
+    "effective_object_story_id",
+    "source_facebook_post_id",
 }
 
 def deep_diff(a, b, path=""):
@@ -188,11 +216,12 @@ def deep_diff(a, b, path=""):
     if type(a) != type(b):
         diffs.append({"path": path or "$", "a": a, "b": b, "kind": "type/value"})
         return diffs
+
     if isinstance(a, dict):
         for k in sorted(set(a) | set(b)):
-            p = f"{path}.{k}" if path else k
             if k in IGNORE_KEYS:
                 continue
+            p = f"{path}.{k}" if path else k
             if k not in a:
                 diffs.append({"path": p, "a": "<MISSING>", "b": b[k], "kind": "added"})
             elif k not in b:
@@ -215,14 +244,27 @@ def deep_diff(a, b, path=""):
     return diffs
 
 FOCUS_NEEDLES = (
-    "thumbnail", "image_hash", "image_url", "video_id",
-    "asset_feed_spec", "platform_customizations", "portrait_customizations",
-    "degrees_of_freedom_spec", "destination_spec",
-    "media_sourcing_spec", "creative_sourcing_spec",
-    "format_transformation_spec", "generative_asset_spec",
-    "contextual_multi_ads", "object_story_spec",
-    "tracking_specs", "conversion_specs", "conversion_domain",
-    "issues_info", "failed_delivery_checks", "ad_review_feedback",
+    "thumbnail",
+    "image_hash",
+    "image_url",
+    "video_id",
+    "asset_feed_spec",
+    "platform_customizations",
+    "portrait_customizations",
+    "degrees_of_freedom_spec",
+    "destination_spec",
+    "media_sourcing_spec",
+    "creative_sourcing_spec",
+    "format_transformation_spec",
+    "generative_asset_spec",
+    "contextual_multi_ads",
+    "object_story_spec",
+    "tracking_specs",
+    "conversion_specs",
+    "conversion_domain",
+    "issues_info",
+    "failed_delivery_checks",
+    "ad_review_feedback",
 )
 
 def focus(diffs):
@@ -230,14 +272,17 @@ def focus(diffs):
 
 def compare(left, right):
     all_diffs = (
-        deep_diff(left["ad"], right["ad"], "ad") +
-        deep_diff(left["creative"], right["creative"], "creative")
+        deep_diff(left["ad"], right["ad"], "ad")
+        + deep_diff(left["creative"], right["creative"], "creative")
     )
-    return {"all_diffs": all_diffs, "focused_diffs": focus(all_diffs)}
+    return {
+        "all_diffs": all_diffs,
+        "focused_diffs": focus(all_diffs),
+    }
 
-def short(v, limit=160):
+def short(v, limit=170):
     s = json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else str(v)
-    return s if len(s) <= limit else s[:limit-1] + "…"
+    return s if len(s) <= limit else s[:limit - 1] + "…"
 
 def pair_text(title, pair):
     focused = pair["focused_diffs"]
@@ -259,68 +304,76 @@ def pair_text(title, pair):
         lines.append("✅ Ключових API-visible відмінностей не знайдено.")
     return "\n".join(lines)
 
-def unsupported_text(label, obj):
-    ad_u = obj.get("unsupported", {}).get("ad", {})
-    cr_u = obj.get("unsupported", {}).get("creative", {})
-    if not ad_u and not cr_u:
-        return f"{label}: unsupported fields = none"
-    return f"{label}: unsupported ad={list(ad_u)}, creative={list(cr_u)}"
+def item_header(label, item):
+    return (
+        f"{label}: Adset <code>{esc(item['adset_id'])}</code> → "
+        f"Ad <code>{esc(item['ad'].get('id'))}</code> → "
+        f"Creative <code>{esc(item['creative'].get('id'))}</code>"
+    )
 
 def main():
     if not ACCESS_TOKEN:
         raise SystemExit("FB_SCALER_ACCESS_TOKEN missing")
-    if not SOURCE_AD_ID or not FIXED_AD_ID:
-        raise SystemExit("SOURCE_AD_ID and FIXED_AD_ID are required")
+    if not SOURCE_ADSET_ID or not FIXED_ADSET_ID:
+        raise SystemExit("SOURCE_ADSET_ID and FIXED_ADSET_ID are required")
 
     report = {
-        "version": "v20",
+        "version": "v21",
         "api": API_VER,
-        "mode": "READ_ONLY_TOLERANT_COMPARE",
-        "source_ad_id": SOURCE_AD_ID,
-        "fixed_ad_id": FIXED_AD_ID,
-        "broken_ad_id": BROKEN_AD_ID or None,
+        "mode": "READ_ONLY_COMPARE_BY_ADSET_EDGE",
+        "source_adset_id": SOURCE_ADSET_ID,
+        "fixed_adset_id": FIXED_ADSET_ID,
+        "broken_adset_id": BROKEN_ADSET_ID or None,
         "notes": [
             "READ ONLY: no POST/write calls.",
-            "v20 deliberately avoids adset_id/campaign_id on Ad GET under v26.",
-            "Optional fields are probed tolerantly: unsupported fields are recorded instead of aborting the run.",
+            "Ads are resolved via /{adset_id}/ads because that exact route already worked in v18.",
+            "This avoids direct /{ad_id}?fields=creative ambiguity and removes manual Ad-vs-Adset ID confusion.",
         ],
     }
 
     try:
-        report["source"] = fetch_ad_and_creative(SOURCE_AD_ID, "source")
-        report["fixed"] = fetch_ad_and_creative(FIXED_AD_ID, "fixed")
+        report["source"] = get_one_ad_from_adset(SOURCE_ADSET_ID, "source")
+        report["fixed"] = get_one_ad_from_adset(FIXED_ADSET_ID, "fixed")
         report["source_vs_fixed"] = compare(report["source"], report["fixed"])
 
-        if BROKEN_AD_ID:
-            report["broken"] = fetch_ad_and_creative(BROKEN_AD_ID, "broken")
+        if BROKEN_ADSET_ID:
+            report["broken"] = get_one_ad_from_adset(BROKEN_ADSET_ID, "broken")
             report["broken_vs_fixed"] = compare(report["broken"], report["fixed"])
 
-        Path(REPORT_FILE).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        Path(REPORT_FILE).write_text(
+            json.dumps(report, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
         parts = [
-            "🔎 <b>Creative compare v20 — READ ONLY</b>",
-            f"Source: <code>{esc(SOURCE_AD_ID)}</code>",
-            f"Fixed: <code>{esc(FIXED_AD_ID)}</code>",
-            unsupported_text("SOURCE", report["source"]),
-            unsupported_text("FIXED", report["fixed"]),
+            "🔎 <b>Creative compare v21 — READ ONLY / BY ADSET</b>",
+            item_header("SOURCE", report["source"]),
+            item_header("FIXED", report["fixed"]),
             "",
             pair_text("SOURCE → FIXED", report["source_vs_fixed"]),
         ]
         if report.get("broken_vs_fixed"):
             parts += [
                 "",
-                unsupported_text("BROKEN", report["broken"]),
+                item_header("BROKEN", report["broken"]),
                 pair_text("BROKEN → FIXED (найважливіше)", report["broken_vs_fixed"]),
             ]
-        parts += ["", "🧪 Жодних змін у Meta не внесено.", "Повний diff — у JSON artifact."]
+        parts += [
+            "",
+            "🧪 Жодних змін у Meta не внесено.",
+            "Повний diff — у JSON artifact.",
+        ]
         send_telegram("\n".join(parts))
         print(json.dumps(report, ensure_ascii=False, indent=2), flush=True)
         return 0
 
     except Exception as e:
         report["error"] = str(e)
-        Path(REPORT_FILE).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-        send_telegram("❌ <b>Creative compare v20 error</b>\n" + esc(e))
+        Path(REPORT_FILE).write_text(
+            json.dumps(report, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        send_telegram("❌ <b>Creative compare v21 error</b>\n" + esc(e))
         print(f"ERROR: {e}", flush=True)
         return 1
 
