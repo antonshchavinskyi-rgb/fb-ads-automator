@@ -1,4 +1,4 @@
-name: FB Creative Compare v19 — READ ONLY
+name: FB Creative Compare v20 — READ ONLY
 
 on:
   workflow_dispatch:
@@ -8,11 +8,11 @@ on:
         required: true
         type: string
       fixed_ad_id:
-        description: 'API clone Ad ID AFTER manual thumbnail fix and successful publish'
+        description: 'Clone Ad ID AFTER manual thumbnail fix + successful publish'
         required: true
         type: string
       broken_ad_id:
-        description: 'Optional: broken API clone Ad ID with #2643026'
+        description: 'Optional: broken clone Ad ID with #2643026'
         required: false
         type: string
 
@@ -20,6 +20,7 @@ jobs:
   creative-compare:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -29,7 +30,7 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Run READ ONLY creative compare v19
+      - name: Run tolerant READ ONLY creative compare v20
         env:
           FB_SCALER_ACCESS_TOKEN: ${{ secrets.FB_SCALER_ACCESS_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -43,6 +44,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: creative-compare-v19-report
-          path: duplicate_test_v19_compare_report.json
+          name: creative-compare-v20-report
+          path: duplicate_test_v20_compare_report.json
           if-no-files-found: ignore
