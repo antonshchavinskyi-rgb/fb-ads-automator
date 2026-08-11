@@ -1,18 +1,18 @@
-name: FB Creative Compare v20 — READ ONLY
+name: FB Creative Compare v21 — READ ONLY by Adset
 
 on:
   workflow_dispatch:
     inputs:
-      source_ad_id:
-        description: 'Working original/source Ad ID'
+      source_adset_id:
+        description: 'Working original/source Adset ID'
         required: true
         type: string
-      fixed_ad_id:
-        description: 'Clone Ad ID AFTER manual thumbnail fix + successful publish'
+      fixed_adset_id:
+        description: 'Clone Adset ID whose ad was manually fixed + successfully published'
         required: true
         type: string
-      broken_ad_id:
-        description: 'Optional: broken clone Ad ID with #2643026'
+      broken_adset_id:
+        description: 'Optional: clone Adset ID whose ad still has #2643026'
         required: false
         type: string
 
@@ -30,20 +30,20 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Run tolerant READ ONLY creative compare v20
+      - name: Run READ ONLY creative compare v21 by Adset
         env:
           FB_SCALER_ACCESS_TOKEN: ${{ secrets.FB_SCALER_ACCESS_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          SOURCE_AD_ID: ${{ inputs.source_ad_id }}
-          FIXED_AD_ID: ${{ inputs.fixed_ad_id }}
-          BROKEN_AD_ID: ${{ inputs.broken_ad_id }}
+          SOURCE_ADSET_ID: ${{ inputs.source_adset_id }}
+          FIXED_ADSET_ID: ${{ inputs.fixed_adset_id }}
+          BROKEN_ADSET_ID: ${{ inputs.broken_adset_id }}
         run: python fb_duplicate_test.py
 
       - name: Upload compare report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: creative-compare-v20-report
-          path: duplicate_test_v20_compare_report.json
+          name: creative-compare-v21-report
+          path: duplicate_test_v21_compare_by_adset_report.json
           if-no-files-found: ignore
