@@ -20,7 +20,7 @@ API_VER = "v26.0"
 ACCESS_TOKEN = os.environ.get("FB_SCALER_ACCESS_TOKEN")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-REPORT_FILE = "duplicate_test_v25_generated_selected_report.json"
+REPORT_FILE = "duplicate_test_v25_1_generated_selected_report.json"
 
 # This test intentionally handles ONE ordinary adset per run and creates PAUSED objects only.
 # Catalog adsets are skipped in this phase.
@@ -58,21 +58,68 @@ def esc(text):
     return html.escape(str(text), quote=False)
 
 
+def _telegram_chunks(message, max_chars=3500):
+    """
+    Telegram messages have a strict size ceiling.
+    Split only on line boundaries so our small HTML tags are not cut in half.
+    A single overlong diagnostic line is hard-truncated as a last-resort fallback.
+    """
+    chunks = []
+    current = []
+
+    def flush():
+        nonlocal current
+        if current:
+            chunks.append("\n".join(current))
+            current = []
+
+    for line in str(message).splitlines():
+        if len(line) > max_chars:
+            flush()
+            # Long raw diagnostic lines should normally never reach here because
+            # summary_message() is compact, but keep this safety net.
+            while len(line) > max_chars:
+                chunks.append(line[:max_chars])
+                line = line[max_chars:]
+            if line:
+                current = [line]
+            continue
+
+        candidate = "\n".join(current + [line])
+        if current and len(candidate) > max_chars:
+            flush()
+            current = [line]
+        else:
+            current.append(line)
+
+    flush()
+    return chunks or [""]
+
+
 def send_telegram(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("Telegram secrets missing; message skipped.", flush=True)
         return
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    data = urllib.parse.urlencode({
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": "true",
-    }).encode("utf-8")
-    try:
-        urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=15)
-    except Exception as e:
-        print(f"Telegram error: {e}", flush=True)
+
+    for idx, chunk in enumerate(_telegram_chunks(message), start=1):
+        data = urllib.parse.urlencode({
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": chunk,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": "true",
+        }).encode("utf-8")
+        try:
+            urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=15)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            print(
+                f"Telegram HTTP {e.code} on chunk {idx}: {body[:1200]}",
+                flush=True,
+            )
+        except Exception as e:
+            print(f"Telegram error on chunk {idx}: {e}", flush=True)
 
 
 def decode_meta_error(body):
@@ -863,7 +910,7 @@ def format_error(e, source_id):
     if isinstance(e, MetaRequestError):
         info = e.info
         parts = [
-            "❌ <b>Duplicate test v25 error</b>",
+            "❌ <b>Duplicate test v25.1 error</b>",
             f"Source Adset: <code>{esc(source_id)}</code>",
             f"Stage: <b>{esc(e.stage or 'unknown')}</b>",
         ]
@@ -874,7 +921,7 @@ def format_error(e, source_id):
             parts.append(f"fbtrace_id: {esc(info.get('fbtrace_id'))}")
         return "\n".join(parts)
     return (
-        "❌ <b>Duplicate test v25 error</b>\n"
+        "❌ <b>Duplicate test v25.1 error</b>\n"
         f"Source Adset: <code>{esc(source_id)}</code>\n"
         f"Partial: {esc(json.dumps(PARTIAL, ensure_ascii=False))}\n"
         f"{esc(str(e))}"
@@ -888,7 +935,7 @@ def summary_message(result):
     feature_statuses = result.get("requested_feature_statuses") or {}
     feature_short = ", ".join(f"{k}={v or 'NOT_RETURNED'}" for k, v in feature_statuses.items())
     lines = [
-        "🧪 <b>Duplicate test v25 • GENERATED_SELECTED THUMBNAIL</b>",
+        "🧪 <b>Duplicate test v25.1 • GENERATED_SELECTED THUMBNAIL</b>",
         f"Account: <code>{esc(result.get('account_id'))}</code>",
         f"Source Adset: <code>{esc(result.get('source_adset_id'))}</code>",
         f"Copy Adset: <code>{esc(result.get('copied_adset_id'))}</code> • {esc((result.get('copied_adset') or {}).get('name'))}",
@@ -897,7 +944,7 @@ def summary_message(result):
         f"Pixel: {esc(result.get('pixel_source'))} → {esc(result.get('pixel_copy'))} {'✅' if result.get('pixel_match') else '❌'}",
         f"Multi-advertiser: {esc(result.get('multi_advertiser_status'))} {'✅' if result.get('multi_advertiser_status') == 'OPT_OUT' else '⚠️'}",
         "DOF sent on create: ❌ NO",
-        f"Meta returned enhancement statuses: {esc(result.get('enhancement_enroll_statuses') or 'none')}",
+        f"Meta returned enhancement statuses: {len(result.get('enhancement_enroll_statuses') or [])} fields (full list in JSON)",
         f"Meta returned OPT_IN count: {len(result.get('enhancement_opt_ins') or [])}",
         f"Media: {esc(media.get('mode'))} • thumbnail: {esc(media.get('preview_strategy'))}",
         f"Root AdVideo ID: {esc((media.get('preview_meta') or {}).get('root_advideo_id'))}",
@@ -946,7 +993,7 @@ def main():
     except SkipSource as e:
         report["error"] = {"type": "skip", "message": str(e), "partial": deepcopy(PARTIAL)}
         send_telegram(
-            "⏭ <b>Duplicate test v25 skipped</b>\n"
+            "⏭ <b>Duplicate test v25.1 skipped</b>\n"
             f"Source Adset: <code>{esc(source_id)}</code>\n{esc(str(e))}"
         )
         exit_code = 1
