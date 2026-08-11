@@ -17,18 +17,30 @@ SOURCE_AD_ID = (os.environ.get("SOURCE_AD_ID") or "").strip()
 FIXED_AD_ID = (os.environ.get("FIXED_AD_ID") or "").strip()
 BROKEN_AD_ID = (os.environ.get("BROKEN_AD_ID") or "").strip()
 
-REPORT_FILE = "duplicate_test_v19_compare_report.json"
+REPORT_FILE = "duplicate_test_v20_compare_report.json"
 
-AD_FIELDS = [
-    "id","name","account_id","adset_id","campaign_id","status","effective_status",
-    "creative","tracking_specs","conversion_specs","conversion_domain",
-    "issues_info","failed_delivery_checks","ad_review_feedback",
+# Keep the required GET deliberately small. Meta v26 currently rejects adset_id
+# on this Ad node in the user's runtime, even though SDK codegen still exposes it.
+AD_REQUIRED = ["id", "name", "status", "effective_status", "creative"]
+AD_OPTIONAL = [
+    "account_id",
+    "tracking_specs",
+    "conversion_specs",
+    "conversion_domain",
+    "issues_info",
+    "failed_delivery_checks",
+    "ad_review_feedback",
+    "preview_shareable_link",
+    "source_ad_id",
 ]
 
-CREATIVE_FIELDS = [
-    "id","name","account_id","actor_id","status",
-    "object_story_id","effective_object_story_id","source_facebook_post_id",
-    "object_story_spec",
+CREATIVE_REQUIRED = ["id", "name", "object_story_spec"]
+CREATIVE_OPTIONAL = [
+    "account_id",
+    "actor_id",
+    "object_story_id",
+    "effective_object_story_id",
+    "source_facebook_post_id",
     "asset_feed_spec",
     "platform_customizations",
     "portrait_customizations",
@@ -42,8 +54,14 @@ CREATIVE_FIELDS = [
     "contextual_multi_ads",
     "categorization_criteria",
     "category_media_source",
-    "image_hash","image_url","thumbnail_id","thumbnail_url","video_id",
-    "link_url","object_url","url_tags",
+    "image_hash",
+    "image_url",
+    "thumbnail_id",
+    "thumbnail_url",
+    "video_id",
+    "link_url",
+    "object_url",
+    "url_tags",
 ]
 
 def esc(v):
@@ -65,6 +83,28 @@ def send_telegram(message):
     except Exception as e:
         print(f"Telegram error: {e}", flush=True)
 
+def parse_meta_error(body):
+    try:
+        payload = json.loads(body)
+        err = payload.get("error", {})
+        return {
+            "message": err.get("message", body),
+            "type": err.get("type"),
+            "code": err.get("code"),
+            "subcode": err.get("error_subcode"),
+            "fbtrace_id": err.get("fbtrace_id"),
+            "raw": payload,
+        }
+    except Exception:
+        return {"message": body, "raw": body}
+
+class GraphError(RuntimeError):
+    def __init__(self, status, info, stage):
+        self.status = status
+        self.info = info
+        self.stage = stage
+        super().__init__(f"{stage}: HTTP {status}: {info.get('message')}")
+
 def graph_get(node_id, fields, stage):
     params = {
         "fields": ",".join(fields),
@@ -76,20 +116,71 @@ def graph_get(node_id, fields, stage):
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"{stage}: HTTP {e.code}: {body}")
+        raise GraphError(e.code, parse_meta_error(body), stage)
+
+def is_missing_field_error(err):
+    if not isinstance(err, GraphError):
+        return False
+    msg = (err.info.get("message") or "").lower()
+    return err.info.get("code") == 100 and (
+        "nonexisting field" in msg or
+        "non-existing field" in msg or
+        "tried accessing" in msg
+    )
+
+def fetch_optional_tolerant(node_id, fields, stage_prefix, out, unsupported):
+    if not fields:
+        return
+    try:
+        data = graph_get(node_id, fields, stage_prefix)
+        for f in fields:
+            if f in data:
+                out[f] = data[f]
+        return
+    except GraphError as e:
+        if not is_missing_field_error(e):
+            raise
+        if len(fields) == 1:
+            unsupported[fields[0]] = e.info.get("message")
+            return
+        mid = len(fields) // 2
+        fetch_optional_tolerant(node_id, fields[:mid], stage_prefix + "_a", out, unsupported)
+        fetch_optional_tolerant(node_id, fields[mid:], stage_prefix + "_b", out, unsupported)
+
+def tolerant_get(node_id, required_fields, optional_fields, label):
+    data = graph_get(node_id, required_fields, f"{label}_required")
+    unsupported = {}
+    fetch_optional_tolerant(node_id, optional_fields, f"{label}_optional", data, unsupported)
+    return {"data": data, "unsupported_fields": unsupported}
 
 def fetch_ad_and_creative(ad_id, label):
-    ad = graph_get(ad_id, AD_FIELDS, f"{label}_ad")
+    ad_result = tolerant_get(ad_id, AD_REQUIRED, AD_OPTIONAL, f"{label}_ad")
+    ad = ad_result["data"]
+
     creative_id = (ad.get("creative") or {}).get("id")
     if not creative_id:
         raise RuntimeError(f"{label}: ad has no creative id")
-    creative = graph_get(creative_id, CREATIVE_FIELDS, f"{label}_creative")
-    return {"ad": ad, "creative": creative}
 
-IGNORE_PATH_PARTS = {
-    "id", "name", "account_id", "adset_id", "campaign_id",
-    "status", "effective_status", "effective_object_story_id",
-    "object_story_id", "source_facebook_post_id",
+    creative_result = tolerant_get(
+        creative_id,
+        CREATIVE_REQUIRED,
+        CREATIVE_OPTIONAL,
+        f"{label}_creative",
+    )
+    return {
+        "ad": ad,
+        "creative": creative_result["data"],
+        "unsupported": {
+            "ad": ad_result["unsupported_fields"],
+            "creative": creative_result["unsupported_fields"],
+        },
+    }
+
+IGNORE_KEYS = {
+    "id", "name", "account_id",
+    "status", "effective_status",
+    "effective_object_story_id", "object_story_id", "source_facebook_post_id",
+    "preview_shareable_link",
 }
 
 def deep_diff(a, b, path=""):
@@ -100,7 +191,7 @@ def deep_diff(a, b, path=""):
     if isinstance(a, dict):
         for k in sorted(set(a) | set(b)):
             p = f"{path}.{k}" if path else k
-            if k in IGNORE_PATH_PARTS:
+            if k in IGNORE_KEYS:
                 continue
             if k not in a:
                 diffs.append({"path": p, "a": "<MISSING>", "b": b[k], "kind": "added"})
@@ -123,42 +214,19 @@ def deep_diff(a, b, path=""):
             diffs.append({"path": path or "$", "a": a, "b": b, "kind": "value"})
     return diffs
 
+FOCUS_NEEDLES = (
+    "thumbnail", "image_hash", "image_url", "video_id",
+    "asset_feed_spec", "platform_customizations", "portrait_customizations",
+    "degrees_of_freedom_spec", "destination_spec",
+    "media_sourcing_spec", "creative_sourcing_spec",
+    "format_transformation_spec", "generative_asset_spec",
+    "contextual_multi_ads", "object_story_spec",
+    "tracking_specs", "conversion_specs", "conversion_domain",
+    "issues_info", "failed_delivery_checks", "ad_review_feedback",
+)
+
 def focus(diffs):
-    needles = (
-        "thumbnail", "image_hash", "image_url", "video_id",
-        "asset_feed_spec", "platform_customizations", "portrait_customizations",
-        "degrees_of_freedom_spec", "destination_spec",
-        "media_sourcing_spec", "creative_sourcing_spec",
-        "format_transformation_spec", "generative_asset_spec",
-        "contextual_multi_ads", "object_story_spec",
-        "tracking_specs", "conversion_specs", "conversion_domain",
-    )
-    return [d for d in diffs if any(n in d["path"] for n in needles)]
-
-def short(v, limit=180):
-    s = json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else str(v)
-    return s if len(s) <= limit else s[:limit-1] + "…"
-
-def telegram_pair(title, pair):
-    focused = pair["focused_diffs"]
-    lines = [
-        f"🔬 <b>{esc(title)}</b>",
-        f"All structural diffs: <b>{len(pair['all_diffs'])}</b>",
-        f"Focused creative/tracking diffs: <b>{len(focused)}</b>",
-    ]
-    if focused:
-        lines.append("")
-        for d in focused[:18]:
-            lines.append(
-                f"• <code>{esc(d['path'])}</code>\n"
-                f"  A: {esc(short(d['a']))}\n"
-                f"  B: {esc(short(d['b']))}"
-            )
-        if len(focused) > 18:
-            lines.append(f"…ще {len(focused)-18} — дивись JSON artifact.")
-    else:
-        lines.append("✅ У ключових полях відмінностей не знайдено.")
-    return "\n".join(lines)
+    return [d for d in diffs if any(n in d["path"] for n in FOCUS_NEEDLES)]
 
 def compare(left, right):
     all_diffs = (
@@ -167,6 +235,37 @@ def compare(left, right):
     )
     return {"all_diffs": all_diffs, "focused_diffs": focus(all_diffs)}
 
+def short(v, limit=160):
+    s = json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else str(v)
+    return s if len(s) <= limit else s[:limit-1] + "…"
+
+def pair_text(title, pair):
+    focused = pair["focused_diffs"]
+    lines = [
+        f"🔬 <b>{esc(title)}</b>",
+        f"All diffs: <b>{len(pair['all_diffs'])}</b>",
+        f"Focused diffs: <b>{len(focused)}</b>",
+    ]
+    if focused:
+        for d in focused[:16]:
+            lines.append(
+                f"• <code>{esc(d['path'])}</code>\n"
+                f"  A: {esc(short(d['a']))}\n"
+                f"  B: {esc(short(d['b']))}"
+            )
+        if len(focused) > 16:
+            lines.append(f"…ще {len(focused)-16} у JSON artifact.")
+    else:
+        lines.append("✅ Ключових API-visible відмінностей не знайдено.")
+    return "\n".join(lines)
+
+def unsupported_text(label, obj):
+    ad_u = obj.get("unsupported", {}).get("ad", {})
+    cr_u = obj.get("unsupported", {}).get("creative", {})
+    if not ad_u and not cr_u:
+        return f"{label}: unsupported fields = none"
+    return f"{label}: unsupported ad={list(ad_u)}, creative={list(cr_u)}"
+
 def main():
     if not ACCESS_TOKEN:
         raise SystemExit("FB_SCALER_ACCESS_TOKEN missing")
@@ -174,15 +273,16 @@ def main():
         raise SystemExit("SOURCE_AD_ID and FIXED_AD_ID are required")
 
     report = {
-        "version": "v19",
+        "version": "v20",
         "api": API_VER,
-        "mode": "READ_ONLY_CREATIVE_COMPARE",
+        "mode": "READ_ONLY_TOLERANT_COMPARE",
         "source_ad_id": SOURCE_AD_ID,
         "fixed_ad_id": FIXED_AD_ID,
         "broken_ad_id": BROKEN_AD_ID or None,
         "notes": [
             "READ ONLY: no POST/write calls.",
-            "Goal: identify exact API-visible fields changed by manual thumbnail/save/publish action.",
+            "v20 deliberately avoids adset_id/campaign_id on Ad GET under v26.",
+            "Optional fields are probed tolerantly: unsupported fields are recorded instead of aborting the run.",
         ],
     }
 
@@ -198,22 +298,29 @@ def main():
         Path(REPORT_FILE).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
 
         parts = [
-            "🔎 <b>Creative compare v19 — READ ONLY</b>",
-            f"Source Ad: <code>{esc(SOURCE_AD_ID)}</code>",
-            f"Fixed Ad: <code>{esc(FIXED_AD_ID)}</code>",
+            "🔎 <b>Creative compare v20 — READ ONLY</b>",
+            f"Source: <code>{esc(SOURCE_AD_ID)}</code>",
+            f"Fixed: <code>{esc(FIXED_AD_ID)}</code>",
+            unsupported_text("SOURCE", report["source"]),
+            unsupported_text("FIXED", report["fixed"]),
             "",
-            telegram_pair("SOURCE → FIXED", report["source_vs_fixed"]),
+            pair_text("SOURCE → FIXED", report["source_vs_fixed"]),
         ]
         if report.get("broken_vs_fixed"):
-            parts += ["", telegram_pair("BROKEN → FIXED (найважливіше)", report["broken_vs_fixed"])]
+            parts += [
+                "",
+                unsupported_text("BROKEN", report["broken"]),
+                pair_text("BROKEN → FIXED (найважливіше)", report["broken_vs_fixed"]),
+            ]
         parts += ["", "🧪 Жодних змін у Meta не внесено.", "Повний diff — у JSON artifact."]
         send_telegram("\n".join(parts))
         print(json.dumps(report, ensure_ascii=False, indent=2), flush=True)
         return 0
+
     except Exception as e:
         report["error"] = str(e)
         Path(REPORT_FILE).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-        send_telegram("❌ <b>Creative compare v19 error</b>\n" + esc(e))
+        send_telegram("❌ <b>Creative compare v20 error</b>\n" + esc(e))
         print(f"ERROR: {e}", flush=True)
         return 1
 
