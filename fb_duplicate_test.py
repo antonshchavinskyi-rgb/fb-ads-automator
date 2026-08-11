@@ -20,7 +20,7 @@ API_VER = "v26.0"
 ACCESS_TOKEN = os.environ.get("FB_SCALER_ACCESS_TOKEN")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-REPORT_FILE = "duplicate_test_v22_auto_tracking_report.json"
+REPORT_FILE = "duplicate_test_v23_no_dof_probe_report.json"
 
 # This test intentionally handles ONE ordinary adset per run and creates PAUSED objects only.
 # Catalog adsets are skipped in this phase.
@@ -339,8 +339,9 @@ def get_feature_enroll_statuses(creative):
 def poll_ad_post_processing(ad_id):
     """Check asynchronous Meta post-processing so UI delivery errors are visible in the report."""
     snapshots = []
-    # Two gentle checks; this is a test user, but we still avoid hammering the API.
-    for delay in (10, 20):
+    # Async publishing errors can appear later than the first 30 seconds.
+    # Three sparse checks over ~2.5 minutes are still light on the dedicated scaler user.
+    for delay in (15, 45, 90):
         time.sleep(delay)
         snap = get_node(ad_id, AD_FIELDS, "audit_ad_post_processing")
         snapshots.append(snap)
@@ -373,9 +374,9 @@ def build_clean_creative(source_creative, account_id, suffix):
     payload = {
         "name": f"{clean_copy_suffixes(source_creative.get('name') or 'creative')}{suffix}",
         "contextual_multi_ads": {"enroll_status": "OPT_OUT"},
-        "degrees_of_freedom_spec": {
-            "creative_features_spec": explicit_creative_optouts(mode),
-        },
+        # v23 isolation test: intentionally omit degrees_of_freedom_spec entirely.
+        # We want to know whether explicitly sending Advantage+ creative feature
+        # OPT_OUT values is what causes async publish error #2643026.
     }
     url_tags = source_creative.get("url_tags")
     if url_tags:
@@ -388,7 +389,8 @@ def build_clean_creative(source_creative, account_id, suffix):
         "new_image_hash": None,
         "preview_meta": None,
         "requested_multi_advertiser": "OPT_OUT",
-        "requested_feature_optouts": sorted(explicit_creative_optouts(mode).keys()),
+        "requested_feature_optouts": [],
+        "degrees_of_freedom_sent": False,
         "omitted_source_containers": [
             "asset_feed_spec", "creative_sourcing_spec",
             "format_transformation_spec", "generative_asset_spec", "platform_customizations",
@@ -588,7 +590,7 @@ def create_clean_clone(source_adset_id):
         raise SkipSource("Catalog source detected. Catalogs are intentionally skipped in ordinary-ad phase.")
 
     now = datetime.now(POLAND_TZ)
-    suffix = f" [PYTEST-V22 {now.strftime('%Y%m%d-%H%M%S')}]"
+    suffix = f" [PYTEST-V23 {now.strftime('%Y%m%d-%H%M%S')}]"
     account_id = str(source.get("account_id"))
 
     # 1) Copy only the adset. Child ad/creative are rebuilt from a minimal schema.
@@ -737,15 +739,16 @@ def create_clean_clone(source_adset_id):
         "copied_creative": copied_creative,
         "creative_create_payload": creative_payload,
     }
+    # v23 is a publish-isolation probe. Default Meta enhancement statuses are
+    # recorded, but they do not fail the probe. The only question now is whether
+    # omitting degrees_of_freedom_spec removes async publish error #2643026.
     result["core_ok"] = (
         copied_adset.get("status") == "PAUSED"
         and copied_ad.get("status") == "PAUSED"
         and result["creative_id_changed"]
         and result["pixel_match"]
         and not creative_diffs
-        and not enhancement_opt_ins
         and multi_advertiser_status == "OPT_OUT"
-        and not missing_or_not_optout
         and not ad_issues
         and not failed_delivery_checks
     )
@@ -758,12 +761,13 @@ def create_clean_clone(source_adset_id):
     source_posts = set(tracking_audit.get("source_tracking_post_ids") or [])
     copy_posts = set(tracking_audit.get("copy_tracking_post_ids") or [])
     result["tracking_rebuilt"] = bool(copy_posts) and not bool(source_posts & copy_posts)
-    result["scaler_ready"] = (
+    result["publish_probe_ok"] = (
         result["core_ok"]
-        and result["thumbnail_no_manual_intervention"]
-        and result["tracking_rebuilt"]
-        and bool(tracking_audit.get("copy_conversion_specs"))
+        and not bool(ad_issues)
+        and not bool(failed_delivery_checks)
     )
+    # Diagnostic only; not yet approved for the real scaler.
+    result["scaler_ready"] = False
     return result
 
 
@@ -771,7 +775,7 @@ def format_error(e, source_id):
     if isinstance(e, MetaRequestError):
         info = e.info
         parts = [
-            "❌ <b>Duplicate test v22 error</b>",
+            "❌ <b>Duplicate test v23 error</b>",
             f"Source Adset: <code>{esc(source_id)}</code>",
             f"Stage: <b>{esc(e.stage or 'unknown')}</b>",
         ]
@@ -782,7 +786,7 @@ def format_error(e, source_id):
             parts.append(f"fbtrace_id: {esc(info.get('fbtrace_id'))}")
         return "\n".join(parts)
     return (
-        "❌ <b>Duplicate test v22 error</b>\n"
+        "❌ <b>Duplicate test v23 error</b>\n"
         f"Source Adset: <code>{esc(source_id)}</code>\n"
         f"Partial: {esc(json.dumps(PARTIAL, ensure_ascii=False))}\n"
         f"{esc(str(e))}"
@@ -796,7 +800,7 @@ def summary_message(result):
     feature_statuses = result.get("requested_feature_statuses") or {}
     feature_short = ", ".join(f"{k}={v or 'NOT_RETURNED'}" for k, v in feature_statuses.items())
     lines = [
-        "✅ <b>Duplicate test v22 • AUTO TRACKING / SOURCE VIDEO HASH</b>",
+        "🧪 <b>Duplicate test v23 • NO DOF PUBLISH PROBE</b>",
         f"Account: <code>{esc(result.get('account_id'))}</code>",
         f"Source Adset: <code>{esc(result.get('source_adset_id'))}</code>",
         f"Copy Adset: <code>{esc(result.get('copied_adset_id'))}</code> • {esc((result.get('copied_adset') or {}).get('name'))}",
@@ -804,7 +808,9 @@ def summary_message(result):
         f"Creative: <code>{esc(result.get('source_creative_id'))}</code> → <code>{esc(result.get('copied_creative_id'))}</code> {'✅ NEW' if result.get('creative_id_changed') else '❌ SAME'}",
         f"Pixel: {esc(result.get('pixel_source'))} → {esc(result.get('pixel_copy'))} {'✅' if result.get('pixel_match') else '❌'}",
         f"Multi-advertiser: {esc(result.get('multi_advertiser_status'))} {'✅' if result.get('multi_advertiser_status') == 'OPT_OUT' else '⚠️'}",
-        f"Creative controls: {esc(feature_short or 'none returned')}",
+        "DOF sent on create: ❌ NO",
+        f"Meta returned enhancement statuses: {esc(result.get('enhancement_enroll_statuses') or 'none')}",
+        f"Meta returned OPT_IN count: {len(result.get('enhancement_opt_ins') or [])}",
         f"Media: {esc(media.get('mode'))} • thumbnail: {esc(media.get('preview_strategy'))}",
         f"Thumbnail UI Automatic: {'✅ YES' if result.get('thumbnail_ui_automatic') else 'ℹ️ NO — explicit generated frame'}",
         f"Thumbnail needs manual action: {'❌ YES' if not result.get('thumbnail_no_manual_intervention') else '✅ NO'}",
@@ -815,7 +821,7 @@ def summary_message(result):
         f"Core diffs: adset={len(result.get('adset_diffs', []))}, ad={len(result.get('ad_diffs', []))}, creative={len(result.get('creative_diffs', []))}",
         f"Post-processing issues: {len(issues)} • failed checks: {len(failed_checks)} {'✅' if not issues and not failed_checks else '❌'}",
         f"Core OK: {'✅ YES' if result.get('core_ok') else '⚠️ NO'}",
-        f"Scaler-ready: {'✅ YES' if result.get('scaler_ready') else '⚠️ NO'}",
+        f"Publish probe (NO DOF): {'✅ PASS' if result.get('publish_probe_ok') else '❌ FAIL'}",
     ]
     if issues:
         lines.append("issues_info: " + esc(json.dumps(issues, ensure_ascii=False)[:1200]))
@@ -846,7 +852,7 @@ def main():
     except SkipSource as e:
         report["error"] = {"type": "skip", "message": str(e), "partial": deepcopy(PARTIAL)}
         send_telegram(
-            "⏭ <b>Duplicate test v22 skipped</b>\n"
+            "⏭ <b>Duplicate test v23 skipped</b>\n"
             f"Source Adset: <code>{esc(source_id)}</code>\n{esc(str(e))}"
         )
         exit_code = 1
