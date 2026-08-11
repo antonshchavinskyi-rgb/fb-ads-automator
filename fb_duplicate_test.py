@@ -20,7 +20,7 @@ API_VER = "v26.0"
 ACCESS_TOKEN = os.environ.get("FB_SCALER_ACCESS_TOKEN")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-REPORT_FILE = "duplicate_test_v24_generated_thumbnail_id_report.json"
+REPORT_FILE = "duplicate_test_v25_generated_selected_report.json"
 
 # This test intentionally handles ONE ordinary adset per run and creates PAUSED objects only.
 # Catalog adsets are skipped in this phase.
@@ -351,22 +351,42 @@ def poll_ad_post_processing(ad_id):
 
 
 
+def _url_path_tail(url):
+    if not url:
+        return None
+    try:
+        parsed = urllib.parse.urlparse(str(url))
+        path = parsed.path or ""
+        return path.rsplit("/", 1)[-1] or None
+    except Exception:
+        return None
+
+
 def resolve_generated_thumbnail(source_creative):
     """
-    Important discovery from Ads Manager draft payload:
-    - creative root `video_id` and object_story_spec.video_data.video_id can be DIFFERENT.
-    - The public AdVideo /thumbnails edge belongs to the ROOT creative.video_id.
-    Previous tests queried the inner story video_id and therefore hit subcode=33.
+    v25 is based on the real Ads Manager draft captured after manually selecting
+    a generated thumbnail.
 
-    We read Meta-generated thumbnails from the root AdVideo and choose:
-    1) current preferred thumbnail, else
-    2) the first generated thumbnail returned by Meta.
+    Important facts from that draft:
+    - video_data.image_hash disappears;
+    - video_data.image_url becomes the selected generated thumbnail URL;
+    - video_data.video_thumbnail_id is populated;
+    - video_data.video_thumbnail_source = "generated_selected".
 
-    READ ONLY: this does NOT change preferred_thumbnail_id on the source video.
+    We also learned that the root creative.video_id is the AdVideo node that
+    exposes /thumbnails, while object_story_spec.video_data.video_id is a
+    different story/video reference in this account.
+
+    Selection order:
+    1) thumbnail whose CDN filename matches source creative.thumbnail_url;
+    2) preferred thumbnail;
+    3) first generated thumbnail.
     """
     root_advideo_id = str(source_creative.get("video_id") or "").strip()
     oss = source_creative.get("object_story_spec") or {}
     story_video_id = str((oss.get("video_data") or {}).get("video_id") or "").strip()
+    source_thumb_url = source_creative.get("thumbnail_url")
+    source_thumb_tail = _url_path_tail(source_thumb_url)
 
     if not root_advideo_id:
         raise SkipSource("Source creative has no ROOT creative.video_id for AdVideo thumbnail lookup.")
@@ -384,7 +404,14 @@ def resolve_generated_thumbnail(source_creative):
             f"Root AdVideo {root_advideo_id} returned no generated thumbnails."
         )
 
-    selected = next((x for x in thumbs if x.get("is_preferred")), None) or thumbs[0]
+    matched = None
+    if source_thumb_tail:
+        for item in thumbs:
+            if _url_path_tail(item.get("uri")) == source_thumb_tail:
+                matched = item
+                break
+
+    selected = matched or next((x for x in thumbs if x.get("is_preferred")), None) or thumbs[0]
     thumb_id = str(selected.get("id") or "").strip()
     thumb_url = selected.get("uri")
 
@@ -396,13 +423,18 @@ def resolve_generated_thumbnail(source_creative):
     return {
         "root_advideo_id": root_advideo_id,
         "story_video_id": story_video_id or None,
+        "source_creative_thumbnail_url": source_thumb_url,
+        "source_thumbnail_filename": source_thumb_tail,
         "thumbnail_id": thumb_id,
         "thumbnail_url": thumb_url,
+        "thumbnail_filename": _url_path_tail(thumb_url),
+        "matched_source_thumbnail": bool(matched),
         "thumbnail_is_preferred": bool(selected.get("is_preferred")),
         "thumbnail_width": selected.get("width"),
         "thumbnail_height": selected.get("height"),
         "thumbnail_scale": selected.get("scale"),
         "thumbnail_count": len(thumbs),
+        "thumbnail_source": "generated_selected",
     }
 
 
@@ -478,9 +510,10 @@ def build_clean_creative(source_creative, account_id, suffix):
         thumb = resolve_generated_thumbnail(source_creative)
         minimal_vd["image_url"] = thumb["thumbnail_url"]
         minimal_vd["video_thumbnail_id"] = thumb["thumbnail_id"]
+        minimal_vd["video_thumbnail_source"] = "generated_selected"
 
         audit.update({
-            "preview_strategy": "ROOT_ADVIDEO_GENERATED_THUMBNAIL_ID",
+            "preview_strategy": "ROOT_ADVIDEO_GENERATED_SELECTED",
             "new_image_hash": None,
             "preview_meta": thumb,
             "thumbnail_ui_automatic": False,
@@ -644,7 +677,7 @@ def create_clean_clone(source_adset_id):
         raise SkipSource("Catalog source detected. Catalogs are intentionally skipped in ordinary-ad phase.")
 
     now = datetime.now(POLAND_TZ)
-    suffix = f" [PYTEST-V24 {now.strftime('%Y%m%d-%H%M%S')}]"
+    suffix = f" [PYTEST-V25 {now.strftime('%Y%m%d-%H%M%S')}]"
     account_id = str(source.get("account_id"))
 
     # 1) Copy only the adset. Child ad/creative are rebuilt from a minimal schema.
@@ -830,7 +863,7 @@ def format_error(e, source_id):
     if isinstance(e, MetaRequestError):
         info = e.info
         parts = [
-            "❌ <b>Duplicate test v24 error</b>",
+            "❌ <b>Duplicate test v25 error</b>",
             f"Source Adset: <code>{esc(source_id)}</code>",
             f"Stage: <b>{esc(e.stage or 'unknown')}</b>",
         ]
@@ -841,7 +874,7 @@ def format_error(e, source_id):
             parts.append(f"fbtrace_id: {esc(info.get('fbtrace_id'))}")
         return "\n".join(parts)
     return (
-        "❌ <b>Duplicate test v24 error</b>\n"
+        "❌ <b>Duplicate test v25 error</b>\n"
         f"Source Adset: <code>{esc(source_id)}</code>\n"
         f"Partial: {esc(json.dumps(PARTIAL, ensure_ascii=False))}\n"
         f"{esc(str(e))}"
@@ -855,7 +888,7 @@ def summary_message(result):
     feature_statuses = result.get("requested_feature_statuses") or {}
     feature_short = ", ".join(f"{k}={v or 'NOT_RETURNED'}" for k, v in feature_statuses.items())
     lines = [
-        "🧪 <b>Duplicate test v24 • GENERATED THUMBNAIL ID</b>",
+        "🧪 <b>Duplicate test v25 • GENERATED_SELECTED THUMBNAIL</b>",
         f"Account: <code>{esc(result.get('account_id'))}</code>",
         f"Source Adset: <code>{esc(result.get('source_adset_id'))}</code>",
         f"Copy Adset: <code>{esc(result.get('copied_adset_id'))}</code> • {esc((result.get('copied_adset') or {}).get('name'))}",
@@ -870,6 +903,8 @@ def summary_message(result):
         f"Root AdVideo ID: {esc((media.get('preview_meta') or {}).get('root_advideo_id'))}",
         f"Story video ID: {esc((media.get('preview_meta') or {}).get('story_video_id'))}",
         f"Generated thumbnail ID: {esc((media.get('preview_meta') or {}).get('thumbnail_id'))}",
+        f"Thumbnail source: {esc((media.get('preview_meta') or {}).get('thumbnail_source'))}",
+        f"Matched source thumbnail URL: {'✅ YES' if (media.get('preview_meta') or {}).get('matched_source_thumbnail') else '⚠️ NO'}",
         f"Generated thumbnail preferred: {esc((media.get('preview_meta') or {}).get('thumbnail_is_preferred'))}",
         f"Thumbnail UI Automatic: {'✅ YES' if result.get('thumbnail_ui_automatic') else 'ℹ️ NO — explicit generated frame'}",
         f"Thumbnail needs manual action: {'❌ YES' if not result.get('thumbnail_no_manual_intervention') else '✅ NO'}",
@@ -880,7 +915,7 @@ def summary_message(result):
         f"Core diffs: adset={len(result.get('adset_diffs', []))}, ad={len(result.get('ad_diffs', []))}, creative={len(result.get('creative_diffs', []))}",
         f"Post-processing issues: {len(issues)} • failed checks: {len(failed_checks)} {'✅' if not issues and not failed_checks else '❌'}",
         f"Core OK: {'✅ YES' if result.get('core_ok') else '⚠️ NO'}",
-        f"Publish probe (generated thumbnail ID): {'✅ PASS' if result.get('publish_probe_ok') else '❌ FAIL'}",
+        f"Publish probe (generated_selected): {'✅ PASS' if result.get('publish_probe_ok') else '❌ FAIL'}",
     ]
     if issues:
         lines.append("issues_info: " + esc(json.dumps(issues, ensure_ascii=False)[:1200]))
@@ -911,7 +946,7 @@ def main():
     except SkipSource as e:
         report["error"] = {"type": "skip", "message": str(e), "partial": deepcopy(PARTIAL)}
         send_telegram(
-            "⏭ <b>Duplicate test v24 skipped</b>\n"
+            "⏭ <b>Duplicate test v25 skipped</b>\n"
             f"Source Adset: <code>{esc(source_id)}</code>\n{esc(str(e))}"
         )
         exit_code = 1
