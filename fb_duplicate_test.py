@@ -3,8 +3,6 @@ import sys
 import json
 import time
 import html
-import random
-import mimetypes
 import re
 import urllib.request
 import urllib.parse
@@ -14,150 +12,129 @@ from datetime import datetime
 
 from fb_config import POLAND_TZ
 
-# Isolated duplicate-test uses the current Marketing API without changing production scripts.
 API_VER = "v26.0"
 
 ACCESS_TOKEN = os.environ.get("FB_SCALER_ACCESS_TOKEN")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-REPORT_FILE = "duplicate_test_v25_1_generated_selected_report.json"
+TEST_ADSET_ID = (os.environ.get("TEST_ADSET_ID") or "").strip()
 
-# This test intentionally handles ONE ordinary adset per run and creates PAUSED objects only.
-# Catalog adsets are skipped in this phase.
-
-ADSET_FIELDS = [
-    "id", "name", "account_id", "campaign_id", "status", "effective_status",
-    "bid_strategy", "bid_amount", "bid_constraints", "billing_event",
-    "optimization_goal", "daily_budget", "lifetime_budget", "start_time", "end_time",
-    "attribution_spec", "promoted_object", "destination_type", "pacing_type",
-    "targeting", "is_dynamic_creative", "recurring_budget_semantics",
-]
-
-AD_FIELDS = [
-    "id", "name", "status", "configured_status", "effective_status", "adset_id", "campaign_id",
-    "creative", "tracking_specs", "conversion_specs", "conversion_domain", "source_ad_id",
-    "issues_info", "failed_delivery_checks", "ad_review_feedback", "updated_time",
-]
-
-CREATIVE_FIELDS = [
-    "id", "name", "account_id", "status", "object_story_id", "effective_object_story_id",
-    "object_story_spec", "url_tags", "image_hash", "image_url", "thumbnail_url", "video_id",
-    "contextual_multi_ads", "asset_feed_spec", "degrees_of_freedom_spec", "creative_sourcing_spec",
-    "format_transformation_spec", "generative_asset_spec", "platform_customizations", "destination_spec",
-]
-
-RELEVANT_PERMISSION_NAMES = {
-    "ads_management", "ads_read", "business_management",
-    "pages_show_list", "pages_read_engagement", "pages_manage_ads",
-}
+REPORT_FILE = "duplicate_test_v26_page_video_object_story_report.json"
 
 PARTIAL = {}
 
+ADSET_FIELDS = [
+    "id", "name", "account_id", "campaign_id", "status", "effective_status",
+    "bid_strategy", "bid_amount", "billing_event", "optimization_goal",
+    "daily_budget", "lifetime_budget", "attribution_spec", "promoted_object",
+    "destination_type", "pacing_type", "targeting", "is_dynamic_creative",
+    "recurring_budget_semantics",
+]
 
-def esc(text):
-    return html.escape(str(text), quote=False)
+AD_FIELDS = [
+    "id", "name", "status", "configured_status", "effective_status",
+    "creative", "tracking_specs", "conversion_specs", "conversion_domain",
+    "issues_info", "failed_delivery_checks", "updated_time",
+]
+
+CREATIVE_FIELDS = [
+    "id", "name", "account_id", "status",
+    "object_story_id", "effective_object_story_id",
+    "object_story_spec", "url_tags", "thumbnail_url", "video_id",
+    "contextual_multi_ads",
+]
+
+VIDEO_FIELDS = [
+    "id", "created_time", "updated_time", "length",
+    "picture", "post_id", "published", "source",
+    "status", "permalink_url",
+]
 
 
-def _telegram_chunks(message, max_chars=3500):
-    """
-    Telegram messages have a strict size ceiling.
-    Split only on line boundaries so our small HTML tags are not cut in half.
-    A single overlong diagnostic line is hard-truncated as a last-resort fallback.
-    """
+def esc(value):
+    return html.escape(str(value), quote=False)
+
+
+def telegram_chunks(message, max_chars=3500):
     chunks = []
     current = []
 
-    def flush():
-        nonlocal current
-        if current:
-            chunks.append("\n".join(current))
-            current = []
-
     for line in str(message).splitlines():
-        if len(line) > max_chars:
-            flush()
-            # Long raw diagnostic lines should normally never reach here because
-            # summary_message() is compact, but keep this safety net.
-            while len(line) > max_chars:
-                chunks.append(line[:max_chars])
-                line = line[max_chars:]
-            if line:
-                current = [line]
-            continue
-
         candidate = "\n".join(current + [line])
         if current and len(candidate) > max_chars:
-            flush()
+            chunks.append("\n".join(current))
             current = [line]
         else:
             current.append(line)
 
-    flush()
+    if current:
+        chunks.append("\n".join(current))
+
     return chunks or [""]
 
 
 def send_telegram(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram secrets missing; message skipped.", flush=True)
+        print("Telegram secrets missing; skipped.", flush=True)
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
-    for idx, chunk in enumerate(_telegram_chunks(message), start=1):
-        data = urllib.parse.urlencode({
+    for i, chunk in enumerate(telegram_chunks(message), start=1):
+        payload = urllib.parse.urlencode({
             "chat_id": TELEGRAM_CHAT_ID,
             "text": chunk,
             "parse_mode": "HTML",
             "disable_web_page_preview": "true",
         }).encode("utf-8")
+
         try:
-            urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=15)
+            urllib.request.urlopen(
+                urllib.request.Request(url, data=payload),
+                timeout=20,
+            )
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
-            print(
-                f"Telegram HTTP {e.code} on chunk {idx}: {body[:1200]}",
-                flush=True,
-            )
+            print(f"Telegram HTTP {e.code}, chunk {i}: {body[:1000]}", flush=True)
         except Exception as e:
-            print(f"Telegram error on chunk {idx}: {e}", flush=True)
+            print(f"Telegram error, chunk {i}: {e}", flush=True)
 
 
 def decode_meta_error(body):
     try:
-        parsed = json.loads(body)
-        err = parsed.get("error", {})
+        data = json.loads(body)
+        err = data.get("error", {})
         return {
-            "message": err.get("message", body),
+            "message": err.get("message"),
             "code": err.get("code"),
             "subcode": err.get("error_subcode"),
-            "is_transient": err.get("is_transient", False),
+            "is_transient": bool(err.get("is_transient")),
             "user_title": err.get("error_user_title"),
             "user_msg": err.get("error_user_msg"),
             "fbtrace_id": err.get("fbtrace_id"),
-            "raw": parsed,
+            "raw": data,
         }
     except Exception:
-        return {"message": body, "code": None, "subcode": None, "raw": body}
+        return {"message": body, "raw": body}
 
 
-class MetaRequestError(RuntimeError):
-    def __init__(self, http_status, info, stage=None):
+class MetaError(RuntimeError):
+    def __init__(self, stage, http_status, info):
+        self.stage = stage
         self.http_status = http_status
         self.info = info
-        self.stage = stage
-        text = f"Meta HTTP {http_status}: {info.get('message')} (code={info.get('code')}, subcode={info.get('subcode')})"
+        msg = (
+            f"Meta HTTP {http_status}: {info.get('message')} "
+            f"(code={info.get('code')}, subcode={info.get('subcode')})"
+        )
         if info.get("user_title"):
-            text += f" | {info.get('user_title')}"
+            msg += f" | {info.get('user_title')}"
         if info.get("user_msg"):
-            text += f" | {info.get('user_msg')}"
-        super().__init__(text)
+            msg += f" | {info.get('user_msg')}"
+        super().__init__(msg)
 
 
-class SkipSource(RuntimeError):
-    pass
-
-
-def serialize_param(value):
+def serialize(value):
     if isinstance(value, (dict, list, tuple)):
         return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
     if isinstance(value, bool):
@@ -165,853 +142,743 @@ def serialize_param(value):
     return value
 
 
-def graph_request(method, path, params=None, stage=None, get_retry=False):
+def graph_request(method, path, params=None, token=None, stage="graph"):
     params = dict(params or {})
-    params["access_token"] = ACCESS_TOKEN
-    url = f"https://graph.facebook.com/{API_VER}/{path.lstrip('/')}"
-    attempts = 2 if (method == "GET" and get_retry) else 1
+    params["access_token"] = token or ACCESS_TOKEN
 
-    for attempt in range(attempts):
-        try:
-            encoded = {k: serialize_param(v) for k, v in params.items() if v is not None}
-            if method == "GET":
-                req = urllib.request.Request(url + "?" + urllib.parse.urlencode(encoded), method="GET")
-            else:
-                req = urllib.request.Request(
-                    url,
-                    data=urllib.parse.urlencode(encoded).encode("utf-8"),
-                    method="POST",
-                )
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                body = resp.read().decode("utf-8")
-                return json.loads(body) if body else {}
-        except urllib.error.HTTPError as e:
-            info = decode_meta_error(e.read().decode("utf-8", errors="replace"))
-            # Never retry POST: if response is lost after success, retry could create a duplicate.
-            if method == "GET" and attempt == 0 and (info.get("is_transient") or info.get("code") in {1, 2}):
-                time.sleep(30)
-                continue
-            raise MetaRequestError(e.code, info, stage=stage)
+    url = f"https://graph.facebook.com/{API_VER}/{str(path).lstrip('/')}"
+
+    encoded = {
+        k: serialize(v)
+        for k, v in params.items()
+        if v is not None
+    }
+
+    try:
+        if method == "GET":
+            req = urllib.request.Request(
+                url + "?" + urllib.parse.urlencode(encoded),
+                method="GET",
+            )
+        else:
+            req = urllib.request.Request(
+                url,
+                data=urllib.parse.urlencode(encoded).encode("utf-8"),
+                method="POST",
+            )
+
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            body = resp.read().decode("utf-8")
+            return json.loads(body) if body else {}
+
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        raise MetaError(stage, e.code, decode_meta_error(body))
 
 
-def graph_get_all(path, params=None, stage=None):
+def graph_get_all(path, params=None, token=None, stage="graph_list"):
     params = dict(params or {})
-    params["access_token"] = ACCESS_TOKEN
-    url = f"https://graph.facebook.com/{API_VER}/{path.lstrip('/')}?" + urllib.parse.urlencode(
-        {k: serialize_param(v) for k, v in params.items() if v is not None}
+    params["access_token"] = token or ACCESS_TOKEN
+
+    url = (
+        f"https://graph.facebook.com/{API_VER}/{str(path).lstrip('/')}?"
+        + urllib.parse.urlencode({
+            k: serialize(v)
+            for k, v in params.items()
+            if v is not None
+        })
     )
+
     rows = []
+
     while url:
         try:
-            with urllib.request.urlopen(urllib.request.Request(url), timeout=60) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
-                rows.extend(payload.get("data", []))
-                url = payload.get("paging", {}).get("next")
+            with urllib.request.urlopen(
+                urllib.request.Request(url),
+                timeout=120,
+            ) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
-            info = decode_meta_error(e.read().decode("utf-8", errors="replace"))
-            raise MetaRequestError(e.code, info, stage=stage)
+            body = e.read().decode("utf-8", errors="replace")
+            raise MetaError(stage, e.code, decode_meta_error(body))
+
+        rows.extend(data.get("data", []))
+        url = data.get("paging", {}).get("next")
+
     return rows
 
 
-def get_permissions_diag():
-    identity = graph_request("GET", "me", {"fields": "id,name"}, stage="diag:me")
-    permissions = graph_request("GET", "me/permissions", {}, stage="diag:permissions").get("data", [])
-    granted = sorted([x.get("permission") for x in permissions if x.get("status") == "granted" and x.get("permission")])
-    relevant = {k: ("granted" if k in granted else "not_granted_or_not_returned") for k in sorted(RELEVANT_PERMISSION_NAMES)}
-    return {"identity": identity, "permissions": permissions, "granted": granted, "relevant": relevant}
-
-
-def send_access_diag(diag):
-    identity = diag.get("identity", {})
-    granted = [k for k, v in diag.get("relevant", {}).items() if v == "granted"]
-    missing = [k for k, v in diag.get("relevant", {}).items() if v != "granted"]
-    send_telegram(
-        "🔐 <b>Meta API access diagnostics</b>\n"
-        f"API identity: {esc(identity.get('name'))} • <code>{esc(identity.get('id'))}</code>\n"
-        f"Relevant granted: {esc(', '.join(granted) or 'none')}\n"
-        f"Relevant not granted/not returned: {esc(', '.join(missing) or 'none')}"
+def get_node(node_id, fields, token=None, stage="get_node"):
+    return graph_request(
+        "GET",
+        node_id,
+        {"fields": ",".join(fields)},
+        token=token,
+        stage=stage,
     )
-
-
-def get_node(node_id, fields, stage):
-    return graph_request("GET", str(node_id), {"fields": ",".join(fields)}, stage=stage, get_retry=True)
-
-
-def download_bytes(url, stage):
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            content = resp.read()
-            content_type = resp.headers.get_content_type() or "image/jpeg"
-            return content, content_type
-    except Exception as e:
-        raise RuntimeError(f"{stage}: could not download image: {e}")
-
-
-def multipart_encode(fields, file_field, filename, content, content_type):
-    boundary = "----FBTEST" + str(int(time.time() * 1000))
-    chunks = []
-    for key, value in fields.items():
-        chunks.append(f"--{boundary}\r\n".encode())
-        chunks.append(f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode())
-        chunks.append(str(value).encode("utf-8"))
-        chunks.append(b"\r\n")
-    chunks.append(f"--{boundary}\r\n".encode())
-    chunks.append(
-        f'Content-Disposition: form-data; name="{file_field}"; filename="{filename}"\r\n'.encode()
-    )
-    chunks.append(f"Content-Type: {content_type}\r\n\r\n".encode())
-    chunks.append(content)
-    chunks.append(b"\r\n")
-    chunks.append(f"--{boundary}--\r\n".encode())
-    return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
-
-
-def upload_image_to_ad_account(account_id, image_bytes, content_type, stage):
-    ext = mimetypes.guess_extension(content_type) or ".jpg"
-    filename = f"pytest_thumb_{int(time.time())}{ext}"
-    body, multipart_type = multipart_encode(
-        {"access_token": ACCESS_TOKEN}, "filename", filename, image_bytes, content_type
-    )
-    url = f"https://graph.facebook.com/{API_VER}/act_{account_id}/adimages"
-    req = urllib.request.Request(url, data=body, method="POST", headers={"Content-Type": multipart_type})
-    try:
-        with urllib.request.urlopen(req, timeout=90) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        info = decode_meta_error(e.read().decode("utf-8", errors="replace"))
-        raise MetaRequestError(e.code, info, stage=stage)
-
-    # Typical response: {"images":{"filename.jpg":{"hash":"...", ...}}}
-    images = payload.get("images", {}) if isinstance(payload, dict) else {}
-    for _, info in images.items():
-        if isinstance(info, dict) and info.get("hash"):
-            return str(info["hash"]), payload
-    # fallback recursive hash search
-    def find_hash(obj):
-        if isinstance(obj, dict):
-            if obj.get("hash"):
-                return obj.get("hash")
-            for v in obj.values():
-                h = find_hash(v)
-                if h:
-                    return h
-        elif isinstance(obj, list):
-            for v in obj:
-                h = find_hash(v)
-                if h:
-                    return h
-        return None
-    h = find_hash(payload)
-    if not h:
-        raise RuntimeError(f"{stage}: upload succeeded but no image hash returned: {payload}")
-    return str(h), payload
-
-
-def fresh_image_hash(source_creative, link_data, account_id):
-    # We do not reuse the source image_hash. Download the rendered/source image and upload again.
-    candidate_urls = [
-        link_data.get("picture"),
-        source_creative.get("image_url"),
-        source_creative.get("thumbnail_url"),
-    ]
-    url = next((x for x in candidate_urls if x), None)
-    if not url:
-        raise SkipSource("Image ad has no downloadable picture/image_url/thumbnail_url; cannot create fresh image asset safely.")
-    image_bytes, content_type = download_bytes(url, "image_download")
-    new_hash, upload_raw = upload_image_to_ad_account(account_id, image_bytes, content_type, "image_upload")
-    return new_hash, {"source_url": url, "upload": upload_raw}
-
-
-def clean_dict(d):
-    return {k: deepcopy(v) for k, v in d.items() if v not in (None, "", {}, [])}
 
 
 def clean_copy_suffixes(name):
-    """Remove Facebook's trailing Copy/Копия/Копія suffixes without touching the creative key."""
-    value = (name or "").strip()
-    # Facebook can stack suffixes: "— Копия — Копия", "- Copy", etc.
-    pattern = re.compile(r"\s*(?:—|–|-)\s*(?:копия|копія|copy)(?:\s*\d+)?\s*$", re.IGNORECASE)
-    while True:
-        cleaned = pattern.sub("", value).rstrip()
-        if cleaned == value:
-            break
-        value = cleaned
-    return re.sub(r"\s{2,}", " ", value).strip()
+    text = str(name or "").strip()
+    patterns = [
+        r"\s*[-—–]\s*(копия|копія|copy)\s*$",
+        r"\s*\((копия|копія|copy)\)\s*$",
+    ]
+
+    previous = None
+    while text and text != previous:
+        previous = text
+        for pattern in patterns:
+            text = re.sub(pattern, "", text, flags=re.IGNORECASE).strip()
+
+    return text
 
 
-def explicit_creative_optouts(mode):
-    """Explicitly disable documented Advantage+ creative features for API v26.0.
+def api_identity():
+    me = graph_request("GET", "me", {"fields": "id,name"}, stage="diag_me")
+    perms = graph_request("GET", "me/permissions", {}, stage="diag_permissions").get("data", [])
+    granted = sorted(
+        x.get("permission")
+        for x in perms
+        if x.get("status") == "granted" and x.get("permission")
+    )
+    return {"identity": me, "permissions": perms, "granted": granted}
 
-    Important:
-    - Do NOT send legacy standard_enhancements; Meta has rejected it in our account.
-    - Use the current documented field name video_filtering (not video_filter).
-    - Multi-advertiser ads are controlled separately via contextual_multi_ads.
-    - We intentionally keep the list to fields documented by Meta; unknown fields are NOT assumed to be ignored.
+
+def send_identity(diag):
+    send_telegram(
+        "🔐 <b>Meta API access diagnostics</b>\n"
+        f"API identity: {esc(diag['identity'].get('name'))} • "
+        f"<code>{esc(diag['identity'].get('id'))}</code>\n"
+        f"Granted: {esc(', '.join(diag.get('granted') or []))}"
+    )
+
+
+def resolve_page_token(page_id):
     """
-    opt_out = {"enroll_status": "OPT_OUT"}
-    common = {
-        "site_extensions": deepcopy(opt_out),
-        "text_optimizations": deepcopy(opt_out),
-        "enhance_cta": deepcopy(opt_out),
-        "description_automation": deepcopy(opt_out),
-    }
-    if mode == "VIDEO":
-        common.update({
-            "video_auto_crop": deepcopy(opt_out),
-            "video_filtering": deepcopy(opt_out),
-            "video_uncrop": deepcopy(opt_out),
-        })
-    elif mode == "IMAGE":
-        common.update({
-            "image_templates": deepcopy(opt_out),
-            "image_touchups": deepcopy(opt_out),
-            "image_background_gen": deepcopy(opt_out),
-            "image_uncrop": deepcopy(opt_out),
-            "image_animation": deepcopy(opt_out),
-        })
-    return common
-
-
-def get_feature_enroll_statuses(creative):
-    dof = creative.get("degrees_of_freedom_spec") or {}
-    features = dof.get("creative_features_spec") or {}
-    statuses = {}
-    for key, value in features.items():
-        if isinstance(value, dict) and value.get("enroll_status") is not None:
-            statuses[key] = str(value.get("enroll_status")).upper()
-    return statuses
-
-
-def poll_ad_post_processing(ad_id):
-    """Check asynchronous Meta post-processing so UI delivery errors are visible in the report."""
-    snapshots = []
-    # Async publishing errors can appear later than the first 30 seconds.
-    # Three sparse checks over ~2.5 minutes are still light on the dedicated scaler user.
-    for delay in (15, 45, 90):
-        time.sleep(delay)
-        snap = get_node(ad_id, AD_FIELDS, "audit_ad_post_processing")
-        snapshots.append(snap)
-        if snap.get("issues_info") or snap.get("failed_delivery_checks"):
-            break
-    return snapshots[-1] if snapshots else {}, snapshots
-
-
-
-def _url_path_tail(url):
-    if not url:
-        return None
+    Try to resolve a Page access token using the current scaler token.
+    If Meta does not return one, fall back to the scaler token and let the
+    Page-video endpoint tell us whether that token is sufficient.
+    """
     try:
-        parsed = urllib.parse.urlparse(str(url))
-        path = parsed.path or ""
-        return path.rsplit("/", 1)[-1] or None
-    except Exception:
-        return None
+        page = graph_request(
+            "GET",
+            page_id,
+            {"fields": "id,name,access_token,tasks"},
+            stage="page_token_direct",
+        )
+        if page.get("access_token"):
+            return {
+                "token": page["access_token"],
+                "source": "Page.access_token",
+                "tasks": page.get("tasks"),
+            }
+    except MetaError:
+        pass
+
+    try:
+        pages = graph_get_all(
+            "me/accounts",
+            {"fields": "id,name,access_token,tasks", "limit": 100},
+            stage="page_token_me_accounts",
+        )
+        for page in pages:
+            if str(page.get("id")) == str(page_id) and page.get("access_token"):
+                return {
+                    "token": page["access_token"],
+                    "source": "me/accounts",
+                    "tasks": page.get("tasks"),
+                }
+    except MetaError:
+        pass
+
+    return {
+        "token": ACCESS_TOKEN,
+        "source": "FB_SCALER_ACCESS_TOKEN fallback",
+        "tasks": None,
+    }
 
 
-def resolve_generated_thumbnail(source_creative):
+def get_source_objects(adset_id):
+    adset = get_node(adset_id, ADSET_FIELDS, stage="source_adset")
+
+    ads = graph_get_all(
+        f"{adset_id}/ads",
+        {"fields": ",".join(AD_FIELDS), "limit": 10},
+        stage="source_ads",
+    )
+
+    if len(ads) != 1:
+        raise RuntimeError(f"Expected exactly 1 ad in source adset; got {len(ads)}")
+
+    ad = ads[0]
+    creative_id = str((ad.get("creative") or {}).get("id") or "")
+    if not creative_id:
+        raise RuntimeError("Source ad has no creative id")
+
+    creative = get_node(
+        creative_id,
+        CREATIVE_FIELDS,
+        stage="source_creative",
+    )
+
+    oss = creative.get("object_story_spec") or {}
+    vd = oss.get("video_data") or {}
+
+    if not vd:
+        raise RuntimeError("v26 test supports ordinary VIDEO ad only")
+
+    page_id = str(oss.get("page_id") or "")
+    story_video_id = str(vd.get("video_id") or "")
+    root_video_id = str(creative.get("video_id") or "")
+
+    if not page_id:
+        raise RuntimeError("Source creative has no page_id")
+    if not story_video_id and not root_video_id:
+        raise RuntimeError("Source creative has no video id")
+
+    return {
+        "adset": adset,
+        "ad": ad,
+        "creative": creative,
+        "page_id": page_id,
+        "story_video_id": story_video_id or None,
+        "root_video_id": root_video_id or None,
+        "video_data": vd,
+    }
+
+
+def read_source_video_with_url(source):
     """
-    v25 is based on the real Ads Manager draft captured after manually selecting
-    a generated thumbnail.
-
-    Important facts from that draft:
-    - video_data.image_hash disappears;
-    - video_data.image_url becomes the selected generated thumbnail URL;
-    - video_data.video_thumbnail_id is populated;
-    - video_data.video_thumbnail_source = "generated_selected".
-
-    We also learned that the root creative.video_id is the AdVideo node that
-    exposes /thumbnails, while object_story_spec.video_data.video_id is a
-    different story/video reference in this account.
-
-    Selection order:
-    1) thumbnail whose CDN filename matches source creative.thumbnail_url;
-    2) preferred thumbnail;
-    3) first generated thumbnail.
+    Prefer root creative.video_id, then story video_id.
+    We need a real source URL so the Page Videos endpoint can create a NEW video.
     """
-    root_advideo_id = str(source_creative.get("video_id") or "").strip()
-    oss = source_creative.get("object_story_spec") or {}
-    story_video_id = str((oss.get("video_data") or {}).get("video_id") or "").strip()
-    source_thumb_url = source_creative.get("thumbnail_url")
-    source_thumb_tail = _url_path_tail(source_thumb_url)
+    attempts = []
 
-    if not root_advideo_id:
-        raise SkipSource("Source creative has no ROOT creative.video_id for AdVideo thumbnail lookup.")
+    for label, video_id in (
+        ("root_creative_video_id", source.get("root_video_id")),
+        ("story_video_id", source.get("story_video_id")),
+    ):
+        if not video_id:
+            continue
 
-    thumbs = graph_get_all(
-        f"{root_advideo_id}/thumbnails",
+        try:
+            node = get_node(
+                video_id,
+                VIDEO_FIELDS,
+                stage=f"read_source_video:{label}",
+            )
+            attempts.append({"label": label, "video_id": video_id, "node": node})
+
+            if node.get("source"):
+                return {
+                    "label": label,
+                    "video_id": video_id,
+                    "node": node,
+                    "source_url": node["source"],
+                    "attempts": attempts,
+                }
+        except MetaError as e:
+            attempts.append({
+                "label": label,
+                "video_id": video_id,
+                "error": str(e),
+            })
+
+    raise RuntimeError(
+        "Could not read video source URL from root or story video. "
+        + json.dumps(attempts, ensure_ascii=False)[:1800]
+    )
+
+
+def create_new_page_video(source, source_video, page_access):
+    vd = source["video_data"]
+
+    payload = {
+        "file_url": source_video["source_url"],
+        "published": False,
+        "unpublished_content_type": "ADS_POST",
+    }
+
+    # Keep only text fields here. CTA is intentionally NOT sent in the first
+    # diagnostic run, to isolate Page-video + thumbnail + object_story_id.
+    if vd.get("message"):
+        payload["description"] = vd.get("message")
+
+    if vd.get("title"):
+        payload["title"] = vd.get("title")
+
+    response = graph_request(
+        "POST",
+        f"{source['page_id']}/videos",
+        payload,
+        token=page_access["token"],
+        stage="create_unpublished_page_video",
+    )
+
+    new_video_id = str(response.get("id") or "")
+    if not new_video_id:
+        raise RuntimeError(f"Page video create returned no id: {response}")
+
+    PARTIAL["new_page_video_id"] = new_video_id
+    PARTIAL["page_video_create_response"] = response
+
+    return new_video_id, payload, response
+
+
+def wait_for_video_and_thumbnails(video_id, page_token):
+    snapshots = []
+
+    for delay in (10, 15, 30, 45, 60, 60):
+        time.sleep(delay)
+
+        node = get_node(
+            video_id,
+            VIDEO_FIELDS,
+            token=page_token,
+            stage="poll_new_page_video",
+        )
+
+        try:
+            thumbs = graph_get_all(
+                f"{video_id}/thumbnails",
+                {
+                    "fields": "id,uri,is_preferred,width,height,scale",
+                    "limit": 50,
+                },
+                token=page_token,
+                stage="poll_new_page_video_thumbnails",
+            )
+        except MetaError as e:
+            thumbs = [{"_error": str(e)}]
+
+        snapshots.append({"video": node, "thumbnails": thumbs})
+
+        real_thumbs = [
+            x for x in thumbs
+            if isinstance(x, dict) and x.get("id") and x.get("uri")
+        ]
+
+        if real_thumbs:
+            return node, real_thumbs, snapshots
+
+    raise RuntimeError("Timed out waiting for NEW Page video thumbnails")
+
+
+def choose_thumbnail(thumbs):
+    preferred = next((x for x in thumbs if x.get("is_preferred")), None)
+    selected = preferred or thumbs[0]
+
+    return {
+        "id": str(selected.get("id")),
+        "uri": selected.get("uri"),
+        "is_preferred_before": bool(selected.get("is_preferred")),
+        "width": selected.get("width"),
+        "height": selected.get("height"),
+        "selection_reason": "existing_preferred" if preferred else "first_generated",
+    }
+
+
+def set_preferred_thumbnail(video_id, thumb, page_token):
+    response = graph_request(
+        "POST",
+        video_id,
+        {"preferred_thumbnail_id": thumb["id"]},
+        token=page_token,
+        stage="set_preferred_thumbnail",
+    )
+
+    time.sleep(5)
+
+    thumbs_after = graph_get_all(
+        f"{video_id}/thumbnails",
         {
             "fields": "id,uri,is_preferred,width,height,scale",
             "limit": 50,
         },
-        stage="root_advideo_thumbnails_read",
+        token=page_token,
+        stage="verify_preferred_thumbnail",
     )
-    if not thumbs:
-        raise SkipSource(
-            f"Root AdVideo {root_advideo_id} returned no generated thumbnails."
-        )
 
-    matched = None
-    if source_thumb_tail:
-        for item in thumbs:
-            if _url_path_tail(item.get("uri")) == source_thumb_tail:
-                matched = item
-                break
-
-    selected = matched or next((x for x in thumbs if x.get("is_preferred")), None) or thumbs[0]
-    thumb_id = str(selected.get("id") or "").strip()
-    thumb_url = selected.get("uri")
-
-    if not thumb_id or not thumb_url:
-        raise SkipSource(
-            f"Generated thumbnail from root AdVideo {root_advideo_id} lacks id/uri: {selected}"
-        )
+    selected_after = next(
+        (x for x in thumbs_after if str(x.get("id")) == str(thumb["id"])),
+        None,
+    )
 
     return {
-        "root_advideo_id": root_advideo_id,
-        "story_video_id": story_video_id or None,
-        "source_creative_thumbnail_url": source_thumb_url,
-        "source_thumbnail_filename": source_thumb_tail,
-        "thumbnail_id": thumb_id,
-        "thumbnail_url": thumb_url,
-        "thumbnail_filename": _url_path_tail(thumb_url),
-        "matched_source_thumbnail": bool(matched),
-        "thumbnail_is_preferred": bool(selected.get("is_preferred")),
-        "thumbnail_width": selected.get("width"),
-        "thumbnail_height": selected.get("height"),
-        "thumbnail_scale": selected.get("scale"),
-        "thumbnail_count": len(thumbs),
-        "thumbnail_source": "generated_selected",
+        "post_response": response,
+        "selected_after": selected_after,
+        "preferred_after": bool(selected_after and selected_after.get("is_preferred")),
+        "all_after": thumbs_after,
     }
 
 
-def build_clean_creative(source_creative, account_id, suffix):
-    """Build a NEW ordinary creative from essential business fields only.
+def wait_for_post_id(video_id, page_token):
+    snapshots = []
 
-    Controls applied explicitly:
-    - multi-advertiser ads: OPT_OUT via contextual_multi_ads;
-    - Creative Setup / Advantage+ controls: explicit OPT_OUT for the relevant v25 features;
-    - legacy enhancement containers from the source are NOT copied;
-    - for video, read generated thumbnails from the ROOT creative.video_id AdVideo node and
-      create the new creative with image_url + video_thumbnail_id.
-    """
-    oss = deepcopy(source_creative.get("object_story_spec") or {})
-    page_id = oss.get("page_id")
-    if not page_id:
-        raise SkipSource("Source creative has no page_id in object_story_spec.")
+    for delay in (0, 5, 10, 20, 30):
+        if delay:
+            time.sleep(delay)
 
-    mode = "VIDEO" if oss.get("video_data") else "IMAGE" if oss.get("link_data") else None
-    if not mode:
-        raise SkipSource("Only ordinary single video_data or link_data creatives are supported in v22.")
+        node = get_node(
+            video_id,
+            VIDEO_FIELDS,
+            token=page_token,
+            stage="wait_for_post_id",
+        )
 
-    payload = {
-        "name": f"{clean_copy_suffixes(source_creative.get('name') or 'creative')}{suffix}",
-        "contextual_multi_ads": {"enroll_status": "OPT_OUT"},
-        # v23 isolation test: intentionally omit degrees_of_freedom_spec entirely.
-        # We want to know whether explicitly sending Advantage+ creative feature
-        # OPT_OUT values is what causes async publish error #2643026.
-    }
-    url_tags = source_creative.get("url_tags")
-    if url_tags:
-        payload["url_tags"] = url_tags
+        snapshots.append(node)
 
-    audit = {
-        "mode": mode,
-        "preview_strategy": None,
-        "source_image_hash": source_creative.get("image_hash"),
-        "new_image_hash": None,
-        "preview_meta": None,
-        "requested_multi_advertiser": "OPT_OUT",
-        "requested_feature_optouts": [],
-        "degrees_of_freedom_sent": False,
-        "omitted_source_containers": [
-            "asset_feed_spec", "creative_sourcing_spec",
-            "format_transformation_spec", "generative_asset_spec", "platform_customizations",
-        ],
-    }
+        if node.get("post_id"):
+            return node, snapshots
 
-    if mode == "VIDEO":
-        vd = oss.get("video_data") or {}
-        video_id = vd.get("video_id") or source_creative.get("video_id")
-        if not video_id:
-            raise SkipSource("Video creative has no video_id.")
-
-        minimal_vd = clean_dict({
-            "video_id": str(video_id),
-            "message": vd.get("message"),
-            "title": vd.get("title"),
-            "link_description": vd.get("link_description"),
-            "call_to_action": vd.get("call_to_action"),
-        })
-        # v24: reproduce the IMPORTANT part of Ads Manager's draft after a human
-        # selects one of Meta's generated video thumbnails.
-        #
-        # The captured UI draft changed:
-        #   image_hash -> REMOVED
-        #   image_url -> generated thumbnail URL
-        #   video_thumbnail_id -> generated thumbnail object ID
-        #
-        # Public Meta docs contain video_thumbnail_id in video creative examples.
-        # We intentionally do NOT send the internal/draft-only-looking
-        # `video_thumbnail_source` field in this first public-API probe.
-        thumb = resolve_generated_thumbnail(source_creative)
-        minimal_vd["image_url"] = thumb["thumbnail_url"]
-        minimal_vd["video_thumbnail_id"] = thumb["thumbnail_id"]
-        minimal_vd["video_thumbnail_source"] = "generated_selected"
-
-        audit.update({
-            "preview_strategy": "ROOT_ADVIDEO_GENERATED_SELECTED",
-            "new_image_hash": None,
-            "preview_meta": thumb,
-            "thumbnail_ui_automatic": False,
-            "thumbnail_no_manual_intervention": True,
-        })
-
-        payload["object_story_spec"] = {"page_id": str(page_id), "video_data": minimal_vd}
-        return payload, audit
-
-    ld = oss.get("link_data") or {}
-    new_hash, image_meta = fresh_image_hash(source_creative, ld, str(account_id))
-    minimal_ld = clean_dict({
-        "link": ld.get("link"),
-        "message": ld.get("message"),
-        "name": ld.get("name"),
-        "description": ld.get("description"),
-        "call_to_action": ld.get("call_to_action"),
-        "image_hash": new_hash,
-    })
-    if not minimal_ld.get("link"):
-        raise SkipSource("Image/link creative has no destination link.")
-    payload["object_story_spec"] = {"page_id": str(page_id), "link_data": minimal_ld}
-    audit.update({
-        "preview_strategy": "FRESH_IMAGE_REUPLOAD",
-        "new_image_hash": new_hash,
-        "preview_meta": image_meta,
-        "thumbnail_ui_automatic": True,
-        "thumbnail_no_manual_intervention": True,
-    })
-    return payload, audit
+    raise RuntimeError("NEW Page video never returned post_id")
 
 
-def find_nested(obj, key):
-    if isinstance(obj, dict):
-        if key in obj:
-            return obj.get(key)
-        for v in obj.values():
-            found = find_nested(v, key)
-            if found is not None:
-                return found
-    if isinstance(obj, list):
-        for v in obj:
-            found = find_nested(v, key)
-            if found is not None:
-                return found
-    return None
+def normalize_object_story_id(page_id, post_id):
+    value = str(post_id)
+    return value if "_" in value else f"{page_id}_{value}"
 
 
-def extract_minimal_semantics(creative):
-    oss = creative.get("object_story_spec") or {}
-    if oss.get("video_data"):
-        vd = oss.get("video_data") or {}
-        cta = vd.get("call_to_action") or {}
-        return {
-            "mode": "VIDEO",
-            "page_id": oss.get("page_id"),
-            "video_id": vd.get("video_id"),
-            "message": vd.get("message"),
-            "headline": vd.get("title"),
-            "description": vd.get("link_description"),
-            "cta": cta,
-            "url": find_nested(cta, "link"),
-            "url_tags": creative.get("url_tags"),
-            "image_hash": vd.get("image_hash") or creative.get("image_hash"),
-        }
-    if oss.get("link_data"):
-        ld = oss.get("link_data") or {}
-        return {
-            "mode": "IMAGE",
-            "page_id": oss.get("page_id"),
-            "message": ld.get("message"),
-            "headline": ld.get("name"),
-            "description": ld.get("description"),
-            "cta": ld.get("call_to_action"),
-            "url": ld.get("link"),
-            "url_tags": creative.get("url_tags"),
-            "image_hash": ld.get("image_hash") or creative.get("image_hash"),
-        }
-    return {"mode": "UNKNOWN"}
-
-
-def normalize_for_compare(value):
-    if isinstance(value, dict):
-        return {k: normalize_for_compare(v) for k, v in sorted(value.items())}
-    if isinstance(value, list):
-        return [normalize_for_compare(v) for v in value]
-    return value
-
-
-def diff_fields(src, dst, fields):
-    diffs = []
-    for f in fields:
-        a, b = src.get(f), dst.get(f)
-        if normalize_for_compare(a) != normalize_for_compare(b):
-            diffs.append({"field": f, "source": a, "copy": b})
-    return diffs
-
-
-def build_new_ad_payload(source_ad, copied_adset_id, new_creative_id, suffix):
-    """
-    v22 key change:
-    - DO NOT send source tracking_specs. They can contain source Page-post IDs and
-      become stale after a NEW creative generates a NEW unpublished Page post.
-    - DO NOT send conversion_specs. In the current Meta SDK this is readable on Ad,
-      but is not a documented create_ad parameter; let Meta derive it.
-    - conversion_domain is still copied when present because create_ad supports it.
-    """
-    payload = {
-        "name": f"{clean_copy_suffixes(source_ad.get('name') or 'ad')}{suffix}",
-        "adset_id": str(copied_adset_id),
-        "creative": {"creative_id": str(new_creative_id)},
-        "status": "PAUSED",
-    }
-    if source_ad.get("conversion_domain") not in (None, "", {}, []):
-        payload["conversion_domain"] = deepcopy(source_ad.get("conversion_domain"))
-    return payload
-
-
-
-def extract_tracking_post_ids(tracking_specs):
-    ids = []
-    def walk(v):
-        if isinstance(v, dict):
-            for k, x in v.items():
-                if k == "post":
-                    if isinstance(x, list):
-                        for item in x:
-                            if isinstance(item, (str, int)):
-                                ids.append(str(item))
-                    elif isinstance(x, (str, int)):
-                        ids.append(str(x))
-                walk(x)
-        elif isinstance(v, list):
-            for x in v:
-                walk(x)
-    walk(tracking_specs or [])
-    return sorted(set(ids))
-
-
-def is_catalog(source_adset, source_creative):
-    promoted = source_adset.get("promoted_object") or {}
-    if find_nested(promoted, "product_set_id"):
-        return True
-    if find_nested(source_creative, "product_set_id"):
-        return True
-    return False
-
-
-def create_clean_clone(source_adset_id):
-    source = get_node(source_adset_id, ADSET_FIELDS, "source_adset_read")
-    ads = graph_get_all(source_adset_id + "/ads", {"fields": ",".join(AD_FIELDS), "limit": 5}, "source_ads_read")
-    if len(ads) != 1:
-        raise SkipSource(f"Expected exactly 1 source ad, got {len(ads)}.")
-    source_ad = ads[0]
-    creative_id = str((source_ad.get("creative") or {}).get("id") or "")
-    if not creative_id:
-        raise SkipSource("Source ad has no creative ID.")
-    source_creative = get_node(creative_id, CREATIVE_FIELDS, "source_creative_read")
-
-    if is_catalog(source, source_creative):
-        raise SkipSource("Catalog source detected. Catalogs are intentionally skipped in ordinary-ad phase.")
-
-    now = datetime.now(POLAND_TZ)
-    suffix = f" [PYTEST-V25 {now.strftime('%Y%m%d-%H%M%S')}]"
-    account_id = str(source.get("account_id"))
-
-    # 1) Copy only the adset. Child ad/creative are rebuilt from a minimal schema.
-    copy_resp = graph_request(
-        "POST", f"{source_adset_id}/copies",
+def copy_adset(source_adset, suffix):
+    response = graph_request(
+        "POST",
+        f"{source_adset['id']}/copies",
         {"deep_copy": False, "status_option": "PAUSED"},
-        stage="adset_copy_only",
+        stage="copy_adset",
     )
-    copied_adset_id = str(copy_resp.get("copied_adset_id") or copy_resp.get("id") or "")
-    if not copied_adset_id:
-        raise RuntimeError(f"No copied_adset_id returned: {copy_resp}")
-    PARTIAL["copied_adset_id"] = copied_adset_id
+
+    copied_id = str(
+        response.get("copied_adset_id")
+        or response.get("id")
+        or ""
+    )
+
+    if not copied_id:
+        raise RuntimeError(f"No copied adset id: {response}")
+
+    PARTIAL["copied_adset_id"] = copied_id
+
     graph_request(
-        "POST", copied_adset_id,
-        {"name": f"{clean_copy_suffixes(source.get('name') or source_adset_id)}{suffix}", "status": "PAUSED"},
+        "POST",
+        copied_id,
+        {
+            "name": f"{clean_copy_suffixes(source_adset.get('name'))}{suffix}",
+            "status": "PAUSED",
+        },
         stage="rename_copied_adset",
     )
 
-    # 2) Create NEW creative from business-essential fields only.
-    # For video, resolve the source AdVideo through the ad account /advideos (or /video_ads) edge
-    # and use Meta's own `picture` URL as video_data.image_url. We do not call the
-    # standalone /{video_id}/thumbnails edge because this ad-video ID may not support it.
-    creative_payload, media_audit = build_clean_creative(source_creative, account_id, suffix)
-    new_creative = graph_request(
-        "POST", f"act_{account_id}/adcreatives", creative_payload,
-        stage="create_clean_creative_v26_account_video_picture"
+    return copied_id
+
+
+def create_creative_from_object_story(source, object_story_id, suffix):
+    account_id = str(source["adset"]["account_id"])
+
+    payload = {
+        "name": f"{source['creative'].get('name') or 'creative'}{suffix}",
+        "object_story_id": object_story_id,
+        "contextual_multi_ads": {"enroll_status": "OPT_OUT"},
+    }
+
+    if source["creative"].get("url_tags"):
+        payload["url_tags"] = source["creative"]["url_tags"]
+
+    response = graph_request(
+        "POST",
+        f"act_{account_id}/adcreatives",
+        payload,
+        stage="create_creative_via_object_story_id",
     )
-    new_creative_id = str(new_creative.get("id") or "")
-    if not new_creative_id:
-        raise RuntimeError(f"Creative create returned no id: {new_creative}")
-    PARTIAL["new_creative_id"] = new_creative_id
 
-    # 3) Create NEW ad pointing to the NEW creative.
-    ad_payload = build_new_ad_payload(source_ad, copied_adset_id, new_creative_id, suffix)
-    new_ad = graph_request("POST", f"act_{account_id}/ads", ad_payload, stage="create_new_ad")
-    new_ad_id = str(new_ad.get("id") or "")
-    if not new_ad_id:
-        raise RuntimeError(f"Ad create returned no id: {new_ad}")
-    PARTIAL["new_ad_id"] = new_ad_id
+    creative_id = str(response.get("id") or "")
+    if not creative_id:
+        raise RuntimeError(f"Creative create returned no id: {response}")
 
-    copied_adset = get_node(copied_adset_id, ADSET_FIELDS, "audit_adset")
-    copied_creative = get_node(new_creative_id, CREATIVE_FIELDS, "audit_creative")
-    copied_ad, postprocess_snapshots = poll_ad_post_processing(new_ad_id)
+    PARTIAL["new_creative_id"] = creative_id
 
-    source_sem = extract_minimal_semantics(source_creative)
-    copy_sem = extract_minimal_semantics(copied_creative)
-    # Thumbnail hash is expected to differ; compare all other creative semantics.
-    creative_fields_to_compare = ["mode", "page_id", "video_id", "message", "headline", "description", "cta", "url", "url_tags"]
-    creative_diffs = diff_fields(source_sem, copy_sem, creative_fields_to_compare)
+    return creative_id, payload
 
-    adset_fields = [
-        "bid_strategy", "bid_amount", "bid_constraints", "billing_event", "optimization_goal",
-        "daily_budget", "lifetime_budget", "attribution_spec", "promoted_object", "destination_type",
-        "pacing_type", "targeting", "is_dynamic_creative", "recurring_budget_semantics",
-    ]
-    ad_fields = ["tracking_specs", "conversion_specs", "conversion_domain"]
-    adset_diffs = diff_fields(source, copied_adset, adset_fields)
-    ad_diffs = diff_fields(source_ad, copied_ad, ad_fields)
 
-    enhancement_fields = {
-        k: copied_creative.get(k)
-        for k in [
-            "asset_feed_spec", "degrees_of_freedom_spec", "creative_sourcing_spec",
-            "format_transformation_spec", "generative_asset_spec", "platform_customizations",
-        ]
-        if copied_creative.get(k) not in (None, {}, [])
+def create_ad(source, copied_adset_id, creative_id, suffix):
+    account_id = str(source["adset"]["account_id"])
+
+    payload = {
+        "name": f"{source['ad'].get('name') or 'ad'}{suffix}",
+        "adset_id": copied_adset_id,
+        "creative": {"creative_id": creative_id},
+        "status": "PAUSED",
     }
 
-    def collect_enroll_statuses(obj, path=""):
-        rows = []
-        if isinstance(obj, dict):
-            if "enroll_status" in obj:
-                rows.append({"path": path or "$", "enroll_status": obj.get("enroll_status")})
-            for k, v in obj.items():
-                child = f"{path}.{k}" if path else str(k)
-                rows.extend(collect_enroll_statuses(v, child))
-        elif isinstance(obj, list):
-            for i, v in enumerate(obj):
-                rows.extend(collect_enroll_statuses(v, f"{path}[{i}]"))
-        return rows
+    if source["ad"].get("conversion_domain"):
+        payload["conversion_domain"] = deepcopy(source["ad"]["conversion_domain"])
 
-    enhancement_statuses = collect_enroll_statuses(enhancement_fields)
-    enhancement_opt_ins = [
-        x for x in enhancement_statuses
-        if str(x.get("enroll_status") or "").upper() == "OPT_IN"
-    ]
+    response = graph_request(
+        "POST",
+        f"act_{account_id}/ads",
+        payload,
+        stage="create_new_ad",
+    )
 
-    requested_feature_keys = set((media_audit.get("requested_feature_optouts") or []))
-    returned_feature_statuses = get_feature_enroll_statuses(copied_creative)
-    requested_feature_statuses = {k: returned_feature_statuses.get(k) for k in sorted(requested_feature_keys)}
-    missing_or_not_optout = {
-        k: v for k, v in requested_feature_statuses.items()
-        if v != "OPT_OUT"
-    }
-    contextual_multi = copied_creative.get("contextual_multi_ads") or {}
-    multi_advertiser_status = str(contextual_multi.get("enroll_status") or "").upper() or None
-    ad_issues = copied_ad.get("issues_info") or []
-    failed_delivery_checks = copied_ad.get("failed_delivery_checks") or []
+    ad_id = str(response.get("id") or "")
+    if not ad_id:
+        raise RuntimeError(f"Ad create returned no id: {response}")
 
-    source_pixel = find_nested(source.get("promoted_object") or {}, "pixel_id")
-    copied_pixel = find_nested(copied_adset.get("promoted_object") or {}, "pixel_id")
+    PARTIAL["new_ad_id"] = ad_id
+
+    return ad_id, payload
+
+
+def poll_ad(ad_id):
+    snapshots = []
+
+    for delay in (15, 45, 90):
+        time.sleep(delay)
+
+        node = get_node(
+            ad_id,
+            AD_FIELDS,
+            stage="poll_new_ad",
+        )
+
+        snapshots.append(node)
+
+        if node.get("issues_info") or node.get("failed_delivery_checks"):
+            break
+
+    return snapshots[-1], snapshots
+
+
+def run():
+    if not ACCESS_TOKEN:
+        raise RuntimeError("FB_SCALER_ACCESS_TOKEN missing")
+    if not TEST_ADSET_ID:
+        raise RuntimeError("TEST_ADSET_ID missing")
+
+    diag = api_identity()
+    send_identity(diag)
+
+    source = get_source_objects(TEST_ADSET_ID)
+
+    page_access = resolve_page_token(source["page_id"])
+
+    source_video = read_source_video_with_url(source)
+
+    # 1. NEW unpublished Page video.
+    new_page_video_id, page_video_payload, page_video_response = create_new_page_video(
+        source,
+        source_video,
+        page_access,
+    )
+
+    # 2. Wait for generated thumbnails.
+    new_video_node, thumbs, video_poll = wait_for_video_and_thumbnails(
+        new_page_video_id,
+        page_access["token"],
+    )
+
+    # 3. Explicitly select preferred thumbnail on the NEW Page video.
+    chosen_thumb = choose_thumbnail(thumbs)
+    thumb_update = set_preferred_thumbnail(
+        new_page_video_id,
+        chosen_thumb,
+        page_access["token"],
+    )
+
+    if not thumb_update["preferred_after"]:
+        raise RuntimeError(
+            "preferred_thumbnail_id was sent, but verification says selected thumbnail is not preferred"
+        )
+
+    # 4. Wait for real Page post id.
+    video_with_post, post_poll = wait_for_post_id(
+        new_page_video_id,
+        page_access["token"],
+    )
+
+    object_story_id = normalize_object_story_id(
+        source["page_id"],
+        video_with_post["post_id"],
+    )
+    PARTIAL["object_story_id"] = object_story_id
+
+    # 5. Only now duplicate the AdSet.
+    suffix = f" [PYTEST-V26 {datetime.now(POLAND_TZ).strftime('%Y%m%d-%H%M%S')}]"
+    copied_adset_id = copy_adset(source["adset"], suffix)
+
+    # 6. NEW Creative from already-prepared Page post.
+    new_creative_id, creative_payload = create_creative_from_object_story(
+        source,
+        object_story_id,
+        suffix,
+    )
+
+    new_creative = get_node(
+        new_creative_id,
+        CREATIVE_FIELDS,
+        stage="audit_new_creative",
+    )
+
+    # 7. NEW PAUSED Ad.
+    new_ad_id, ad_payload = create_ad(
+        source,
+        copied_adset_id,
+        new_creative_id,
+        suffix,
+    )
+
+    final_ad, ad_poll = poll_ad(new_ad_id)
+
+    copied_adset = get_node(
+        copied_adset_id,
+        ADSET_FIELDS,
+        stage="audit_copied_adset",
+    )
+
+    source_pixel = (source["adset"].get("promoted_object") or {}).get("pixel_id")
+    copy_pixel = (copied_adset.get("promoted_object") or {}).get("pixel_id")
+
+    issues = final_ad.get("issues_info") or []
+    failed = final_ad.get("failed_delivery_checks") or []
 
     result = {
-        "mode": "CLEAN_REBUILD",
-        "account_id": account_id,
-        "source_adset_id": source_adset_id,
-        "copied_adset_id": copied_adset_id,
-        "source_ad_id": source_ad.get("id"),
-        "copied_ad_id": new_ad_id,
-        "source_creative_id": creative_id,
-        "copied_creative_id": new_creative_id,
-        "creative_id_changed": creative_id != new_creative_id,
-        "pixel_source": source_pixel,
-        "pixel_copy": copied_pixel,
-        "pixel_match": source_pixel == copied_pixel,
-        "source_semantics": source_sem,
-        "copy_semantics": copy_sem,
-        "media_audit": media_audit,
-        "adset_diffs": adset_diffs,
-        "ad_diffs": ad_diffs,
-        "creative_diffs": creative_diffs,
-        "enhancement_fields_after_create": enhancement_fields,
-        "enhancement_enroll_statuses": enhancement_statuses,
-        "enhancement_opt_ins": enhancement_opt_ins,
-        "requested_feature_statuses": requested_feature_statuses,
-        "missing_or_not_optout": missing_or_not_optout,
-        "multi_advertiser_status": multi_advertiser_status,
-        "ad_issues": ad_issues,
-        "failed_delivery_checks": failed_delivery_checks,
-        "postprocess_snapshots": postprocess_snapshots,
-        "source_adset": source,
-        "copied_adset": copied_adset,
-        "source_ad": source_ad,
-        "copied_ad": copied_ad,
-        "tracking_regeneration": {
-            "source_tracking_present": bool(source_ad.get("tracking_specs")),
-            "copy_tracking_present": bool(copied_ad.get("tracking_specs")),
-            "source_tracking_post_ids": extract_tracking_post_ids(source_ad.get("tracking_specs")),
-            "copy_tracking_post_ids": extract_tracking_post_ids(copied_ad.get("tracking_specs")),
-            "source_conversion_specs": source_ad.get("conversion_specs"),
-            "copy_conversion_specs": copied_ad.get("conversion_specs"),
-            "source_conversion_domain": source_ad.get("conversion_domain"),
-            "copy_conversion_domain": copied_ad.get("conversion_domain"),
+        "version": "v26",
+        "mode": "PAGE_VIDEO_TO_OBJECT_STORY_ID",
+        "source_adset_id": TEST_ADSET_ID,
+        "account_id": source["adset"]["account_id"],
+        "page_id": source["page_id"],
+        "page_token_source": page_access["source"],
+        "page_tasks": page_access.get("tasks"),
+
+        "source_ad_id": source["ad"]["id"],
+        "source_creative_id": source["creative"]["id"],
+        "source_root_video_id": source["root_video_id"],
+        "source_story_video_id": source["story_video_id"],
+        "source_video_resolution": source_video,
+
+        "new_page_video_id": new_page_video_id,
+        "page_video_create_payload": {
+            **page_video_payload,
+            "file_url": "<REDACTED_SOURCE_URL>",
         },
-        "source_creative": source_creative,
-        "copied_creative": copied_creative,
-        "creative_create_payload": creative_payload,
+        "page_video_create_response": page_video_response,
+        "video_poll": video_poll,
+
+        "chosen_thumbnail": chosen_thumb,
+        "thumbnail_update": thumb_update,
+        "video_with_post": video_with_post,
+        "post_poll": post_poll,
+
+        "object_story_id": object_story_id,
+
+        "copied_adset_id": copied_adset_id,
+        "new_creative_id": new_creative_id,
+        "new_creative": new_creative,
+        "new_ad_id": new_ad_id,
+        "final_ad": final_ad,
+        "ad_poll": ad_poll,
+
+        "creative_payload": creative_payload,
+        "ad_payload": ad_payload,
+
+        "pixel_source": source_pixel,
+        "pixel_copy": copy_pixel,
+        "pixel_match": source_pixel == copy_pixel,
+
+        "issues": issues,
+        "failed_delivery_checks": failed,
+        "publish_probe_ok": (
+            not issues
+            and not failed
+            and source_pixel == copy_pixel
+        ),
     }
-    # v23 is a publish-isolation probe. Default Meta enhancement statuses are
-    # recorded, but they do not fail the probe. The only question now is whether
-    # omitting degrees_of_freedom_spec removes async publish error #2643026.
-    result["core_ok"] = (
-        copied_adset.get("status") == "PAUSED"
-        and copied_ad.get("status") == "PAUSED"
-        and result["creative_id_changed"]
-        and result["pixel_match"]
-        and not creative_diffs
-        and multi_advertiser_status == "OPT_OUT"
-        and not ad_issues
-        and not failed_delivery_checks
-    )
-    # Separate the UI label from the operational goal. The public API does not expose
-    # a documented equivalent of Ads Manager's "Automatic" thumbnail selector. For
-    # automation, the critical requirement is that the script can choose a Meta-generated ad-video preview URL with no human intervention and the ad publishes cleanly.
-    result["thumbnail_ui_automatic"] = bool(media_audit.get("thumbnail_ui_automatic"))
-    result["thumbnail_no_manual_intervention"] = bool(media_audit.get("thumbnail_no_manual_intervention"))
-    tracking_audit = result.get("tracking_regeneration") or {}
-    source_posts = set(tracking_audit.get("source_tracking_post_ids") or [])
-    copy_posts = set(tracking_audit.get("copy_tracking_post_ids") or [])
-    result["tracking_rebuilt"] = bool(copy_posts) and not bool(source_posts & copy_posts)
-    result["publish_probe_ok"] = (
-        result["core_ok"]
-        and not bool(ad_issues)
-        and not bool(failed_delivery_checks)
-    )
-    # Diagnostic only. If this passes, we have proven the thumbnail mechanism,
-    # but we still need to finish the separate Creative Setup / Website Highlights control.
-    result["scaler_ready"] = False
-    return result
+
+    return diag, result
 
 
-def format_error(e, source_id):
-    if isinstance(e, MetaRequestError):
-        info = e.info
-        parts = [
-            "❌ <b>Duplicate test v25.1 error</b>",
-            f"Source Adset: <code>{esc(source_id)}</code>",
-            f"Stage: <b>{esc(e.stage or 'unknown')}</b>",
-        ]
-        if PARTIAL:
-            parts.append("Partial: " + esc(json.dumps(PARTIAL, ensure_ascii=False)))
-        parts.append(esc(str(e)))
-        if info.get("fbtrace_id"):
-            parts.append(f"fbtrace_id: {esc(info.get('fbtrace_id'))}")
-        return "\n".join(parts)
-    return (
-        "❌ <b>Duplicate test v25.1 error</b>\n"
-        f"Source Adset: <code>{esc(source_id)}</code>\n"
-        f"Partial: {esc(json.dumps(PARTIAL, ensure_ascii=False))}\n"
-        f"{esc(str(e))}"
-    )
-
-
-def summary_message(result):
-    media = result.get("media_audit") or {}
-    issues = result.get("ad_issues") or []
-    failed_checks = result.get("failed_delivery_checks") or []
-    feature_statuses = result.get("requested_feature_statuses") or {}
-    feature_short = ", ".join(f"{k}={v or 'NOT_RETURNED'}" for k, v in feature_statuses.items())
+def summary(result):
     lines = [
-        "🧪 <b>Duplicate test v25.1 • GENERATED_SELECTED THUMBNAIL</b>",
-        f"Account: <code>{esc(result.get('account_id'))}</code>",
-        f"Source Adset: <code>{esc(result.get('source_adset_id'))}</code>",
-        f"Copy Adset: <code>{esc(result.get('copied_adset_id'))}</code> • {esc((result.get('copied_adset') or {}).get('name'))}",
-        f"Source Ad → Copy Ad: <code>{esc(result.get('source_ad_id'))}</code> → <code>{esc(result.get('copied_ad_id'))}</code>",
-        f"Creative: <code>{esc(result.get('source_creative_id'))}</code> → <code>{esc(result.get('copied_creative_id'))}</code> {'✅ NEW' if result.get('creative_id_changed') else '❌ SAME'}",
-        f"Pixel: {esc(result.get('pixel_source'))} → {esc(result.get('pixel_copy'))} {'✅' if result.get('pixel_match') else '❌'}",
-        f"Multi-advertiser: {esc(result.get('multi_advertiser_status'))} {'✅' if result.get('multi_advertiser_status') == 'OPT_OUT' else '⚠️'}",
-        "DOF sent on create: ❌ NO",
-        f"Meta returned enhancement statuses: {len(result.get('enhancement_enroll_statuses') or [])} fields (full list in JSON)",
-        f"Meta returned OPT_IN count: {len(result.get('enhancement_opt_ins') or [])}",
-        f"Media: {esc(media.get('mode'))} • thumbnail: {esc(media.get('preview_strategy'))}",
-        f"Root AdVideo ID: {esc((media.get('preview_meta') or {}).get('root_advideo_id'))}",
-        f"Story video ID: {esc((media.get('preview_meta') or {}).get('story_video_id'))}",
-        f"Generated thumbnail ID: {esc((media.get('preview_meta') or {}).get('thumbnail_id'))}",
-        f"Thumbnail source: {esc((media.get('preview_meta') or {}).get('thumbnail_source'))}",
-        f"Matched source thumbnail URL: {'✅ YES' if (media.get('preview_meta') or {}).get('matched_source_thumbnail') else '⚠️ NO'}",
-        f"Generated thumbnail preferred: {esc((media.get('preview_meta') or {}).get('thumbnail_is_preferred'))}",
-        f"Thumbnail UI Automatic: {'✅ YES' if result.get('thumbnail_ui_automatic') else 'ℹ️ NO — explicit generated frame'}",
-        f"Thumbnail needs manual action: {'❌ YES' if not result.get('thumbnail_no_manual_intervention') else '✅ NO'}",
-        f"Tracking source post IDs: {esc((result.get('tracking_regeneration') or {}).get('source_tracking_post_ids'))}",
-        f"Tracking copy post IDs: {esc((result.get('tracking_regeneration') or {}).get('copy_tracking_post_ids'))}",
-        f"Conversion specs auto-generated: {'✅ YES' if (result.get('tracking_regeneration') or {}).get('copy_conversion_specs') else '⚠️ NO'}",
-        f"Tracking rebuilt for NEW post: {'✅ YES' if result.get('tracking_rebuilt') else '⚠️ NO'}",
-        f"Core diffs: adset={len(result.get('adset_diffs', []))}, ad={len(result.get('ad_diffs', []))}, creative={len(result.get('creative_diffs', []))}",
-        f"Post-processing issues: {len(issues)} • failed checks: {len(failed_checks)} {'✅' if not issues and not failed_checks else '❌'}",
-        f"Core OK: {'✅ YES' if result.get('core_ok') else '⚠️ NO'}",
-        f"Publish probe (generated_selected): {'✅ PASS' if result.get('publish_probe_ok') else '❌ FAIL'}",
+        "🧪 <b>Duplicate test v26 • PAGE VIDEO → OBJECT_STORY_ID</b>",
+        f"Account: <code>{esc(result['account_id'])}</code>",
+        f"Page: <code>{esc(result['page_id'])}</code>",
+        f"Page token source: {esc(result['page_token_source'])}",
+        "",
+        f"Source Adset: <code>{esc(result['source_adset_id'])}</code>",
+        f"Source Ad: <code>{esc(result['source_ad_id'])}</code>",
+        f"Source Creative: <code>{esc(result['source_creative_id'])}</code>",
+        f"Source root video: <code>{esc(result['source_root_video_id'])}</code>",
+        f"Source story video: <code>{esc(result['source_story_video_id'])}</code>",
+        "",
+        f"NEW Page Video: <code>{esc(result['new_page_video_id'])}</code> ✅",
+        f"Preferred thumbnail: <code>{esc(result['chosen_thumbnail']['id'])}</code>",
+        f"Preferred verified: {'✅ YES' if result['thumbnail_update']['preferred_after'] else '❌ NO'}",
+        f"Object Story ID: <code>{esc(result['object_story_id'])}</code>",
+        "",
+        f"Copy Adset: <code>{esc(result['copied_adset_id'])}</code>",
+        f"NEW Creative: <code>{esc(result['new_creative_id'])}</code>",
+        f"Creative root video_id: <code>{esc(result['new_creative'].get('video_id'))}</code>",
+        f"NEW Ad: <code>{esc(result['new_ad_id'])}</code> (PAUSED)",
+        "",
+        f"Pixel: {esc(result['pixel_source'])} → {esc(result['pixel_copy'])} "
+        f"{'✅' if result['pixel_match'] else '❌'}",
+        f"Post-processing issues: {len(result['issues'])}",
+        f"Failed delivery checks: {len(result['failed_delivery_checks'])}",
+        "",
+        f"Publish probe v26: {'✅ PASS' if result['publish_probe_ok'] else '❌ FAIL'}",
     ]
-    if issues:
-        lines.append("issues_info: " + esc(json.dumps(issues, ensure_ascii=False)[:1200]))
-    if failed_checks:
-        lines.append("failed_delivery_checks: " + esc(json.dumps(failed_checks, ensure_ascii=False)[:1200]))
+
+    if result["issues"]:
+        lines.append(
+            "issues_info: "
+            + esc(json.dumps(result["issues"], ensure_ascii=False)[:1200])
+        )
+
     return "\n".join(lines)
 
 
+def error_message(exc):
+    stage = getattr(exc, "stage", None)
+    return (
+        "❌ <b>Duplicate test v26 error</b>\n"
+        f"Source Adset: <code>{esc(TEST_ADSET_ID)}</code>\n"
+        f"Stage: <b>{esc(stage or 'python')}</b>\n"
+        f"Partial: {esc(json.dumps(PARTIAL, ensure_ascii=False)[:1800])}\n"
+        f"{esc(str(exc))}"
+    )
+
+
 def main():
-    if not ACCESS_TOKEN:
-        print("FB_SCALER_ACCESS_TOKEN missing", flush=True)
-        return 2
-
-    source_id = (os.environ.get("TEST_ADSET_ID") or "").strip()
-    if not source_id:
-        print("TEST_ADSET_ID missing", flush=True)
-        return 2
-
-    diag = get_permissions_diag()
-    send_access_diag(diag)
-    report = {"api_access": diag, "source_adset_id": source_id, "result": None, "error": None}
+    report = {
+        "version": "v26",
+        "mode": "PAGE_VIDEO_TO_OBJECT_STORY_ID",
+        "source_adset_id": TEST_ADSET_ID,
+        "result": None,
+        "error": None,
+    }
 
     try:
-        result = create_clean_clone(source_id)
+        diag, result = run()
+        report["api_access"] = diag
         report["result"] = result
-        send_telegram(summary_message(result))
-        exit_code = 0
-    except SkipSource as e:
-        report["error"] = {"type": "skip", "message": str(e), "partial": deepcopy(PARTIAL)}
-        send_telegram(
-            "⏭ <b>Duplicate test v25.1 skipped</b>\n"
-            f"Source Adset: <code>{esc(source_id)}</code>\n{esc(str(e))}"
-        )
-        exit_code = 1
-    except Exception as e:
+        send_telegram(summary(result))
+        code = 0
+    except Exception as exc:
         report["error"] = {
-            "type": type(e).__name__,
-            "message": str(e),
-            "stage": getattr(e, "stage", None),
+            "type": type(exc).__name__,
+            "message": str(exc),
+            "stage": getattr(exc, "stage", None),
             "partial": deepcopy(PARTIAL),
-            "meta": getattr(e, "info", None),
+            "meta": getattr(exc, "info", None),
         }
-        send_telegram(format_error(e, source_id))
-        exit_code = 1
+        send_telegram(error_message(exc))
+        code = 1
 
     with open(REPORT_FILE, "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
+
     print(f"Report saved: {REPORT_FILE}", flush=True)
-    return exit_code
+    return code
 
 
 if __name__ == "__main__":
