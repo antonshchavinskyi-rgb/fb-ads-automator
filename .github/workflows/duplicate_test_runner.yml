@@ -1,4 +1,4 @@
-name: FB Duplicate Test — Controlled Ordinary Ad v24 — API v26
+name: FB Duplicate Test — Controlled Ordinary Ad v25 — API v26
 
 on:
   workflow_dispatch:
@@ -21,7 +21,7 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Run controlled duplicate test v24 (API v26)
+      - name: Run controlled duplicate test v25 (API v26)
         env:
           FB_SCALER_ACCESS_TOKEN: ${{ secrets.FB_SCALER_ACCESS_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -33,6 +33,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: duplicate-test-v24-auto-tracking-report
-          path: duplicate_test_v24_generated_thumbnail_id_report.json
+          name: duplicate-test-v25-auto-tracking-report
+          path: duplicate_test_v25_generated_selected_report.json
           if-no-files-found: ignore
