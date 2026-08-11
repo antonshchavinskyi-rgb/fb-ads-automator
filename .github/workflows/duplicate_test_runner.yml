@@ -1,17 +1,17 @@
-name: FB Duplicate Test — Controlled Ordinary Ad v17 — API v26
+name: FB Creative Structure Diagnostic v18 — READ ONLY
 
 on:
   workflow_dispatch:
     inputs:
       adset_id:
-        description: 'ONE ordinary Adset ID to duplicate as PAUSED'
+        description: 'ONE ordinary source Adset ID to inspect'
         required: true
         type: string
 
 jobs:
-  duplicate-test:
+  creative-diagnostic:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -21,7 +21,7 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Run controlled duplicate test v17 (API v26)
+      - name: Run READ ONLY asset-feed diagnostic v18
         env:
           FB_SCALER_ACCESS_TOKEN: ${{ secrets.FB_SCALER_ACCESS_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -29,10 +29,10 @@ jobs:
           TEST_ADSET_ID: ${{ inputs.adset_id }}
         run: python fb_duplicate_test.py
 
-      - name: Upload audit report
+      - name: Upload diagnostic report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: duplicate-test-v17-v26-report
-          path: duplicate_test_v17_page_preferred_thumb_report.json
+          name: creative-structure-v18-report
+          path: duplicate_test_v18_asset_feed_diag_report.json
           if-no-files-found: ignore
