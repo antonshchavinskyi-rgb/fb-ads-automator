@@ -154,7 +154,7 @@ GET-відгуку класифікуємо як UI-підтверджену н�
 не дає потрібної поведінки мініатюри. Наступний тест переходить на нативний
 Ad Copies API.
 
-### v26.6 — поточна гіпотеза
+### v26.6 — відхилено: deprecated standard_enhancements
 
 - AdSet копіюється через `POST /{adset_id}/copies`;
 - Ad копіюється через `POST /{source_ad_id}/copies` у новий AdSet;
@@ -165,18 +165,89 @@ Ad Copies API.
 - обов'язково має бути новий Ad ID у новому AdSet;
 - у UI перевіряємо `Створити оголошення` та мініатюру `Авто`.
 
+Фактичний результат:
+
+- скопійований AdSet `120248234920820301` було створено;
+- Meta відхилила створення Ad на етапі `POST /{source_ad_id}/copies`;
+- помилка: `code=100`, `subcode=3858504`;
+- причина: вихідний Creative містить застарілий пакет
+  `standard_enhancements`, який більше не підтримується при копіюванні;
+- тестовий AdSet після помилки успішно видалено автоматичним cleanup;
+- новий Ad або Creative у цьому запуску не створено.
+
+Висновок: нативний `/copies` без `creative_parameters` не сумісний із цим
+вихідним Creative. Гіпотезу v26.6 відхилено фактичним API-викликом.
+
+### v26.6.1 — частковий технічний успіх, але publish FAIL
+
+- AdSet і далі копіюється нативно через `POST /{adset_id}/copies`;
+- Ad копіюється нативно через `POST /{source_ad_id}/copies`;
+- з вихідного `degrees_of_freedom_spec` видаляється лише заборонений
+  `standard_enhancements`;
+- його `enroll_status` переноситься в актуальні окремі функції для відео:
+  `video_auto_crop`, `text_optimizations`, `inline_comment`;
+- очищений `degrees_of_freedom_spec` передається через офіційний параметр
+  Ad Copies API `creative_parameters`;
+- `object_story_id`, `image_url`, `image_hash`, нове Page Video та ручна
+  мініатюра не передаються;
+- якщо API не поверне старий пакет або його `OPT_IN/OPT_OUT`, тест зупиниться
+  з діагностикою, а не підставить вигадане значення.
+
+Фактичний запуск: GitHub Actions run `#44`, commit
+`a296b23d486f03e1c8576f596764e6c3a7dae902`.
+
+Створено:
+
+- AdSet: `120248236576670301`;
+- Ad: `120248236577940301`;
+- Creative: `1897098357917433`;
+- Meta створила новий Creative, а не повторно використала source Creative.
+
+Підтверджено:
+
+- помилку `3858504` усунуто;
+- `standard_enhancements` не передавався;
+- source `OPT_IN/OPT_OUT` для вже наявних індивідуальних функцій збережено;
+- новий Ad знаходиться у новому AdSet;
+- Pixel збережено: `1221875848516044`;
+- AdSet fidelity пройдено; відсутній у readback
+  `targeting_automation.individual_setting` залишився UI-підтвердженим warning;
+- текст, заголовок, опис, CTA, посадкова сторінка, `url_tags` та `image_hash`
+  збережені;
+- `object_story_id`, `image_url` та `image_hash` скрипт у запит `/copies`
+  не передавав.
+
+Не пройдено:
+
+- новий Ad перейшов у `effective_status=WITH_ISSUES`;
+- hard error: `2643026` — загальна помилка обробки оголошення;
+- Creative має `status=WITH_ISSUES`;
+- `issues_info` містить одну hard error;
+- під час раннього readback у нового Ad були відсутні `tracking_specs` і
+  `conversion_specs`;
+- root `video_id` у нового Creative інший, при цьому story video, текст,
+  CTA та image hash збережені; це фіксуємо як факт, але не називаємо причиною
+  помилки без окремого доказу;
+- `true_duplicate_ok=false`, `publish_probe_ok=false`.
+
+Важливо: GitHub Action завершився зеленим, бо Python виконався без винятку й
+зберіг звіт. Бізнес-вердикт тесту при цьому `FAIL` через стан оголошення.
+
+Висновок: v26.6.1 довів, що deprecated enhancements можна мігрувати через
+`creative_parameters` і отримати нативні нові Ad та Creative. Але цей дубль
+не готовий до production, бо Meta не змогла обробити новий Creative.
+
 ## Поточний наступний крок
 
-1. Замінити на GitHub `fb_duplicate_test.py` версією v26.6 та запустити з
-   початковим source AdSet `120247989505660301`.
-2. Перевірити в Ads Manager:
+1. В Ads Manager відкрити Ad `120248236577940301` і перевірити:
    - режим оголошення — «Створити оголошення»;
    - мініатюра — `Авто`;
-   - текст, CTA, URL, Pixel і статус оголошення.
-3. Надіслати Telegram-повідомлення, JSON
-   `duplicate_test_v26_6_native_ad_copies_report.json` і скрин мініатюри.
-4. Не переходити до production `fb_scaler.py`, доки v26.6 не підтвердить
-   нативний дубль і режим мініатюри `Авто`.
+   - повний текст помилки у UI, якщо він відрізняється від API `2643026`.
+2. Надіслати скрин мініатюри та блоку помилки.
+3. Після UI-перевірки визначити вузький тест v26.6.2: повторна обробка або
+   корекція лише тієї частини Creative, яку підтвердить помилка.
+4. Не переходити до production `fb_scaler.py`, доки не отримано Ad без
+   `WITH_ISSUES` і не підтверджено мініатюру `Авто`.
 
 ## Не чіпати
 
