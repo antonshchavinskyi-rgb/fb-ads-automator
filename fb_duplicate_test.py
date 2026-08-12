@@ -14,7 +14,8 @@ from datetime import datetime
 from fb_config import POLAND_TZ
 
 API_VER = "v26.0"
-TEST_VERSION = "v26.4"
+TEST_VERSION = "v26.5.1"
+BUILD_ID = "2026-08-12-auto-thumbnail-r1"
 
 ACCESS_TOKEN = os.environ.get("FB_SCALER_ACCESS_TOKEN")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -23,7 +24,7 @@ TEST_ADSET_ID = (os.environ.get("TEST_ADSET_ID") or "").strip()
 TEST_VIDEO_FILE_URL = (os.environ.get("TEST_VIDEO_FILE_URL") or "").strip()
 TEST_VIDEO_FILE_PATH = (os.environ.get("TEST_VIDEO_FILE_PATH") or "").strip()
 
-REPORT_FILE = "duplicate_test_v26_4_true_ad_duplicate_report.json"
+REPORT_FILE = "duplicate_test_v26_5_1_auto_thumbnail_true_ad_duplicate_report.json"
 
 REQUIRED_PAGE_VIDEO_PERMISSIONS = {
     "pages_manage_posts",
@@ -457,7 +458,7 @@ def get_source_objects(adset_id):
 
 def resolve_source_video(source, page_access):
     """
-    v26.4: inspect BOTH source video ids with BOTH available token contexts.
+    v26.5.1: inspect BOTH source video ids with BOTH available token contexts.
 
     Priority:
     1) explicit local MP4 path (developer console/local run);
@@ -720,7 +721,7 @@ def wait_for_video_and_thumbnails(video_id, page_token):
 
         # Some Page videos expose post_id before the nested status reaches a
         # stable `ready` spelling. Either signal plus real thumbnails is enough
-        # to continue to the explicit thumbnail write.
+        # to continue while leaving Meta's generated thumbnail selection on Auto.
         if real_thumbs and (readiness["ready"] or node.get("post_id")):
             return node, real_thumbs, snapshots
 
@@ -728,97 +729,6 @@ def wait_for_video_and_thumbnails(video_id, page_token):
         "Timed out waiting for NEW Page video readiness + thumbnails: "
         + json.dumps(snapshots[-1] if snapshots else {}, ensure_ascii=False)[:1800]
     )
-
-
-def choose_thumbnail(thumbs):
-    preferred = next((x for x in thumbs if x.get("is_preferred")), None)
-    selected = preferred or thumbs[0]
-
-    return {
-        "id": str(selected.get("id")),
-        "uri": selected.get("uri"),
-        "is_preferred_before": bool(selected.get("is_preferred")),
-        "width": selected.get("width"),
-        "height": selected.get("height"),
-        "selection_reason": "existing_preferred" if preferred else "first_generated",
-    }
-
-
-def upload_selected_frame_as_preferred(video_id, thumb, page_token, thumbs_before):
-    """
-    Public API thumbnail write:
-    download one generated frame, then upload the image bytes to
-    /{video_id}/thumbnails with is_preferred=true.
-
-    This does not depend on Ads Manager draft-only fields such as
-    video_thumbnail_id/video_thumbnail_source.
-    """
-    image_bytes, content_type = download_binary(
-        thumb["uri"],
-        stage="download_generated_thumbnail",
-    )
-    if not image_bytes:
-        raise RuntimeError("Generated thumbnail download returned an empty file")
-
-    response = graph_multipart(
-        f"{video_id}/thumbnails",
-        {"is_preferred": True},
-        "source",
-        f"generated-frame-{thumb['id']}.jpg",
-        image_bytes,
-        content_type if content_type.startswith("image/") else "image/jpeg",
-        token=page_token,
-        stage="upload_preferred_thumbnail",
-    )
-
-    before_ids = {str(x.get("id")) for x in thumbs_before if x.get("id")}
-    verification_snapshots = []
-
-    for delay in (3, 7, 15):
-        time.sleep(delay)
-        thumbs_after = graph_get_all(
-            f"{video_id}/thumbnails",
-            {
-                "fields": "id,uri,is_preferred,width,height,scale",
-                "limit": 50,
-            },
-            token=page_token,
-            stage="verify_uploaded_preferred_thumbnail",
-        )
-        preferred_after = next(
-            (x for x in thumbs_after if x.get("is_preferred")),
-            None,
-        )
-        new_ids = [
-            str(x.get("id"))
-            for x in thumbs_after
-            if x.get("id") and str(x.get("id")) not in before_ids
-        ]
-        verification_snapshots.append({
-            "preferred": preferred_after,
-            "new_thumbnail_ids": new_ids,
-            "all": thumbs_after,
-        })
-        if preferred_after:
-            return {
-                "post_response": response,
-                "uploaded_bytes": len(image_bytes),
-                "uploaded_content_type": content_type,
-                "preferred_after": True,
-                "preferred_thumbnail_after": preferred_after,
-                "new_thumbnail_ids": new_ids,
-                "verification_snapshots": verification_snapshots,
-            }
-
-    return {
-        "post_response": response,
-        "uploaded_bytes": len(image_bytes),
-        "uploaded_content_type": content_type,
-        "preferred_after": False,
-        "preferred_thumbnail_after": None,
-        "new_thumbnail_ids": [],
-        "verification_snapshots": verification_snapshots,
-    }
 
 
 def copy_adset(source_adset, suffix):
@@ -853,7 +763,7 @@ def copy_adset(source_adset, suffix):
     return copied_id
 
 
-def build_new_object_story_spec(source, new_video_id, preferred_thumbnail):
+def build_new_object_story_spec(source, new_video_id):
     """
     Build a fresh unpublished video-ad story.
 
@@ -882,10 +792,6 @@ def build_new_object_story_spec(source, new_video_id, preferred_thumbnail):
 
     video_data["video_id"] = str(new_video_id)
 
-    thumbnail_uri = (preferred_thumbnail or {}).get("uri")
-    if thumbnail_uri:
-        video_data["image_url"] = thumbnail_uri
-
     spec["video_data"] = video_data
     return spec
 
@@ -893,7 +799,6 @@ def build_new_object_story_spec(source, new_video_id, preferred_thumbnail):
 def create_creative_from_new_story_spec(
     source,
     new_video_id,
-    preferred_thumbnail,
     suffix,
 ):
     account_id = str(source["adset"]["account_id"])
@@ -901,7 +806,6 @@ def create_creative_from_new_story_spec(
     object_story_spec = build_new_object_story_spec(
         source,
         new_video_id,
-        preferred_thumbnail,
     )
 
     payload = {
@@ -1077,37 +981,24 @@ def run():
         page_access,
     )
 
-    # 2. Wait for generated thumbnails.
+    # 2. Wait until Meta has processed the video and generated its automatic
+    # thumbnail candidates. Do not upload or select a preferred thumbnail.
     new_video_node, thumbs, video_poll = wait_for_video_and_thumbnails(
         new_page_video_id,
         page_access["token"],
     )
 
-    # 3. Explicitly select preferred thumbnail on the NEW Page video.
-    chosen_thumb = choose_thumbnail(thumbs)
-    thumb_update = upload_selected_frame_as_preferred(
-        new_page_video_id,
-        chosen_thumb,
-        page_access["token"],
-        thumbs,
-    )
-
-    if not thumb_update["preferred_after"]:
-        raise RuntimeError(
-            "Thumbnail image upload returned, but no preferred thumbnail was visible afterward"
-        )
-
-    # 4. Duplicate the AdSet only after the media is ready.
-    suffix = f" [PYTEST-V26.4 {datetime.now(POLAND_TZ).strftime('%Y%m%d-%H%M%S')}]"
+    # 3. Duplicate the AdSet only after the media is ready.
+    suffix = f" [PYTEST-V26.5.1 {datetime.now(POLAND_TZ).strftime('%Y%m%d-%H%M%S')}]"
     copied_adset_id = copy_adset(source["adset"], suffix)
 
-    # 5. Create a NEW ad creative from object_story_spec. Never pass the Page
+    # 4. Create a NEW ad creative from object_story_spec. Never pass the Page
     # video's post_id/object_story_id: doing so would select an existing post.
-    preferred_thumbnail = thumb_update.get("preferred_thumbnail_after") or {}
+    # Also omit image_url/image_hash so Ads Manager keeps thumbnail selection
+    # in Auto mode.
     new_creative_id, creative_payload = create_creative_from_new_story_spec(
         source,
         new_page_video_id,
-        preferred_thumbnail,
         suffix,
     )
 
@@ -1117,7 +1008,7 @@ def run():
         stage="audit_new_creative",
     )
 
-    # 6. Create a NEW PAUSED Ad inside the NEW AdSet.
+    # 5. Create a NEW PAUSED Ad inside the NEW AdSet.
     new_ad_id, ad_payload = create_ad(
         source,
         copied_adset_id,
@@ -1159,6 +1050,7 @@ def run():
 
     result = {
         "version": TEST_VERSION,
+        "build_id": BUILD_ID,
         "mode": "TRUE_AD_DUPLICATE_VIA_OBJECT_STORY_SPEC",
         "source_adset_id": TEST_ADSET_ID,
         "account_id": source["adset"]["account_id"],
@@ -1180,8 +1072,10 @@ def run():
         "page_video_create_response": page_video_response,
         "video_poll": video_poll,
 
-        "chosen_thumbnail": chosen_thumb,
-        "thumbnail_update": thumb_update,
+        "thumbnail_mode_requested": "AUTO",
+        "generated_thumbnails_observed": len(thumbs),
+        "thumbnail_write_performed": False,
+        "creative_thumbnail_override_passed": False,
         "video_upload_post_id": new_video_node.get("post_id"),
         "video_upload_post_was_not_passed_to_creative": True,
 
@@ -1235,7 +1129,8 @@ def run():
 
 def summary(result):
     lines = [
-        "🧪 <b>Duplicate test v26.4 • TRUE ADSET + AD DUPLICATE</b>",
+        "🧪 <b>Duplicate test v26.5.1 • TRUE ADSET + AD DUPLICATE</b>",
+        f"Build: <code>{esc(BUILD_ID)}</code>",
         f"Account: <code>{esc(result['account_id'])}</code>",
         f"Page: <code>{esc(result['page_id'])}</code>",
         f"Page token source: {esc(result['page_token_source'])}",
@@ -1248,10 +1143,10 @@ def summary(result):
         f"Page video input mode: <b>{esc((result.get('source_video_resolution') or {}).get('mode'))}</b>",
         "",
         f"NEW Page Video: <code>{esc(result['new_page_video_id'])}</code> ✅",
-        f"Generated frame selected: <code>{esc(result['chosen_thumbnail']['id'])}</code>",
-        f"Frame uploaded to /thumbnails: {esc(result['thumbnail_update']['uploaded_bytes'])} bytes",
-        f"Preferred thumbnail verified: {'✅ YES' if result['thumbnail_update']['preferred_after'] else '❌ NO'}",
-        f"Preferred after: <code>{esc((result['thumbnail_update'].get('preferred_thumbnail_after') or {}).get('id'))}</code>",
+        "Thumbnail mode requested: <b>AUTO</b>",
+        f"Generated thumbnail candidates observed: <code>{esc(result['generated_thumbnails_observed'])}</code>",
+        "Preferred thumbnail write performed: <b>NO</b>",
+        "Creative image_url/image_hash override passed: <b>NO</b>",
         "Creative request mode: <b>object_story_spec (CREATE AD)</b>",
         "Existing post ID passed to Creative: <b>NO</b>",
         "",
@@ -1269,8 +1164,8 @@ def summary(result):
         f"Post-processing issues: {len(result['issues'])}",
         f"Failed delivery checks: {len(result['failed_delivery_checks'])}",
         "",
-        f"True duplicate v26.4: {'✅ PASS' if result['true_duplicate_ok'] else '❌ FAIL'}",
-        f"Publish probe v26.4: {'✅ PASS' if result['publish_probe_ok'] else '❌ FAIL'}",
+        f"True duplicate v26.5.1: {'✅ PASS' if result['true_duplicate_ok'] else '❌ FAIL'}",
+        f"Publish probe v26.5.1: {'✅ PASS' if result['publish_probe_ok'] else '❌ FAIL'}",
     ]
 
     if result["issues"]:
@@ -1300,7 +1195,8 @@ def summary(result):
 def error_message(exc):
     stage = getattr(exc, "stage", None)
     return (
-        "❌ <b>Duplicate test v26.4 error</b>\n"
+        "❌ <b>Duplicate test v26.5.1 error</b>\n"
+        f"Build: <code>{esc(BUILD_ID)}</code>\n"
         f"Source Adset: <code>{esc(TEST_ADSET_ID)}</code>\n"
         f"Stage: <b>{esc(stage or 'python')}</b>\n"
         f"Partial: {esc(json.dumps(PARTIAL, ensure_ascii=False)[:1800])}\n"
@@ -1311,6 +1207,7 @@ def error_message(exc):
 def main():
     report = {
         "version": TEST_VERSION,
+        "build_id": BUILD_ID,
         "mode": "TRUE_AD_DUPLICATE_VIA_OBJECT_STORY_SPEC",
         "source_adset_id": TEST_ADSET_ID,
         "result": None,
