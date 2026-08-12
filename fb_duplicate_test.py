@@ -19,7 +19,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 TEST_ADSET_ID = (os.environ.get("TEST_ADSET_ID") or "").strip()
 
-REPORT_FILE = "duplicate_test_v26_page_video_object_story_report.json"
+REPORT_FILE = "duplicate_test_v26_1_video_reuse_object_story_report.json"
 
 PARTIAL = {}
 
@@ -350,8 +350,19 @@ def get_source_objects(adset_id):
 
 def read_source_video_with_url(source):
     """
-    Prefer root creative.video_id, then story video_id.
-    We need a real source URL so the Page Videos endpoint can create a NEW video.
+    v26.1:
+    Prefer the working root creative.video_id.
+
+    If Meta returns a downloadable `source`, we can create the new Page video
+    with file_url.
+
+    If `source` is hidden/not returned, use the PUBLIC Page Videos
+    `crossposted_video_id` parameter instead. Meta documents this parameter as
+    "the video id that the new video post will be reusing".
+
+    This avoids downloading/re-uploading the file and is exactly the fallback
+    we need for the current source video, which is readable/READY but has no
+    `source` field for this token.
     """
     attempts = []
 
@@ -372,12 +383,27 @@ def read_source_video_with_url(source):
 
             if node.get("source"):
                 return {
+                    "mode": "file_url",
                     "label": label,
                     "video_id": video_id,
                     "node": node,
                     "source_url": node["source"],
                     "attempts": attempts,
                 }
+
+            # The ROOT creative.video_id is a valid readable AdVideo in our
+            # source ad. If the raw source URL is hidden, reuse that video in a
+            # NEW Page video post via the documented crossposted_video_id field.
+            if label == "root_creative_video_id":
+                return {
+                    "mode": "crossposted_video_id",
+                    "label": label,
+                    "video_id": video_id,
+                    "node": node,
+                    "crossposted_video_id": video_id,
+                    "attempts": attempts,
+                }
+
         except MetaError as e:
             attempts.append({
                 "label": label,
@@ -386,7 +412,7 @@ def read_source_video_with_url(source):
             })
 
     raise RuntimeError(
-        "Could not read video source URL from root or story video. "
+        "Could not resolve a reusable source video. "
         + json.dumps(attempts, ensure_ascii=False)[:1800]
     )
 
@@ -395,12 +421,22 @@ def create_new_page_video(source, source_video, page_access):
     vd = source["video_data"]
 
     payload = {
-        "file_url": source_video["source_url"],
         "published": False,
         "unpublished_content_type": "ADS_POST",
     }
 
-    # Keep only text fields here. CTA is intentionally NOT sent in the first
+    mode = source_video.get("mode")
+
+    if mode == "file_url":
+        payload["file_url"] = source_video["source_url"]
+        stage = "create_unpublished_page_video:file_url"
+    elif mode == "crossposted_video_id":
+        payload["crossposted_video_id"] = source_video["crossposted_video_id"]
+        stage = "create_unpublished_page_video:crossposted_video_id"
+    else:
+        raise RuntimeError(f"Unknown source video mode: {mode}")
+
+    # Keep only text fields here. CTA is intentionally NOT sent in this
     # diagnostic run, to isolate Page-video + thumbnail + object_story_id.
     if vd.get("message"):
         payload["description"] = vd.get("message")
@@ -408,12 +444,15 @@ def create_new_page_video(source, source_video, page_access):
     if vd.get("title"):
         payload["title"] = vd.get("title")
 
+    PARTIAL["page_video_source_mode"] = mode
+    PARTIAL["page_video_source_video_id"] = source_video.get("video_id")
+
     response = graph_request(
         "POST",
         f"{source['page_id']}/videos",
         payload,
         token=page_access["token"],
-        stage="create_unpublished_page_video",
+        stage=stage,
     )
 
     new_video_id = str(response.get("id") or "")
@@ -742,8 +781,8 @@ def run():
     failed = final_ad.get("failed_delivery_checks") or []
 
     result = {
-        "version": "v26",
-        "mode": "PAGE_VIDEO_TO_OBJECT_STORY_ID",
+        "version": "v26.1",
+        "mode": "PAGE_VIDEO_REUSE_TO_OBJECT_STORY_ID",
         "source_adset_id": TEST_ADSET_ID,
         "account_id": source["adset"]["account_id"],
         "page_id": source["page_id"],
@@ -759,7 +798,11 @@ def run():
         "new_page_video_id": new_page_video_id,
         "page_video_create_payload": {
             **page_video_payload,
-            "file_url": "<REDACTED_SOURCE_URL>",
+            **(
+                {"file_url": "<REDACTED_SOURCE_URL>"}
+                if page_video_payload.get("file_url")
+                else {}
+            ),
         },
         "page_video_create_response": page_video_response,
         "video_poll": video_poll,
@@ -799,7 +842,7 @@ def run():
 
 def summary(result):
     lines = [
-        "🧪 <b>Duplicate test v26 • PAGE VIDEO → OBJECT_STORY_ID</b>",
+        "🧪 <b>Duplicate test v26.1 • VIDEO REUSE → OBJECT_STORY_ID</b>",
         f"Account: <code>{esc(result['account_id'])}</code>",
         f"Page: <code>{esc(result['page_id'])}</code>",
         f"Page token source: {esc(result['page_token_source'])}",
@@ -809,6 +852,7 @@ def summary(result):
         f"Source Creative: <code>{esc(result['source_creative_id'])}</code>",
         f"Source root video: <code>{esc(result['source_root_video_id'])}</code>",
         f"Source story video: <code>{esc(result['source_story_video_id'])}</code>",
+        f"Page video source mode: <b>{esc((result.get('source_video_resolution') or {}).get('mode'))}</b>",
         "",
         f"NEW Page Video: <code>{esc(result['new_page_video_id'])}</code> ✅",
         f"Preferred thumbnail: <code>{esc(result['chosen_thumbnail']['id'])}</code>",
@@ -825,7 +869,7 @@ def summary(result):
         f"Post-processing issues: {len(result['issues'])}",
         f"Failed delivery checks: {len(result['failed_delivery_checks'])}",
         "",
-        f"Publish probe v26: {'✅ PASS' if result['publish_probe_ok'] else '❌ FAIL'}",
+        f"Publish probe v26.1: {'✅ PASS' if result['publish_probe_ok'] else '❌ FAIL'}",
     ]
 
     if result["issues"]:
@@ -850,8 +894,8 @@ def error_message(exc):
 
 def main():
     report = {
-        "version": "v26",
-        "mode": "PAGE_VIDEO_TO_OBJECT_STORY_ID",
+        "version": "v26.1",
+        "mode": "PAGE_VIDEO_REUSE_TO_OBJECT_STORY_ID",
         "source_adset_id": TEST_ADSET_ID,
         "result": None,
         "error": None,
