@@ -14,8 +14,8 @@ from datetime import datetime
 from fb_config import POLAND_TZ
 
 API_VER = "v26.0"
-TEST_VERSION = "v26.6"
-BUILD_ID = "2026-08-12-native-ad-copies-r1"
+TEST_VERSION = "v26.6.1"
+BUILD_ID = "2026-08-12-native-ad-copies-sanitized-enhancements-r1"
 
 ACCESS_TOKEN = os.environ.get("FB_SCALER_ACCESS_TOKEN")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -24,7 +24,7 @@ TEST_ADSET_ID = (os.environ.get("TEST_ADSET_ID") or "").strip()
 TEST_VIDEO_FILE_URL = (os.environ.get("TEST_VIDEO_FILE_URL") or "").strip()
 TEST_VIDEO_FILE_PATH = (os.environ.get("TEST_VIDEO_FILE_PATH") or "").strip()
 
-REPORT_FILE = "duplicate_test_v26_6_native_ad_copies_report.json"
+REPORT_FILE = "duplicate_test_v26_6_1_sanitized_enhancements_report.json"
 
 REQUIRED_PAGE_VIDEO_PERMISSIONS = {
     "pages_manage_posts",
@@ -53,8 +53,14 @@ CREATIVE_FIELDS = [
     "id", "name", "account_id", "status",
     "object_story_id", "effective_object_story_id",
     "object_story_spec", "url_tags", "thumbnail_url", "video_id",
-    "contextual_multi_ads",
+    "contextual_multi_ads", "degrees_of_freedom_spec",
 ]
+
+VIDEO_STANDARD_ENHANCEMENT_FEATURES = (
+    "video_auto_crop",
+    "text_optimizations",
+    "inline_comment",
+)
 
 VIDEO_FIELDS = [
     "id", "created_time", "updated_time", "length",
@@ -772,11 +778,72 @@ def copy_adset(source_adset, suffix):
     return copied_id
 
 
-def copy_ad_natively(source_ad, copied_adset_id, suffix):
-    """Use Meta's native Ad Copies API without supplying creative inputs."""
+def build_native_copy_creative_parameters(source_creative):
+    """
+    Replace the deprecated standard_enhancements bundle with the individual
+    features Meta documents for single-video ads.
+
+    The Ad Copies endpoint receives only degrees_of_freedom_spec. It still
+    performs the native media/post copy, so no thumbnail or story identifier
+    is supplied by this script.
+    """
+    source_dof = deepcopy(source_creative.get("degrees_of_freedom_spec") or {})
+    source_features = source_dof.get("creative_features_spec")
+    if not isinstance(source_features, dict):
+        raise DiagnosticError(
+            "prepare_native_copy_creative_parameters",
+            "Source Creative did not expose degrees_of_freedom_spec."
+        )
+
+    sanitized_dof = deepcopy(source_dof)
+    sanitized_features = sanitized_dof.setdefault("creative_features_spec", {})
+    legacy_bundle = sanitized_features.pop("standard_enhancements", None)
+    if not isinstance(legacy_bundle, dict):
+        raise DiagnosticError(
+            "prepare_native_copy_creative_parameters",
+            "Source Creative did not expose standard_enhancements in "
+            "degrees_of_freedom_spec; refusing to guess its enrollment state."
+        )
+
+    enroll_status = legacy_bundle.get("enroll_status")
+    if enroll_status not in ("OPT_IN", "OPT_OUT"):
+        raise DiagnosticError(
+            "prepare_native_copy_creative_parameters",
+            "standard_enhancements has no supported OPT_IN/OPT_OUT status: "
+            + json.dumps(legacy_bundle, ensure_ascii=False)
+        )
+
+    translated_features = []
+    preserved_features = []
+    for feature_name in VIDEO_STANDARD_ENHANCEMENT_FEATURES:
+        if feature_name in sanitized_features:
+            preserved_features.append(feature_name)
+            continue
+        sanitized_features[feature_name] = {"enroll_status": enroll_status}
+        translated_features.append(feature_name)
+
+    migration = {
+        "source_degrees_of_freedom_spec": source_dof,
+        "removed_standard_enhancements": legacy_bundle,
+        "legacy_enroll_status": enroll_status,
+        "translated_video_features": translated_features,
+        "preserved_existing_individual_features": preserved_features,
+        "sanitized_degrees_of_freedom_spec": sanitized_dof,
+    }
+    PARTIAL["creative_parameters_migration"] = migration
+
+    return {"degrees_of_freedom_spec": sanitized_dof}, migration
+
+
+def copy_ad_natively(source_ad, source_creative, copied_adset_id, suffix):
+    """Use Meta's native Ad Copies API with only a sanitized enhancement spec."""
+    creative_parameters, migration = build_native_copy_creative_parameters(
+        source_creative
+    )
     request_payload = {
         "adset_id": copied_adset_id,
         "status_option": "PAUSED",
+        "creative_parameters": creative_parameters,
     }
     response = graph_request(
         "POST",
@@ -801,7 +868,7 @@ def copy_ad_natively(source_ad, copied_adset_id, suffix):
         stage="rename_native_copied_ad",
     )
 
-    return copied_ad_id, request_payload, response
+    return copied_ad_id, request_payload, response, migration
 
 
 def select_meta_generated_thumbnail(thumbnails):
@@ -1082,14 +1149,21 @@ def run():
     source = get_source_objects(TEST_ADSET_ID)
 
     # 1. Duplicate the AdSet in the same campaign.
-    suffix = f" [PYTEST-V26.6 {datetime.now(POLAND_TZ).strftime('%Y%m%d-%H%M%S')}]"
+    suffix = f" [PYTEST-V26.6.1 {datetime.now(POLAND_TZ).strftime('%Y%m%d-%H%M%S')}]"
     copied_adset_id = copy_adset(source["adset"], suffix)
 
     # 2. Duplicate the Ad through Meta's native /{ad_id}/copies endpoint.
-    # No creative parameters, object_story_id, image_url or image_hash are
-    # supplied. This is the API equivalent of Ads Manager's Duplicate action.
-    new_ad_id, native_copy_payload, native_copy_response = copy_ad_natively(
+    # Only a sanitized degrees_of_freedom_spec is supplied to migrate the
+    # deprecated standard_enhancements bundle to individual video features.
+    # object_story_id, image_url and image_hash are never supplied.
+    (
+        new_ad_id,
+        native_copy_payload,
+        native_copy_response,
+        creative_parameters_migration,
+    ) = copy_ad_natively(
         source["ad"],
+        source["creative"],
         copied_adset_id,
         suffix,
     )
@@ -1140,7 +1214,7 @@ def run():
     result = {
         "version": TEST_VERSION,
         "build_id": BUILD_ID,
-        "mode": "NATIVE_AD_COPIES_API",
+        "mode": "NATIVE_AD_COPIES_API_SANITIZED_ENHANCEMENTS",
         "source_adset_id": TEST_ADSET_ID,
         "account_id": source["adset"]["account_id"],
         "page_id": source["page_id"],
@@ -1160,7 +1234,12 @@ def run():
 
         "native_ad_copy_payload": native_copy_payload,
         "native_ad_copy_response": native_copy_response,
-        "creative_parameters_passed": False,
+        "creative_parameters_passed": True,
+        "creative_parameters_scope": "DEGREES_OF_FREEDOM_SPEC_ONLY",
+        "creative_parameters_migration": creative_parameters_migration,
+        "standard_enhancements_passed": False,
+        "source_degrees_of_freedom_spec": source["creative"].get("degrees_of_freedom_spec"),
+        "copied_degrees_of_freedom_spec": copied_creative.get("degrees_of_freedom_spec"),
         "object_story_id_passed": False,
         "thumbnail_fields_passed": False,
         "ads_manager_thumbnail_label_expected": "VERIFY_AUTO_ON_SCREEN",
@@ -1206,7 +1285,7 @@ def run():
 
 def summary(result):
     lines = [
-        "🧪 <b>Duplicate test v26.6 • NATIVE AD COPIES API</b>",
+        "🧪 <b>Duplicate test v26.6.1 • NATIVE COPY + ENHANCEMENT MIGRATION</b>",
         f"Build: <code>{esc(BUILD_ID)}</code>",
         f"Account: <code>{esc(result['account_id'])}</code>",
         f"Page: <code>{esc(result['page_id'])}</code>",
@@ -1225,7 +1304,9 @@ def summary(result):
         f"Ad inside NEW Adset: {'✅' if result['ad_structure']['new_ad_inside_new_adset'] else '❌'}",
         f"New Ad ID: {'✅' if result['ad_structure']['new_ad_id_differs_from_source'] else '❌'}",
         "Ad copy endpoint: <b>POST /{source_ad_id}/copies</b>",
-        "Creative parameters passed: <b>NO</b>",
+        "Creative parameters passed: <b>YES — degrees_of_freedom_spec only</b>",
+        "Deprecated standard_enhancements passed: <b>NO</b>",
+        "Individual video features: <b>video_auto_crop, text_optimizations, inline_comment</b>",
         "object_story_id passed: <b>NO</b>",
         "image_url/image_hash passed: <b>NO</b>",
         "Ads Manager thumbnail label: <b>VERIFY AUTO ON SCREEN</b>",
@@ -1238,8 +1319,8 @@ def summary(result):
         f"Post-processing issues: {len(result['issues'])}",
         f"Failed delivery checks: {len(result['failed_delivery_checks'])}",
         "",
-        f"Native duplicate v26.6: {'✅ PASS' if result['true_duplicate_ok'] else '❌ FAIL'}",
-        f"Publish probe v26.6: {'✅ PASS' if result['publish_probe_ok'] else '❌ FAIL'}",
+        f"Native duplicate v26.6.1: {'✅ PASS' if result['true_duplicate_ok'] else '❌ FAIL'}",
+        f"Publish probe v26.6.1: {'✅ PASS' if result['publish_probe_ok'] else '❌ FAIL'}",
     ]
 
     if result["issues"]:
@@ -1278,7 +1359,7 @@ def summary(result):
 def error_message(exc):
     stage = getattr(exc, "stage", None)
     return (
-        "❌ <b>Duplicate test v26.6 error</b>\n"
+        "❌ <b>Duplicate test v26.6.1 error</b>\n"
         f"Build: <code>{esc(BUILD_ID)}</code>\n"
         f"Source Adset: <code>{esc(TEST_ADSET_ID)}</code>\n"
         f"Stage: <b>{esc(stage or 'python')}</b>\n"
