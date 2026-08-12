@@ -14,7 +14,7 @@ from datetime import datetime
 from fb_config import POLAND_TZ
 
 API_VER = "v26.0"
-TEST_VERSION = "v26.3"
+TEST_VERSION = "v26.4"
 
 ACCESS_TOKEN = os.environ.get("FB_SCALER_ACCESS_TOKEN")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -23,7 +23,7 @@ TEST_ADSET_ID = (os.environ.get("TEST_ADSET_ID") or "").strip()
 TEST_VIDEO_FILE_URL = (os.environ.get("TEST_VIDEO_FILE_URL") or "").strip()
 TEST_VIDEO_FILE_PATH = (os.environ.get("TEST_VIDEO_FILE_PATH") or "").strip()
 
-REPORT_FILE = "duplicate_test_v26_3_binary_reupload_report.json"
+REPORT_FILE = "duplicate_test_v26_4_true_ad_duplicate_report.json"
 
 REQUIRED_PAGE_VIDEO_PERMISSIONS = {
     "pages_manage_posts",
@@ -42,7 +42,7 @@ ADSET_FIELDS = [
 ]
 
 AD_FIELDS = [
-    "id", "name", "status", "configured_status", "effective_status",
+    "id", "name", "adset_id", "status", "configured_status", "effective_status",
     "creative", "tracking_specs", "conversion_specs", "conversion_domain",
     "issues_info", "failed_delivery_checks", "updated_time",
 ]
@@ -58,6 +58,18 @@ VIDEO_FIELDS = [
     "id", "created_time", "updated_time", "length",
     "picture", "post_id", "published", "source",
     "status", "permalink_url",
+]
+
+ADSET_FIDELITY_FIELDS = [
+    "campaign_id", "bid_strategy", "bid_amount", "billing_event",
+    "optimization_goal", "daily_budget", "lifetime_budget",
+    "attribution_spec", "promoted_object", "destination_type",
+    "pacing_type", "targeting", "is_dynamic_creative",
+    "recurring_budget_semantics",
+]
+
+VIDEO_TEXT_FIDELITY_FIELDS = [
+    "message", "title", "link_description", "call_to_action",
 ]
 
 
@@ -252,7 +264,7 @@ def graph_multipart(
 def download_binary(url, stage, max_bytes=25 * 1024 * 1024):
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "MetaDuplicateDiagnostic/26.3"},
+        headers={"User-Agent": "MetaDuplicateDiagnostic/26.4"},
     )
     try:
         with urllib.request.urlopen(req, timeout=180) as resp:
@@ -445,7 +457,7 @@ def get_source_objects(adset_id):
 
 def resolve_source_video(source, page_access):
     """
-    v26.3: inspect BOTH source video ids with BOTH available token contexts.
+    v26.4: inspect BOTH source video ids with BOTH available token contexts.
 
     Priority:
     1) explicit local MP4 path (developer console/local run);
@@ -577,8 +589,8 @@ def create_new_page_video(source, source_video, page_access):
     else:
         raise RuntimeError(f"Unknown source video mode: {mode}")
 
-    # Keep only text fields here. CTA is intentionally NOT sent in this
-    # diagnostic run, to isolate Page-video + thumbnail + object_story_id.
+    # Page Video metadata is not the ad creative. The complete ad text, URL
+    # and CTA are copied later through object_story_spec.video_data.
     if vd.get("message"):
         payload["description"] = vd.get("message")
 
@@ -809,33 +821,6 @@ def upload_selected_frame_as_preferred(video_id, thumb, page_token, thumbs_befor
     }
 
 
-def wait_for_post_id(video_id, page_token):
-    snapshots = []
-
-    for delay in (0, 5, 10, 20, 30):
-        if delay:
-            time.sleep(delay)
-
-        node = get_node(
-            video_id,
-            VIDEO_FIELDS,
-            token=page_token,
-            stage="wait_for_post_id",
-        )
-
-        snapshots.append(node)
-
-        if node.get("post_id"):
-            return node, snapshots
-
-    raise RuntimeError("NEW Page video never returned post_id")
-
-
-def normalize_object_story_id(page_id, post_id):
-    value = str(post_id)
-    return value if "_" in value else f"{page_id}_{value}"
-
-
 def copy_adset(source_adset, suffix):
     response = graph_request(
         "POST",
@@ -868,13 +853,64 @@ def copy_adset(source_adset, suffix):
     return copied_id
 
 
-def create_creative_from_object_story(source, object_story_id, suffix):
+def build_new_object_story_spec(source, new_video_id, preferred_thumbnail):
+    """
+    Build a fresh unpublished video-ad story.
+
+    Crucially, the payload contains object_story_spec and never
+    object_story_id. That is the API equivalent of creating a new ad rather
+    than selecting an existing Page publication.
+    """
+    source_spec = source["creative"].get("object_story_spec") or {}
+    source_video_data = source_spec.get("video_data") or {}
+
+    spec = {"page_id": source["page_id"]}
+    for key in ("instagram_actor_id",):
+        if source_spec.get(key):
+            spec[key] = deepcopy(source_spec[key])
+
+    video_data = {}
+    for key in VIDEO_TEXT_FIDELITY_FIELDS:
+        if source_video_data.get(key) is not None:
+            video_data[key] = deepcopy(source_video_data[key])
+
+    # These optional writable fields occur on some ordinary video ads. Copy
+    # them only when present; do not copy the old video/image identifiers.
+    for key in ("caption_ids", "page_welcome_message"):
+        if source_video_data.get(key) is not None:
+            video_data[key] = deepcopy(source_video_data[key])
+
+    video_data["video_id"] = str(new_video_id)
+
+    thumbnail_uri = (preferred_thumbnail or {}).get("uri")
+    if thumbnail_uri:
+        video_data["image_url"] = thumbnail_uri
+
+    spec["video_data"] = video_data
+    return spec
+
+
+def create_creative_from_new_story_spec(
+    source,
+    new_video_id,
+    preferred_thumbnail,
+    suffix,
+):
     account_id = str(source["adset"]["account_id"])
+
+    object_story_spec = build_new_object_story_spec(
+        source,
+        new_video_id,
+        preferred_thumbnail,
+    )
 
     payload = {
         "name": f"{source['creative'].get('name') or 'creative'}{suffix}",
-        "object_story_id": object_story_id,
-        "contextual_multi_ads": {"enroll_status": "OPT_OUT"},
+        "object_story_spec": object_story_spec,
+        "contextual_multi_ads": deepcopy(
+            source["creative"].get("contextual_multi_ads")
+            or {"enroll_status": "OPT_OUT"}
+        ),
     }
 
     if source["creative"].get("url_tags"):
@@ -884,7 +920,7 @@ def create_creative_from_object_story(source, object_story_id, suffix):
         "POST",
         f"act_{account_id}/adcreatives",
         payload,
-        stage="create_creative_via_object_story_id",
+        stage="create_creative_via_object_story_spec",
     )
 
     creative_id = str(response.get("id") or "")
@@ -894,6 +930,54 @@ def create_creative_from_object_story(source, object_story_id, suffix):
     PARTIAL["new_creative_id"] = creative_id
 
     return creative_id, payload
+
+
+def compare_fields(source, copied, fields):
+    differences = {}
+    for field in fields:
+        source_value = source.get(field)
+        copied_value = copied.get(field)
+        if source_value != copied_value:
+            differences[field] = {
+                "source": source_value,
+                "copy": copied_value,
+            }
+    return differences
+
+
+def audit_creative_fidelity(source, new_creative, new_video_id):
+    source_spec = source["creative"].get("object_story_spec") or {}
+    source_vd = source_spec.get("video_data") or {}
+    new_spec = new_creative.get("object_story_spec") or {}
+    new_vd = new_spec.get("video_data") or {}
+
+    text_differences = compare_fields(
+        source_vd,
+        new_vd,
+        VIDEO_TEXT_FIDELITY_FIELDS,
+    )
+
+    source_instagram = source_spec.get("instagram_actor_id")
+    new_instagram = new_spec.get("instagram_actor_id")
+
+    return {
+        "creation_request_used_object_story_spec": True,
+        "creation_request_used_object_story_id": False,
+        "new_object_story_spec_present": bool(new_spec),
+        "new_video_data_present": bool(new_vd),
+        "page_id_source": source_spec.get("page_id"),
+        "page_id_copy": new_spec.get("page_id"),
+        "instagram_actor_id_source": source_instagram,
+        "instagram_actor_id_copy": new_instagram,
+        "video_id_source": str(source_vd.get("video_id") or ""),
+        "video_id_expected": str(new_video_id),
+        "video_id_copy": str(new_vd.get("video_id") or new_creative.get("video_id") or ""),
+        "text_cta_differences": text_differences,
+        "text_cta_match": not text_differences,
+        "page_id_match": str(source_spec.get("page_id") or "") == str(new_spec.get("page_id") or ""),
+        "instagram_actor_id_match": source_instagram == new_instagram,
+        "new_video_id_match": str(new_vd.get("video_id") or new_creative.get("video_id") or "") == str(new_video_id),
+    }
 
 
 def create_ad(source, copied_adset_id, creative_id, suffix):
@@ -1013,26 +1097,17 @@ def run():
             "Thumbnail image upload returned, but no preferred thumbnail was visible afterward"
         )
 
-    # 4. Wait for real Page post id.
-    video_with_post, post_poll = wait_for_post_id(
-        new_page_video_id,
-        page_access["token"],
-    )
-
-    object_story_id = normalize_object_story_id(
-        source["page_id"],
-        video_with_post["post_id"],
-    )
-    PARTIAL["object_story_id"] = object_story_id
-
-    # 5. Only now duplicate the AdSet.
-    suffix = f" [PYTEST-V26.3 {datetime.now(POLAND_TZ).strftime('%Y%m%d-%H%M%S')}]"
+    # 4. Duplicate the AdSet only after the media is ready.
+    suffix = f" [PYTEST-V26.4 {datetime.now(POLAND_TZ).strftime('%Y%m%d-%H%M%S')}]"
     copied_adset_id = copy_adset(source["adset"], suffix)
 
-    # 6. NEW Creative from already-prepared Page post.
-    new_creative_id, creative_payload = create_creative_from_object_story(
+    # 5. Create a NEW ad creative from object_story_spec. Never pass the Page
+    # video's post_id/object_story_id: doing so would select an existing post.
+    preferred_thumbnail = thumb_update.get("preferred_thumbnail_after") or {}
+    new_creative_id, creative_payload = create_creative_from_new_story_spec(
         source,
-        object_story_id,
+        new_page_video_id,
+        preferred_thumbnail,
         suffix,
     )
 
@@ -1042,7 +1117,7 @@ def run():
         stage="audit_new_creative",
     )
 
-    # 7. NEW PAUSED Ad.
+    # 6. Create a NEW PAUSED Ad inside the NEW AdSet.
     new_ad_id, ad_payload = create_ad(
         source,
         copied_adset_id,
@@ -1061,12 +1136,30 @@ def run():
     source_pixel = (source["adset"].get("promoted_object") or {}).get("pixel_id")
     copy_pixel = (copied_adset.get("promoted_object") or {}).get("pixel_id")
 
+    adset_differences = compare_fields(
+        source["adset"],
+        copied_adset,
+        ADSET_FIDELITY_FIELDS,
+    )
+    creative_fidelity = audit_creative_fidelity(
+        source,
+        new_creative,
+        new_page_video_id,
+    )
+    ad_structure = {
+        "new_ad_id_differs_from_source": str(new_ad_id) != str(source["ad"]["id"]),
+        "new_creative_id_differs_from_source": str(new_creative_id) != str(source["creative"]["id"]),
+        "new_adset_id_differs_from_source": str(copied_adset_id) != str(source["adset"]["id"]),
+        "new_ad_inside_new_adset": str(final_ad.get("adset_id") or "") == str(copied_adset_id),
+        "new_ad_uses_new_creative": str((final_ad.get("creative") or {}).get("id") or "") == str(new_creative_id),
+    }
+
     issues = final_ad.get("issues_info") or []
     failed = final_ad.get("failed_delivery_checks") or []
 
     result = {
         "version": TEST_VERSION,
-        "mode": "PAGE_VIDEO_BINARY_REUPLOAD_PUBLIC_THUMBNAIL_TO_OBJECT_STORY_ID",
+        "mode": "TRUE_AD_DUPLICATE_VIA_OBJECT_STORY_SPEC",
         "source_adset_id": TEST_ADSET_ID,
         "account_id": source["adset"]["account_id"],
         "page_id": source["page_id"],
@@ -1089,10 +1182,8 @@ def run():
 
         "chosen_thumbnail": chosen_thumb,
         "thumbnail_update": thumb_update,
-        "video_with_post": video_with_post,
-        "post_poll": post_poll,
-
-        "object_story_id": object_story_id,
+        "video_upload_post_id": new_video_node.get("post_id"),
+        "video_upload_post_was_not_passed_to_creative": True,
 
         "copied_adset_id": copied_adset_id,
         "new_creative_id": new_creative_id,
@@ -1104,17 +1195,38 @@ def run():
         "creative_payload": creative_payload,
         "ad_payload": ad_payload,
 
+        "adset_fidelity_fields": ADSET_FIDELITY_FIELDS,
+        "adset_differences": adset_differences,
+        "adset_fidelity_match": not adset_differences,
+        "creative_fidelity": creative_fidelity,
+        "ad_structure": ad_structure,
+
         "pixel_source": source_pixel,
         "pixel_copy": copy_pixel,
         "pixel_match": source_pixel == copy_pixel,
 
         "issues": issues,
         "failed_delivery_checks": failed,
-        "cta_url_preservation_tested": False,
+        "cta_url_preservation_tested": True,
+        "true_duplicate_ok": (
+            not adset_differences
+            and all(ad_structure.values())
+            and creative_fidelity["new_object_story_spec_present"]
+            and creative_fidelity["new_video_data_present"]
+            and creative_fidelity["text_cta_match"]
+            and creative_fidelity["page_id_match"]
+            and creative_fidelity["instagram_actor_id_match"]
+            and creative_fidelity["new_video_id_match"]
+            and source_pixel == copy_pixel
+        ),
         "publish_probe_ok": (
             not issues
             and not failed
             and source_pixel == copy_pixel
+            and not adset_differences
+            and all(ad_structure.values())
+            and creative_fidelity["text_cta_match"]
+            and creative_fidelity["new_video_id_match"]
         ),
     }
 
@@ -1123,7 +1235,7 @@ def run():
 
 def summary(result):
     lines = [
-        "🧪 <b>Duplicate test v26.3 • BINARY RE-UPLOAD + PUBLIC THUMBNAIL</b>",
+        "🧪 <b>Duplicate test v26.4 • TRUE ADSET + AD DUPLICATE</b>",
         f"Account: <code>{esc(result['account_id'])}</code>",
         f"Page: <code>{esc(result['page_id'])}</code>",
         f"Page token source: {esc(result['page_token_source'])}",
@@ -1140,20 +1252,25 @@ def summary(result):
         f"Frame uploaded to /thumbnails: {esc(result['thumbnail_update']['uploaded_bytes'])} bytes",
         f"Preferred thumbnail verified: {'✅ YES' if result['thumbnail_update']['preferred_after'] else '❌ NO'}",
         f"Preferred after: <code>{esc((result['thumbnail_update'].get('preferred_thumbnail_after') or {}).get('id'))}</code>",
-        f"Object Story ID: <code>{esc(result['object_story_id'])}</code>",
+        "Creative request mode: <b>object_story_spec (CREATE AD)</b>",
+        "Existing post ID passed to Creative: <b>NO</b>",
         "",
         f"Copy Adset: <code>{esc(result['copied_adset_id'])}</code>",
         f"NEW Creative: <code>{esc(result['new_creative_id'])}</code>",
         f"Creative root video_id: <code>{esc(result['new_creative'].get('video_id'))}</code>",
         f"NEW Ad: <code>{esc(result['new_ad_id'])}</code> (PAUSED)",
+        f"Ad inside NEW Adset: {'✅' if result['ad_structure']['new_ad_inside_new_adset'] else '❌'}",
+        f"Ad uses NEW Creative: {'✅' if result['ad_structure']['new_ad_uses_new_creative'] else '❌'}",
         "",
+        f"Adset settings fidelity: {'✅' if result['adset_fidelity_match'] else '❌'}",
+        f"Text + CTA + URL fidelity: {'✅' if result['creative_fidelity']['text_cta_match'] else '❌'}",
         f"Pixel: {esc(result['pixel_source'])} → {esc(result['pixel_copy'])} "
         f"{'✅' if result['pixel_match'] else '❌'}",
         f"Post-processing issues: {len(result['issues'])}",
         f"Failed delivery checks: {len(result['failed_delivery_checks'])}",
         "",
-        f"Publish probe v26.3: {'✅ PASS' if result['publish_probe_ok'] else '❌ FAIL'}",
-        "CTA/URL fidelity: not tested in this isolated processing probe",
+        f"True duplicate v26.4: {'✅ PASS' if result['true_duplicate_ok'] else '❌ FAIL'}",
+        f"Publish probe v26.4: {'✅ PASS' if result['publish_probe_ok'] else '❌ FAIL'}",
     ]
 
     if result["issues"]:
@@ -1162,13 +1279,28 @@ def summary(result):
             + esc(json.dumps(result["issues"], ensure_ascii=False)[:1200])
         )
 
+    if result["adset_differences"]:
+        lines.append(
+            "Adset differences: "
+            + esc(json.dumps(result["adset_differences"], ensure_ascii=False)[:1200])
+        )
+
+    if result["creative_fidelity"]["text_cta_differences"]:
+        lines.append(
+            "Creative differences: "
+            + esc(json.dumps(
+                result["creative_fidelity"]["text_cta_differences"],
+                ensure_ascii=False,
+            )[:1200])
+        )
+
     return "\n".join(lines)
 
 
 def error_message(exc):
     stage = getattr(exc, "stage", None)
     return (
-        "❌ <b>Duplicate test v26.3 error</b>\n"
+        "❌ <b>Duplicate test v26.4 error</b>\n"
         f"Source Adset: <code>{esc(TEST_ADSET_ID)}</code>\n"
         f"Stage: <b>{esc(stage or 'python')}</b>\n"
         f"Partial: {esc(json.dumps(PARTIAL, ensure_ascii=False)[:1800])}\n"
@@ -1179,7 +1311,7 @@ def error_message(exc):
 def main():
     report = {
         "version": TEST_VERSION,
-        "mode": "PAGE_VIDEO_BINARY_REUPLOAD_PUBLIC_THUMBNAIL_TO_OBJECT_STORY_ID",
+        "mode": "TRUE_AD_DUPLICATE_VIA_OBJECT_STORY_SPEC",
         "source_adset_id": TEST_ADSET_ID,
         "result": None,
         "error": None,
