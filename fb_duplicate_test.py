@@ -7,6 +7,7 @@ import re
 import urllib.request
 import urllib.parse
 import urllib.error
+import uuid
 from copy import deepcopy
 from datetime import datetime
 
@@ -18,8 +19,10 @@ ACCESS_TOKEN = os.environ.get("FB_SCALER_ACCESS_TOKEN")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 TEST_ADSET_ID = (os.environ.get("TEST_ADSET_ID") or "").strip()
+TEST_VIDEO_FILE_URL = (os.environ.get("TEST_VIDEO_FILE_URL") or "").strip()
+TEST_VIDEO_FILE_PATH = (os.environ.get("TEST_VIDEO_FILE_PATH") or "").strip()
 
-REPORT_FILE = "duplicate_test_v26_1_video_reuse_object_story_report.json"
+REPORT_FILE = "duplicate_test_v26_2_video_reupload_thumbnail_report.json"
 
 PARTIAL = {}
 
@@ -174,6 +177,80 @@ def graph_request(method, path, params=None, token=None, stage="graph"):
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
         raise MetaError(stage, e.code, decode_meta_error(body))
+
+
+def graph_multipart(
+    path,
+    fields,
+    file_field,
+    filename,
+    file_bytes,
+    content_type,
+    token=None,
+    stage="graph_multipart",
+    host="graph.facebook.com",
+):
+    """POST one binary file to a public Graph API edge."""
+    boundary = f"----MetaDuplicateTest{uuid.uuid4().hex}"
+    boundary_bytes = boundary.encode("ascii")
+    body = bytearray()
+
+    multipart_fields = dict(fields or {})
+    multipart_fields["access_token"] = token or ACCESS_TOKEN
+
+    for key, value in multipart_fields.items():
+        if value is None:
+            continue
+        body.extend(b"--" + boundary_bytes + b"\r\n")
+        body.extend(
+            f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode("utf-8")
+        )
+        body.extend(str(serialize(value)).encode("utf-8"))
+        body.extend(b"\r\n")
+
+    body.extend(b"--" + boundary_bytes + b"\r\n")
+    body.extend(
+        (
+            f'Content-Disposition: form-data; name="{file_field}"; '
+            f'filename="{filename}"\r\n'
+        ).encode("utf-8")
+    )
+    body.extend(f"Content-Type: {content_type}\r\n\r\n".encode("ascii"))
+    body.extend(file_bytes)
+    body.extend(b"\r\n--" + boundary_bytes + b"--\r\n")
+
+    url = f"https://{host}/{API_VER}/{str(path).lstrip('/')}"
+    req = urllib.request.Request(
+        url,
+        data=bytes(body),
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", errors="replace")
+        raise MetaError(stage, e.code, decode_meta_error(raw))
+
+
+def download_binary(url, stage, max_bytes=25 * 1024 * 1024):
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "MetaDuplicateDiagnostic/26.2"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            data = resp.read(max_bytes + 1)
+            if len(data) > max_bytes:
+                raise RuntimeError(f"{stage}: downloaded asset exceeds {max_bytes} bytes")
+            content_type = resp.headers.get_content_type() or "application/octet-stream"
+            return data, content_type
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"{stage}: HTTP {e.code}: {raw[:800]}")
 
 
 def graph_get_all(path, params=None, token=None, stage="graph_list"):
@@ -348,73 +425,132 @@ def get_source_objects(adset_id):
     }
 
 
-def read_source_video_with_url(source):
+def resolve_source_video(source, page_access):
     """
-    v26.1:
-    Prefer the working root creative.video_id.
+    v26.2: inspect BOTH source video ids with BOTH available token contexts.
 
-    If Meta returns a downloadable `source`, we can create the new Page video
-    with file_url.
+    Priority:
+    1) explicit local MP4 path (developer console/local run);
+    2) explicit TEST_VIDEO_FILE_URL;
+    3) a `source` URL returned by either Page or scaler token;
+    4) one last public crosspost probe for the story video only.
 
-    If `source` is hidden/not returned, use the PUBLIC Page Videos
-    `crossposted_video_id` parameter instead. Meta documents this parameter as
-    "the video id that the new video post will be reusing".
-
-    This avoids downloading/re-uploading the file and is exactly the fallback
-    we need for the current source video, which is readable/READY but has no
-    `source` field for this token.
+    v26.1 already proved that crossposting root creative.video_id is forbidden
+    for this source, so that failed branch is intentionally not repeated.
     """
     attempts = []
+    source_candidates = []
 
+    token_contexts = []
+    for token_source, token in (
+        (f"page:{page_access['source']}", page_access["token"]),
+        ("scaler_system_user", ACCESS_TOKEN),
+    ):
+        if not token:
+            continue
+        if any(existing[1] == token for existing in token_contexts):
+            attempts.append({
+                "token_source": token_source,
+                "skipped": "same token value already tested",
+            })
+            continue
+        token_contexts.append((token_source, token))
+
+    # Story first: it is more likely to be Page-associated than root AdVideo.
     for label, video_id in (
-        ("root_creative_video_id", source.get("root_video_id")),
         ("story_video_id", source.get("story_video_id")),
+        ("root_creative_video_id", source.get("root_video_id")),
     ):
         if not video_id:
             continue
 
-        try:
-            node = get_node(
-                video_id,
-                VIDEO_FIELDS,
-                stage=f"read_source_video:{label}",
+        for token_source, token in token_contexts:
+            try:
+                node = get_node(
+                    video_id,
+                    VIDEO_FIELDS,
+                    token=token,
+                    stage=f"read_source_video:{label}:{token_source}",
+                )
+                attempts.append({
+                    "label": label,
+                    "video_id": video_id,
+                    "token_source": token_source,
+                    "node": node,
+                })
+                if node.get("source"):
+                    source_candidates.append({
+                        "label": label,
+                        "video_id": video_id,
+                        "token_source": token_source,
+                        "node": node,
+                        "source_url": node["source"],
+                    })
+            except MetaError as e:
+                attempts.append({
+                    "label": label,
+                    "video_id": video_id,
+                    "token_source": token_source,
+                    "error": str(e),
+                    "meta": e.info,
+                })
+
+    if TEST_VIDEO_FILE_PATH:
+        if not os.path.isfile(TEST_VIDEO_FILE_PATH):
+            raise RuntimeError(
+                f"TEST_VIDEO_FILE_PATH does not exist: {TEST_VIDEO_FILE_PATH}"
             )
-            attempts.append({"label": label, "video_id": video_id, "node": node})
+        return {
+            "mode": "local_binary_upload",
+            "local_path": TEST_VIDEO_FILE_PATH,
+            "attempts": attempts,
+        }
 
-            if node.get("source"):
-                return {
-                    "mode": "file_url",
-                    "label": label,
-                    "video_id": video_id,
-                    "node": node,
-                    "source_url": node["source"],
-                    "attempts": attempts,
-                }
+    if TEST_VIDEO_FILE_URL:
+        return {
+            "mode": "explicit_file_url",
+            "source_url": TEST_VIDEO_FILE_URL,
+            "attempts": attempts,
+        }
 
-            # The ROOT creative.video_id is a valid readable AdVideo in our
-            # source ad. If the raw source URL is hidden, reuse that video in a
-            # NEW Page video post via the documented crossposted_video_id field.
-            if label == "root_creative_video_id":
-                return {
-                    "mode": "crossposted_video_id",
-                    "label": label,
-                    "video_id": video_id,
-                    "node": node,
-                    "crossposted_video_id": video_id,
-                    "attempts": attempts,
-                }
+    if source_candidates:
+        chosen = source_candidates[0]
+        return {
+            "mode": "api_source_file_url",
+            **chosen,
+            "attempts": attempts,
+        }
 
-        except MetaError as e:
-            attempts.append({
-                "label": label,
-                "video_id": video_id,
-                "error": str(e),
-            })
+    if source.get("story_video_id"):
+        return {
+            "mode": "crossposted_story_video_probe",
+            "label": "story_video_id",
+            "video_id": source["story_video_id"],
+            "crossposted_video_id": source["story_video_id"],
+            "attempts": attempts,
+        }
 
     raise RuntimeError(
-        "Could not resolve a reusable source video. "
-        + json.dumps(attempts, ensure_ascii=False)[:1800]
+        "No downloadable video source was returned by either token and no "
+        "story video is available for the final crosspost probe. Provide "
+        "TEST_VIDEO_FILE_URL or TEST_VIDEO_FILE_PATH."
     )
+
+
+def redacted_source_video_resolution(value):
+    result = deepcopy(value)
+    if result.get("source_url"):
+        result["source_url"] = "<REDACTED_SOURCE_URL>"
+    if result.get("local_path"):
+        result["local_path"] = os.path.basename(result["local_path"])
+    for attempt in result.get("attempts") or []:
+        node = attempt.get("node")
+        if isinstance(node, dict) and node.get("source"):
+            node["source"] = "<REDACTED_SOURCE_URL>"
+        meta = attempt.get("meta")
+        if isinstance(meta, dict):
+            meta.pop("raw", None)
+    return result
 
 
 def create_new_page_video(source, source_video, page_access):
@@ -427,12 +563,14 @@ def create_new_page_video(source, source_video, page_access):
 
     mode = source_video.get("mode")
 
-    if mode == "file_url":
+    if mode in ("explicit_file_url", "api_source_file_url"):
         payload["file_url"] = source_video["source_url"]
         stage = "create_unpublished_page_video:file_url"
-    elif mode == "crossposted_video_id":
+    elif mode == "crossposted_story_video_probe":
         payload["crossposted_video_id"] = source_video["crossposted_video_id"]
-        stage = "create_unpublished_page_video:crossposted_video_id"
+        stage = "create_unpublished_page_video:crossposted_story_video_probe"
+    elif mode == "local_binary_upload":
+        stage = "create_unpublished_page_video:binary_source"
     else:
         raise RuntimeError(f"Unknown source video mode: {mode}")
 
@@ -447,13 +585,30 @@ def create_new_page_video(source, source_video, page_access):
     PARTIAL["page_video_source_mode"] = mode
     PARTIAL["page_video_source_video_id"] = source_video.get("video_id")
 
-    response = graph_request(
-        "POST",
-        f"{source['page_id']}/videos",
-        payload,
-        token=page_access["token"],
-        stage=stage,
-    )
+    if mode == "local_binary_upload":
+        with open(source_video["local_path"], "rb") as f:
+            video_bytes = f.read()
+        if not video_bytes:
+            raise RuntimeError("TEST_VIDEO_FILE_PATH is empty")
+        response = graph_multipart(
+            f"{source['page_id']}/videos",
+            payload,
+            "source",
+            os.path.basename(source_video["local_path"]),
+            video_bytes,
+            "video/mp4",
+            token=page_access["token"],
+            stage=stage,
+            host="graph-video.facebook.com",
+        )
+    else:
+        response = graph_request(
+            "POST",
+            f"{source['page_id']}/videos",
+            payload,
+            token=page_access["token"],
+            stage=stage,
+        )
 
     new_video_id = str(response.get("id") or "")
     if not new_video_id:
@@ -465,10 +620,31 @@ def create_new_page_video(source, source_video, page_access):
     return new_video_id, payload, response
 
 
+def video_ready_state(node):
+    status = node.get("status")
+    candidates = []
+
+    if isinstance(status, str):
+        candidates.append(status)
+    elif isinstance(status, dict):
+        for key in ("video_status", "status"):
+            if status.get(key):
+                candidates.append(status[key])
+        for phase_key in ("uploading_phase", "processing_phase", "publishing_phase"):
+            phase = status.get(phase_key)
+            if isinstance(phase, dict) and phase.get("status"):
+                candidates.append(phase["status"])
+
+    normalized = [str(x).strip().lower() for x in candidates]
+    ready = any(x in ("ready", "complete", "completed", "published") for x in normalized)
+    failed = any(x in ("error", "failed", "expired") for x in normalized)
+    return {"ready": ready, "failed": failed, "states": normalized}
+
+
 def wait_for_video_and_thumbnails(video_id, page_token):
     snapshots = []
 
-    for delay in (10, 15, 30, 45, 60, 60):
+    for delay in (5, 10, 15, 30, 45, 60, 60):
         time.sleep(delay)
 
         node = get_node(
@@ -491,17 +667,34 @@ def wait_for_video_and_thumbnails(video_id, page_token):
         except MetaError as e:
             thumbs = [{"_error": str(e)}]
 
-        snapshots.append({"video": node, "thumbnails": thumbs})
+        readiness = video_ready_state(node)
+        snapshots.append({
+            "video": node,
+            "readiness": readiness,
+            "thumbnails": thumbs,
+        })
 
         real_thumbs = [
             x for x in thumbs
             if isinstance(x, dict) and x.get("id") and x.get("uri")
         ]
 
-        if real_thumbs:
+        if readiness["failed"]:
+            raise RuntimeError(
+                "NEW Page video processing failed: "
+                + json.dumps(snapshots[-1], ensure_ascii=False)[:1800]
+            )
+
+        # Some Page videos expose post_id before the nested status reaches a
+        # stable `ready` spelling. Either signal plus real thumbnails is enough
+        # to continue to the explicit thumbnail write.
+        if real_thumbs and (readiness["ready"] or node.get("post_id")):
             return node, real_thumbs, snapshots
 
-    raise RuntimeError("Timed out waiting for NEW Page video thumbnails")
+    raise RuntimeError(
+        "Timed out waiting for NEW Page video readiness + thumbnails: "
+        + json.dumps(snapshots[-1] if snapshots else {}, ensure_ascii=False)[:1800]
+    )
 
 
 def choose_thumbnail(thumbs):
@@ -518,37 +711,80 @@ def choose_thumbnail(thumbs):
     }
 
 
-def set_preferred_thumbnail(video_id, thumb, page_token):
-    response = graph_request(
-        "POST",
-        video_id,
-        {"preferred_thumbnail_id": thumb["id"]},
-        token=page_token,
-        stage="set_preferred_thumbnail",
+def upload_selected_frame_as_preferred(video_id, thumb, page_token, thumbs_before):
+    """
+    Public API thumbnail write:
+    download one generated frame, then upload the image bytes to
+    /{video_id}/thumbnails with is_preferred=true.
+
+    This does not depend on Ads Manager draft-only fields such as
+    video_thumbnail_id/video_thumbnail_source.
+    """
+    image_bytes, content_type = download_binary(
+        thumb["uri"],
+        stage="download_generated_thumbnail",
     )
+    if not image_bytes:
+        raise RuntimeError("Generated thumbnail download returned an empty file")
 
-    time.sleep(5)
-
-    thumbs_after = graph_get_all(
+    response = graph_multipart(
         f"{video_id}/thumbnails",
-        {
-            "fields": "id,uri,is_preferred,width,height,scale",
-            "limit": 50,
-        },
+        {"is_preferred": True},
+        "source",
+        f"generated-frame-{thumb['id']}.jpg",
+        image_bytes,
+        content_type if content_type.startswith("image/") else "image/jpeg",
         token=page_token,
-        stage="verify_preferred_thumbnail",
+        stage="upload_preferred_thumbnail",
     )
 
-    selected_after = next(
-        (x for x in thumbs_after if str(x.get("id")) == str(thumb["id"])),
-        None,
-    )
+    before_ids = {str(x.get("id")) for x in thumbs_before if x.get("id")}
+    verification_snapshots = []
+
+    for delay in (3, 7, 15):
+        time.sleep(delay)
+        thumbs_after = graph_get_all(
+            f"{video_id}/thumbnails",
+            {
+                "fields": "id,uri,is_preferred,width,height,scale",
+                "limit": 50,
+            },
+            token=page_token,
+            stage="verify_uploaded_preferred_thumbnail",
+        )
+        preferred_after = next(
+            (x for x in thumbs_after if x.get("is_preferred")),
+            None,
+        )
+        new_ids = [
+            str(x.get("id"))
+            for x in thumbs_after
+            if x.get("id") and str(x.get("id")) not in before_ids
+        ]
+        verification_snapshots.append({
+            "preferred": preferred_after,
+            "new_thumbnail_ids": new_ids,
+            "all": thumbs_after,
+        })
+        if preferred_after:
+            return {
+                "post_response": response,
+                "uploaded_bytes": len(image_bytes),
+                "uploaded_content_type": content_type,
+                "preferred_after": True,
+                "preferred_thumbnail_after": preferred_after,
+                "new_thumbnail_ids": new_ids,
+                "verification_snapshots": verification_snapshots,
+            }
 
     return {
         "post_response": response,
-        "selected_after": selected_after,
-        "preferred_after": bool(selected_after and selected_after.get("is_preferred")),
-        "all_after": thumbs_after,
+        "uploaded_bytes": len(image_bytes),
+        "uploaded_content_type": content_type,
+        "preferred_after": False,
+        "preferred_thumbnail_after": None,
+        "new_thumbnail_ids": [],
+        "verification_snapshots": verification_snapshots,
     }
 
 
@@ -701,7 +937,9 @@ def run():
 
     page_access = resolve_page_token(source["page_id"])
 
-    source_video = read_source_video_with_url(source)
+    source_video = resolve_source_video(source, page_access)
+    PARTIAL["page_token_source"] = page_access["source"]
+    PARTIAL["source_video_resolution"] = redacted_source_video_resolution(source_video)
 
     # 1. NEW unpublished Page video.
     new_page_video_id, page_video_payload, page_video_response = create_new_page_video(
@@ -718,15 +956,16 @@ def run():
 
     # 3. Explicitly select preferred thumbnail on the NEW Page video.
     chosen_thumb = choose_thumbnail(thumbs)
-    thumb_update = set_preferred_thumbnail(
+    thumb_update = upload_selected_frame_as_preferred(
         new_page_video_id,
         chosen_thumb,
         page_access["token"],
+        thumbs,
     )
 
     if not thumb_update["preferred_after"]:
         raise RuntimeError(
-            "preferred_thumbnail_id was sent, but verification says selected thumbnail is not preferred"
+            "Thumbnail image upload returned, but no preferred thumbnail was visible afterward"
         )
 
     # 4. Wait for real Page post id.
@@ -742,7 +981,7 @@ def run():
     PARTIAL["object_story_id"] = object_story_id
 
     # 5. Only now duplicate the AdSet.
-    suffix = f" [PYTEST-V26 {datetime.now(POLAND_TZ).strftime('%Y%m%d-%H%M%S')}]"
+    suffix = f" [PYTEST-V26.2 {datetime.now(POLAND_TZ).strftime('%Y%m%d-%H%M%S')}]"
     copied_adset_id = copy_adset(source["adset"], suffix)
 
     # 6. NEW Creative from already-prepared Page post.
@@ -781,8 +1020,8 @@ def run():
     failed = final_ad.get("failed_delivery_checks") or []
 
     result = {
-        "version": "v26.1",
-        "mode": "PAGE_VIDEO_REUSE_TO_OBJECT_STORY_ID",
+        "version": "v26.2",
+        "mode": "PAGE_VIDEO_REUPLOAD_PUBLIC_THUMBNAIL_TO_OBJECT_STORY_ID",
         "source_adset_id": TEST_ADSET_ID,
         "account_id": source["adset"]["account_id"],
         "page_id": source["page_id"],
@@ -793,7 +1032,7 @@ def run():
         "source_creative_id": source["creative"]["id"],
         "source_root_video_id": source["root_video_id"],
         "source_story_video_id": source["story_video_id"],
-        "source_video_resolution": source_video,
+        "source_video_resolution": redacted_source_video_resolution(source_video),
 
         "new_page_video_id": new_page_video_id,
         "page_video_create_payload": {
@@ -801,6 +1040,11 @@ def run():
             **(
                 {"file_url": "<REDACTED_SOURCE_URL>"}
                 if page_video_payload.get("file_url")
+                else {}
+            ),
+            **(
+                {"source": "<BINARY_MP4>"}
+                if source_video.get("mode") == "local_binary_upload"
                 else {}
             ),
         },
@@ -830,6 +1074,7 @@ def run():
 
         "issues": issues,
         "failed_delivery_checks": failed,
+        "cta_url_preservation_tested": False,
         "publish_probe_ok": (
             not issues
             and not failed
@@ -842,7 +1087,7 @@ def run():
 
 def summary(result):
     lines = [
-        "🧪 <b>Duplicate test v26.1 • VIDEO REUSE → OBJECT_STORY_ID</b>",
+        "🧪 <b>Duplicate test v26.2 • RE-UPLOAD + PUBLIC THUMBNAIL</b>",
         f"Account: <code>{esc(result['account_id'])}</code>",
         f"Page: <code>{esc(result['page_id'])}</code>",
         f"Page token source: {esc(result['page_token_source'])}",
@@ -852,11 +1097,13 @@ def summary(result):
         f"Source Creative: <code>{esc(result['source_creative_id'])}</code>",
         f"Source root video: <code>{esc(result['source_root_video_id'])}</code>",
         f"Source story video: <code>{esc(result['source_story_video_id'])}</code>",
-        f"Page video source mode: <b>{esc((result.get('source_video_resolution') or {}).get('mode'))}</b>",
+        f"Page video input mode: <b>{esc((result.get('source_video_resolution') or {}).get('mode'))}</b>",
         "",
         f"NEW Page Video: <code>{esc(result['new_page_video_id'])}</code> ✅",
-        f"Preferred thumbnail: <code>{esc(result['chosen_thumbnail']['id'])}</code>",
-        f"Preferred verified: {'✅ YES' if result['thumbnail_update']['preferred_after'] else '❌ NO'}",
+        f"Generated frame selected: <code>{esc(result['chosen_thumbnail']['id'])}</code>",
+        f"Frame uploaded to /thumbnails: {esc(result['thumbnail_update']['uploaded_bytes'])} bytes",
+        f"Preferred thumbnail verified: {'✅ YES' if result['thumbnail_update']['preferred_after'] else '❌ NO'}",
+        f"Preferred after: <code>{esc((result['thumbnail_update'].get('preferred_thumbnail_after') or {}).get('id'))}</code>",
         f"Object Story ID: <code>{esc(result['object_story_id'])}</code>",
         "",
         f"Copy Adset: <code>{esc(result['copied_adset_id'])}</code>",
@@ -869,7 +1116,8 @@ def summary(result):
         f"Post-processing issues: {len(result['issues'])}",
         f"Failed delivery checks: {len(result['failed_delivery_checks'])}",
         "",
-        f"Publish probe v26.1: {'✅ PASS' if result['publish_probe_ok'] else '❌ FAIL'}",
+        f"Publish probe v26.2: {'✅ PASS' if result['publish_probe_ok'] else '❌ FAIL'}",
+        "CTA/URL fidelity: not tested in this isolated processing probe",
     ]
 
     if result["issues"]:
@@ -884,7 +1132,7 @@ def summary(result):
 def error_message(exc):
     stage = getattr(exc, "stage", None)
     return (
-        "❌ <b>Duplicate test v26 error</b>\n"
+        "❌ <b>Duplicate test v26.2 error</b>\n"
         f"Source Adset: <code>{esc(TEST_ADSET_ID)}</code>\n"
         f"Stage: <b>{esc(stage or 'python')}</b>\n"
         f"Partial: {esc(json.dumps(PARTIAL, ensure_ascii=False)[:1800])}\n"
@@ -894,8 +1142,8 @@ def error_message(exc):
 
 def main():
     report = {
-        "version": "v26.1",
-        "mode": "PAGE_VIDEO_REUSE_TO_OBJECT_STORY_ID",
+        "version": "v26.2",
+        "mode": "PAGE_VIDEO_REUPLOAD_PUBLIC_THUMBNAIL_TO_OBJECT_STORY_ID",
         "source_adset_id": TEST_ADSET_ID,
         "result": None,
         "error": None,
