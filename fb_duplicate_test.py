@@ -14,8 +14,8 @@ from datetime import datetime
 from fb_config import POLAND_TZ
 
 API_VER = "v26.0"
-TEST_VERSION = "v26.6.1"
-BUILD_ID = "2026-08-12-native-ad-copies-sanitized-enhancements-r1"
+TEST_VERSION = "v26.7-stable"
+BUILD_ID = "2026-08-12-stable-object-story-spec-manual-thumbnail-r1"
 
 ACCESS_TOKEN = os.environ.get("FB_SCALER_ACCESS_TOKEN")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -24,7 +24,7 @@ TEST_ADSET_ID = (os.environ.get("TEST_ADSET_ID") or "").strip()
 TEST_VIDEO_FILE_URL = (os.environ.get("TEST_VIDEO_FILE_URL") or "").strip()
 TEST_VIDEO_FILE_PATH = (os.environ.get("TEST_VIDEO_FILE_PATH") or "").strip()
 
-REPORT_FILE = "duplicate_test_v26_6_1_sanitized_enhancements_report.json"
+REPORT_FILE = "duplicate_test_v26_7_stable_report.json"
 
 REQUIRED_PAGE_VIDEO_PERMISSIONS = {
     "pages_manage_posts",
@@ -53,14 +53,8 @@ CREATIVE_FIELDS = [
     "id", "name", "account_id", "status",
     "object_story_id", "effective_object_story_id",
     "object_story_spec", "url_tags", "thumbnail_url", "video_id",
-    "contextual_multi_ads", "degrees_of_freedom_spec",
+    "contextual_multi_ads",
 ]
-
-VIDEO_STANDARD_ENHANCEMENT_FEATURES = (
-    "video_auto_crop",
-    "text_optimizations",
-    "inline_comment",
-)
 
 VIDEO_FIELDS = [
     "id", "created_time", "updated_time", "length",
@@ -473,7 +467,7 @@ def get_source_objects(adset_id):
 
 def resolve_source_video(source, page_access):
     """
-    v26.5.2: inspect BOTH source video ids with BOTH available token contexts.
+    v26.7 stable: inspect BOTH source video ids with BOTH available token contexts.
 
     Priority:
     1) explicit local MP4 path (developer console/local run);
@@ -778,99 +772,6 @@ def copy_adset(source_adset, suffix):
     return copied_id
 
 
-def build_native_copy_creative_parameters(source_creative):
-    """
-    Replace the deprecated standard_enhancements bundle with the individual
-    features Meta documents for single-video ads.
-
-    The Ad Copies endpoint receives only degrees_of_freedom_spec. It still
-    performs the native media/post copy, so no thumbnail or story identifier
-    is supplied by this script.
-    """
-    source_dof = deepcopy(source_creative.get("degrees_of_freedom_spec") or {})
-    source_features = source_dof.get("creative_features_spec")
-    if not isinstance(source_features, dict):
-        raise DiagnosticError(
-            "prepare_native_copy_creative_parameters",
-            "Source Creative did not expose degrees_of_freedom_spec."
-        )
-
-    sanitized_dof = deepcopy(source_dof)
-    sanitized_features = sanitized_dof.setdefault("creative_features_spec", {})
-    legacy_bundle = sanitized_features.pop("standard_enhancements", None)
-    if not isinstance(legacy_bundle, dict):
-        raise DiagnosticError(
-            "prepare_native_copy_creative_parameters",
-            "Source Creative did not expose standard_enhancements in "
-            "degrees_of_freedom_spec; refusing to guess its enrollment state."
-        )
-
-    enroll_status = legacy_bundle.get("enroll_status")
-    if enroll_status not in ("OPT_IN", "OPT_OUT"):
-        raise DiagnosticError(
-            "prepare_native_copy_creative_parameters",
-            "standard_enhancements has no supported OPT_IN/OPT_OUT status: "
-            + json.dumps(legacy_bundle, ensure_ascii=False)
-        )
-
-    translated_features = []
-    preserved_features = []
-    for feature_name in VIDEO_STANDARD_ENHANCEMENT_FEATURES:
-        if feature_name in sanitized_features:
-            preserved_features.append(feature_name)
-            continue
-        sanitized_features[feature_name] = {"enroll_status": enroll_status}
-        translated_features.append(feature_name)
-
-    migration = {
-        "source_degrees_of_freedom_spec": source_dof,
-        "removed_standard_enhancements": legacy_bundle,
-        "legacy_enroll_status": enroll_status,
-        "translated_video_features": translated_features,
-        "preserved_existing_individual_features": preserved_features,
-        "sanitized_degrees_of_freedom_spec": sanitized_dof,
-    }
-    PARTIAL["creative_parameters_migration"] = migration
-
-    return {"degrees_of_freedom_spec": sanitized_dof}, migration
-
-
-def copy_ad_natively(source_ad, source_creative, copied_adset_id, suffix):
-    """Use Meta's native Ad Copies API with only a sanitized enhancement spec."""
-    creative_parameters, migration = build_native_copy_creative_parameters(
-        source_creative
-    )
-    request_payload = {
-        "adset_id": copied_adset_id,
-        "status_option": "PAUSED",
-        "creative_parameters": creative_parameters,
-    }
-    response = graph_request(
-        "POST",
-        f"{source_ad['id']}/copies",
-        request_payload,
-        stage="copy_ad_via_native_copies_edge",
-    )
-
-    copied_ad_id = str(response.get("copied_ad_id") or response.get("id") or "")
-    if not copied_ad_id:
-        raise RuntimeError(f"No copied ad id: {response}")
-
-    PARTIAL["new_ad_id"] = copied_ad_id
-
-    graph_request(
-        "POST",
-        copied_ad_id,
-        {
-            "name": f"{clean_copy_suffixes(source_ad.get('name'))}{suffix}",
-            "status": "PAUSED",
-        },
-        stage="rename_native_copied_ad",
-    )
-
-    return copied_ad_id, request_payload, response, migration
-
-
 def select_meta_generated_thumbnail(thumbnails):
     """Choose one frame generated by Meta; never upload or mark a custom frame."""
     real = [
@@ -981,10 +882,9 @@ def compare_fields(source, copied, fields):
 
 def compare_adset_fidelity(source_adset, copied_adset):
     """
-    Keep the raw API difference visible, but treat the one UI-verified
-    /copies readback normalization seen in v26.4/v26.5.2 as non-blocking:
-    source targeting_automation.individual_setting is omitted on the copy
-    while every other targeting value remains identical.
+    Keep raw API differences visible, but treat the UI-verified /copies
+    readback normalization as non-blocking when the copy omits only
+    targeting_automation.individual_setting={age: 1, gender: 1}.
     """
     raw = compare_fields(source_adset, copied_adset, ADSET_FIDELITY_FIELDS)
     effective = deepcopy(raw)
@@ -1146,27 +1046,88 @@ def run():
 
     diag = api_identity()
     send_identity(diag)
+
+    missing_page_video_permissions = sorted(
+        REQUIRED_PAGE_VIDEO_PERMISSIONS - set(diag.get("granted") or [])
+    )
+    PARTIAL["required_page_video_permissions"] = sorted(
+        REQUIRED_PAGE_VIDEO_PERMISSIONS
+    )
+    PARTIAL["missing_page_video_permissions"] = missing_page_video_permissions
+    if missing_page_video_permissions:
+        raise DiagnosticError(
+            "preflight_page_video_permissions",
+            "Missing permission(s) required by POST /{PAGE_ID}/videos: "
+            + ", ".join(missing_page_video_permissions)
+            + ". Add them to the for_scaler system-user token and rerun.",
+        )
+
     source = get_source_objects(TEST_ADSET_ID)
 
-    # 1. Duplicate the AdSet in the same campaign.
-    suffix = f" [PYTEST-V26.6.1 {datetime.now(POLAND_TZ).strftime('%Y%m%d-%H%M%S')}]"
+    page_access = resolve_page_token(source["page_id"])
+    CLEANUP_CONTEXT["page_token"] = page_access["token"]
+    page_tasks = [str(x).upper() for x in (page_access.get("tasks") or [])]
+    PARTIAL["page_token_source"] = page_access["source"]
+    PARTIAL["page_tasks"] = page_tasks
+    if page_tasks and "CREATE_CONTENT" not in page_tasks:
+        raise DiagnosticError(
+            "preflight_page_create_content_task",
+            "The Page assignment returned tasks but does not include "
+            "CREATE_CONTENT. Assign the Create content task for this Page "
+            "to the for_scaler system user and rerun.",
+        )
+
+    source_video = resolve_source_video(source, page_access)
+    PARTIAL["source_video_resolution"] = redacted_source_video_resolution(source_video)
+
+    # 1. NEW unpublished Page video.
+    new_page_video_id, page_video_payload, page_video_response = create_new_page_video(
+        source,
+        source_video,
+        page_access,
+    )
+
+    # 2. Wait until Meta has processed the video and generated thumbnail
+    # candidates. Do not upload a custom thumbnail or change is_preferred.
+    new_video_node, thumbs, video_poll = wait_for_video_and_thumbnails(
+        new_page_video_id,
+        page_access["token"],
+    )
+
+    # 3. Select one of Meta's own generated frames. The API requires an
+    # image_url/image_hash for the fresh Creative even when no custom image is
+    # uploaded.
+    selected_thumbnail = select_meta_generated_thumbnail(thumbs)
+    PARTIAL["selected_meta_generated_thumbnail"] = selected_thumbnail
+
+    # 4. Duplicate the AdSet only after the media is ready.
+    suffix = f" [PYTEST-V26.7-STABLE {datetime.now(POLAND_TZ).strftime('%Y%m%d-%H%M%S')}]"
     copied_adset_id = copy_adset(source["adset"], suffix)
 
-    # 2. Duplicate the Ad through Meta's native /{ad_id}/copies endpoint.
-    # Only a sanitized degrees_of_freedom_spec is supplied to migrate the
-    # deprecated standard_enhancements bundle to individual video features.
-    # object_story_id, image_url and image_hash are never supplied.
-    (
-        new_ad_id,
-        native_copy_payload,
-        native_copy_response,
-        creative_parameters_migration,
-    ) = copy_ad_natively(
-        source["ad"],
-        source["creative"],
-        copied_adset_id,
+    # 5. Create a NEW ad creative from object_story_spec. Never pass the Page
+    # video's post_id/object_story_id: doing so would select an existing post.
+    # Supply only the Meta-generated thumbnail URI required by the API.
+    new_creative_id, creative_payload = create_creative_from_new_story_spec(
+        source,
+        new_page_video_id,
+        selected_thumbnail["uri"],
         suffix,
     )
+
+    new_creative = get_node(
+        new_creative_id,
+        CREATIVE_FIELDS,
+        stage="audit_new_creative",
+    )
+
+    # 6. Create a NEW PAUSED Ad inside the NEW AdSet.
+    new_ad_id, ad_payload = create_ad(
+        source,
+        copied_adset_id,
+        new_creative_id,
+        suffix,
+    )
+
     final_ad, ad_poll = poll_ad(new_ad_id)
 
     copied_adset = get_node(
@@ -1175,37 +1136,25 @@ def run():
         stage="audit_copied_adset",
     )
 
-    copied_creative_id = str((final_ad.get("creative") or {}).get("id") or "")
-    if not copied_creative_id:
-        raise RuntimeError("Native copied Ad has no creative id")
-    copied_creative = get_node(
-        copied_creative_id,
-        CREATIVE_FIELDS,
-        stage="audit_native_copied_creative",
-    )
-
     source_pixel = (source["adset"].get("promoted_object") or {}).get("pixel_id")
     copy_pixel = (copied_adset.get("promoted_object") or {}).get("pixel_id")
 
-    adset_raw_differences, adset_effective_differences, adset_warnings = compare_adset_fidelity(
-        source["adset"],
-        copied_adset,
-    )
-    creative_differences = compare_fields(
-        source["creative"],
-        copied_creative,
-        ["object_story_spec", "url_tags", "video_id", "contextual_multi_ads"],
-    )
-    ad_delivery_differences = compare_fields(
-        source["ad"],
-        final_ad,
-        ["tracking_specs", "conversion_specs", "conversion_domain"],
+    (
+        adset_raw_differences,
+        adset_effective_differences,
+        adset_normalization_warnings,
+    ) = compare_adset_fidelity(source["adset"], copied_adset)
+    creative_fidelity = audit_creative_fidelity(
+        source,
+        new_creative,
+        new_page_video_id,
     )
     ad_structure = {
         "new_ad_id_differs_from_source": str(new_ad_id) != str(source["ad"]["id"]),
+        "new_creative_id_differs_from_source": str(new_creative_id) != str(source["creative"]["id"]),
         "new_adset_id_differs_from_source": str(copied_adset_id) != str(source["adset"]["id"]),
         "new_ad_inside_new_adset": str(final_ad.get("adset_id") or "") == str(copied_adset_id),
-        "copied_ad_has_creative": bool(copied_creative_id),
+        "new_ad_uses_new_creative": str((final_ad.get("creative") or {}).get("id") or "") == str(new_creative_id),
     }
 
     issues = final_ad.get("issues_info") or []
@@ -1214,45 +1163,52 @@ def run():
     result = {
         "version": TEST_VERSION,
         "build_id": BUILD_ID,
-        "mode": "NATIVE_AD_COPIES_API_SANITIZED_ENHANCEMENTS",
+        "mode": "STABLE_OBJECT_STORY_SPEC_MANUAL_THUMBNAIL",
         "source_adset_id": TEST_ADSET_ID,
         "account_id": source["adset"]["account_id"],
         "page_id": source["page_id"],
+        "page_token_source": page_access["source"],
+        "page_tasks": page_access.get("tasks"),
 
         "source_ad_id": source["ad"]["id"],
         "source_creative_id": source["creative"]["id"],
         "source_root_video_id": source["root_video_id"],
         "source_story_video_id": source["story_video_id"],
+        "source_video_resolution": redacted_source_video_resolution(source_video),
+
+        "new_page_video_id": new_page_video_id,
+        "page_video_create_payload": {
+            **page_video_payload,
+            "source": "<BINARY_MP4>",
+        },
+        "page_video_create_response": page_video_response,
+        "video_poll": video_poll,
+
+        "thumbnail_strategy": "META_GENERATED_FRAME_EXPLICIT_IMAGE_URL",
+        "ads_manager_thumbnail_label_expected": "MANUAL_CONFIRMED",
+        "generated_thumbnails_observed": len(thumbs),
+        "thumbnail_write_performed": False,
+        "selected_meta_generated_thumbnail": selected_thumbnail,
+        "creative_image_url_required_and_passed": True,
+        "video_upload_post_id": new_video_node.get("post_id"),
+        "video_upload_post_was_not_passed_to_creative": True,
 
         "copied_adset_id": copied_adset_id,
+        "new_creative_id": new_creative_id,
+        "new_creative": new_creative,
         "new_ad_id": new_ad_id,
-        "copied_creative_id": copied_creative_id,
-        "creative_reused_by_meta": copied_creative_id == str(source["creative"]["id"]),
-        "copied_creative": copied_creative,
         "final_ad": final_ad,
         "ad_poll": ad_poll,
 
-        "native_ad_copy_payload": native_copy_payload,
-        "native_ad_copy_response": native_copy_response,
-        "creative_parameters_passed": True,
-        "creative_parameters_scope": "DEGREES_OF_FREEDOM_SPEC_ONLY",
-        "creative_parameters_migration": creative_parameters_migration,
-        "standard_enhancements_passed": False,
-        "source_degrees_of_freedom_spec": source["creative"].get("degrees_of_freedom_spec"),
-        "copied_degrees_of_freedom_spec": copied_creative.get("degrees_of_freedom_spec"),
-        "object_story_id_passed": False,
-        "thumbnail_fields_passed": False,
-        "ads_manager_thumbnail_label_expected": "VERIFY_AUTO_ON_SCREEN",
+        "creative_payload": creative_payload,
+        "ad_payload": ad_payload,
 
         "adset_fidelity_fields": ADSET_FIDELITY_FIELDS,
         "adset_raw_differences": adset_raw_differences,
-        "adset_effective_differences": adset_effective_differences,
-        "adset_normalization_warnings": adset_warnings,
+        "adset_differences": adset_effective_differences,
+        "adset_normalization_warnings": adset_normalization_warnings,
         "adset_fidelity_match": not adset_effective_differences,
-        "creative_differences": creative_differences,
-        "creative_fidelity_match": not creative_differences,
-        "ad_delivery_differences": ad_delivery_differences,
-        "ad_delivery_fidelity_match": not ad_delivery_differences,
+        "creative_fidelity": creative_fidelity,
         "ad_structure": ad_structure,
 
         "pixel_source": source_pixel,
@@ -1265,8 +1221,12 @@ def run():
         "true_duplicate_ok": (
             not adset_effective_differences
             and all(ad_structure.values())
-            and not creative_differences
-            and not ad_delivery_differences
+            and creative_fidelity["new_object_story_spec_present"]
+            and creative_fidelity["new_video_data_present"]
+            and creative_fidelity["text_cta_match"]
+            and creative_fidelity["page_id_match"]
+            and creative_fidelity["instagram_actor_id_match"]
+            and creative_fidelity["new_video_id_match"]
             and source_pixel == copy_pixel
         ),
         "publish_probe_ok": (
@@ -1275,8 +1235,8 @@ def run():
             and source_pixel == copy_pixel
             and not adset_effective_differences
             and all(ad_structure.values())
-            and not creative_differences
-            and not ad_delivery_differences
+            and creative_fidelity["text_cta_match"]
+            and creative_fidelity["new_video_id_match"]
         ),
     }
 
@@ -1285,42 +1245,45 @@ def run():
 
 def summary(result):
     lines = [
-        "🧪 <b>Duplicate test v26.6.1 • NATIVE COPY + ENHANCEMENT MIGRATION</b>",
+        "🧪 <b>Duplicate test v26.7 stable • TRUE ADSET + AD DUPLICATE</b>",
         f"Build: <code>{esc(BUILD_ID)}</code>",
         f"Account: <code>{esc(result['account_id'])}</code>",
         f"Page: <code>{esc(result['page_id'])}</code>",
+        f"Page token source: {esc(result['page_token_source'])}",
         "",
         f"Source Adset: <code>{esc(result['source_adset_id'])}</code>",
         f"Source Ad: <code>{esc(result['source_ad_id'])}</code>",
         f"Source Creative: <code>{esc(result['source_creative_id'])}</code>",
         f"Source root video: <code>{esc(result['source_root_video_id'])}</code>",
         f"Source story video: <code>{esc(result['source_story_video_id'])}</code>",
+        f"Page video input mode: <b>{esc((result.get('source_video_resolution') or {}).get('mode'))}</b>",
+        "",
+        f"NEW Page Video: <code>{esc(result['new_page_video_id'])}</code> ✅",
+        "Thumbnail strategy: <b>META-GENERATED FRAME</b>",
+        f"Generated thumbnail candidates observed: <code>{esc(result['generated_thumbnails_observed'])}</code>",
+        "Custom thumbnail upload: <b>NO</b>",
+        "Preferred thumbnail write: <b>NO</b>",
+        "Required Creative image_url: <b>YES — Meta-generated frame</b>",
+        "Ads Manager thumbnail label: <b>MANUAL — KNOWN LIMITATION</b>",
+        "Creative request mode: <b>object_story_spec (CREATE AD)</b>",
+        "Existing post ID passed to Creative: <b>NO</b>",
         "",
         f"Copy Adset: <code>{esc(result['copied_adset_id'])}</code>",
+        f"NEW Creative: <code>{esc(result['new_creative_id'])}</code>",
+        f"Creative root video_id: <code>{esc(result['new_creative'].get('video_id'))}</code>",
         f"NEW Ad: <code>{esc(result['new_ad_id'])}</code> (PAUSED)",
-        f"Copied Creative: <code>{esc(result['copied_creative_id'])}</code>",
-        "Creative relationship: "
-        f"<b>{'REUSED BY META' if result['creative_reused_by_meta'] else 'NEW CREATIVE FROM NATIVE COPY'}</b>",
         f"Ad inside NEW Adset: {'✅' if result['ad_structure']['new_ad_inside_new_adset'] else '❌'}",
-        f"New Ad ID: {'✅' if result['ad_structure']['new_ad_id_differs_from_source'] else '❌'}",
-        "Ad copy endpoint: <b>POST /{source_ad_id}/copies</b>",
-        "Creative parameters passed: <b>YES — degrees_of_freedom_spec only</b>",
-        "Deprecated standard_enhancements passed: <b>NO</b>",
-        "Individual video features: <b>video_auto_crop, text_optimizations, inline_comment</b>",
-        "object_story_id passed: <b>NO</b>",
-        "image_url/image_hash passed: <b>NO</b>",
-        "Ads Manager thumbnail label: <b>VERIFY AUTO ON SCREEN</b>",
+        f"Ad uses NEW Creative: {'✅' if result['ad_structure']['new_ad_uses_new_creative'] else '❌'}",
         "",
         f"Adset settings fidelity: {'✅' if result['adset_fidelity_match'] else '❌'}",
-        f"Creative fidelity: {'✅' if result['creative_fidelity_match'] else '❌'}",
-        f"Tracking + conversion fidelity: {'✅' if result['ad_delivery_fidelity_match'] else '❌'}",
+        f"Text + CTA + URL fidelity: {'✅' if result['creative_fidelity']['text_cta_match'] else '❌'}",
         f"Pixel: {esc(result['pixel_source'])} → {esc(result['pixel_copy'])} "
         f"{'✅' if result['pixel_match'] else '❌'}",
         f"Post-processing issues: {len(result['issues'])}",
         f"Failed delivery checks: {len(result['failed_delivery_checks'])}",
         "",
-        f"Native duplicate v26.6.1: {'✅ PASS' if result['true_duplicate_ok'] else '❌ FAIL'}",
-        f"Publish probe v26.6.1: {'✅ PASS' if result['publish_probe_ok'] else '❌ FAIL'}",
+        f"True duplicate v26.7 stable: {'✅ PASS' if result['true_duplicate_ok'] else '❌ FAIL'}",
+        f"Publish probe v26.7 stable: {'✅ PASS' if result['publish_probe_ok'] else '❌ FAIL'}",
     ]
 
     if result["issues"]:
@@ -1329,28 +1292,28 @@ def summary(result):
             + esc(json.dumps(result["issues"], ensure_ascii=False)[:1200])
         )
 
-    if result["adset_raw_differences"]:
+    if result["adset_differences"]:
         lines.append(
-            "Adset raw differences: "
-            + esc(json.dumps(result["adset_raw_differences"], ensure_ascii=False)[:1200])
+            "Blocking Adset differences: "
+            + esc(json.dumps(result["adset_differences"], ensure_ascii=False)[:1200])
         )
 
     if result["adset_normalization_warnings"]:
         lines.append(
             "Adset normalization warning: "
-            + esc(json.dumps(result["adset_normalization_warnings"], ensure_ascii=False)[:1200])
+            + esc(json.dumps(
+                result["adset_normalization_warnings"],
+                ensure_ascii=False,
+            )[:1200])
         )
 
-    if result["creative_differences"]:
+    if result["creative_fidelity"]["text_cta_differences"]:
         lines.append(
             "Creative differences: "
-            + esc(json.dumps(result["creative_differences"], ensure_ascii=False)[:1200])
-        )
-
-    if result["ad_delivery_differences"]:
-        lines.append(
-            "Ad delivery differences: "
-            + esc(json.dumps(result["ad_delivery_differences"], ensure_ascii=False)[:1200])
+            + esc(json.dumps(
+                result["creative_fidelity"]["text_cta_differences"],
+                ensure_ascii=False,
+            )[:1200])
         )
 
     return "\n".join(lines)
@@ -1359,7 +1322,7 @@ def summary(result):
 def error_message(exc):
     stage = getattr(exc, "stage", None)
     return (
-        "❌ <b>Duplicate test v26.6.1 error</b>\n"
+        "❌ <b>Duplicate test v26.7 stable error</b>\n"
         f"Build: <code>{esc(BUILD_ID)}</code>\n"
         f"Source Adset: <code>{esc(TEST_ADSET_ID)}</code>\n"
         f"Stage: <b>{esc(stage or 'python')}</b>\n"
@@ -1372,7 +1335,7 @@ def main():
     report = {
         "version": TEST_VERSION,
         "build_id": BUILD_ID,
-        "mode": "NATIVE_AD_COPIES_API",
+        "mode": "STABLE_OBJECT_STORY_SPEC_MANUAL_THUMBNAIL",
         "source_adset_id": TEST_ADSET_ID,
         "result": None,
         "error": None,
@@ -1406,3 +1369,4 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
