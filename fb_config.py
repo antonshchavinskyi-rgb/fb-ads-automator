@@ -32,13 +32,32 @@ CURRENCY_SYMBOLS = {
     'PLN': 'zł',
 }
 
-# Затверджені стартові параметри (поки Scaler не реалізований — зберігаємо як source of truth)
+# Затверджені бізнес-параметри запуску та Scaler
 COST_GOAL_FACTOR = 0.85
 BID_CAP_FACTOR = 2.20
 DAILY_BUDGET_FACTOR = 1.70
 SCALER_CAMPAIGN_CAP = 50
 SCALER_ACCOUNT_CAP = 150
+SCALER_COST_GOAL_DUPLICATE_MULTIPLIER = 1.00
 SCALER_BID_DUPLICATE_MULTIPLIER = 0.50
+SCALER_SOURCE_ONE_LEAD_CPL_FACTOR = 0.70
+SCALER_SOURCE_MAX_CPL_FACTOR = 0.90
+SCALER_SOURCE_TIERS = (
+    (0.60, 18),
+    (0.75, 15),
+    (0.90, 12),
+)
+SCALER_OFFER_TIERS = (
+    (0.90, 1.00, False),
+    (0.95, 0.75, False),
+    (1.00, 0.50, False),
+    (1.10, 0.50, True),
+)
+SCALER_BID_JITTER_MIN = 0.005
+SCALER_BID_JITTER_MAX = 0.010
+SCALER_START_HOUR = 5
+SCALER_START_MINUTE_FROM = 35
+SCALER_START_MINUTE_TO = 55
 
 # fb_manager.py
 MANAGER_NO_LEAD_FACTOR = 0.60
@@ -147,4 +166,3 @@ def parse_campaign_name(campaign_name: str) -> dict:
         'reason': '',
         'tokens': parts,
     }
-

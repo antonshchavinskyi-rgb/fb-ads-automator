@@ -258,16 +258,49 @@ Ad Copies API.
 `targeting_automation.individual_setting={age: 1, gender: 1}` у readback
 класифікується як warning і не робить бізнес-тест хибно негативним.
 
+Фактичний контрольний запуск користувач підтвердив як успішний. Отже,
+`v26.7-stable` зафіксовано як робочу технічну базу Scaler із прийнятим
+обмеженням мініатюри `Вручну`.
+
+### fb_scaler.py v1.0-test — планування та один PAUSED-дубль
+
+Перший Scaler-етап навмисно не має production-активації.
+
+- `plan` аналізує сьогодні + вчора, агрегує offer_id між усіма налаштованими
+  акаунтами з нормалізацією USD/PLN і не виконує жодного запису в Meta;
+- застосовуються source-пороги, шкала `12/15/18`, lead caps, offer
+  multipliers, Cost Goal/Bid Cap multipliers і caps `50/150`;
+- `ктг` повністю виключено;
+- пріоритет caps: більше лідів, потім нижчий `CPL/BE`;
+- фактична bid strategy береться з API, а маркер `кос/бід` виправляється лише
+  в імені нового дубля;
+- дробова кількість після множників округлюється вниз, щоб не перевищувати
+  затверджений множник;
+- production marker: дата + source AdSet ID + sequence;
+- jitter ставки детермінований у межах ±0,5–1%;
+- start_time детерміновано потрапляє у вікно 05:35–05:55 наступного дня за
+  Europe/Warsaw;
+- `test_one_paused` потребує явного source AdSet і контрольної фрази, створює
+  максимум один дубль та залишає нові AdSet і Ad у `PAUSED`;
+- цей тест перевіряє readback `start_time`, але ще не перевіряє автоматичну
+  активацію scheduled-дубля;
+- duplication path повторно використовує без змін підтверджений
+  `fb_duplicate_test.py` v26.7-stable.
+
 ## Поточний наступний крок
 
-1. Запустити GitHub Actions workflow `FB Duplicate Test — Stable Runner` для
-   source AdSet `120247989505660301`.
-2. Підтвердити у JSON/Telegram одночасно:
-   `true_duplicate_ok=true` та `publish_probe_ok=true`.
-3. У Ads Manager перевірити режим «Створити оголошення» і прийняту мініатюру
-   `Вручну`.
-4. Після успішного контрольного запуску переносити stable-механізм у
-   production `fb_scaler.py` окремим комітом.
+1. Після окремого підтвердження доступу нового workflow до Meta/Telegram
+   secrets у публічному репозиторії додати безпечний workflow без GitHub
+   artifact зі статистикою.
+2. Запустити Scaler у режимі `plan`.
+3. Перевірити Telegram та локальний JSON: кандидати, source/offer CPL/BE, кількість до
+   та після множників, caps і bid/name mismatches.
+4. Після перевірки plan запустити `test_one_paused` для одного погодженого
+   source AdSet із фразою `CREATE_ONE_PAUSED_DUPLICATE`.
+5. Перевірити новий AdSet/Ad у Ads Manager, readback `start_time`, budget,
+   bid strategy, Pixel, jitter ставки та відсутність delivery issues.
+6. Лише після цього окремо тестувати статус `ACTIVE` з майбутнім start_time і
+   фактичний автоматичний старт. Production cron о 16:00 поки не створювати.
 
 ## Не чіпати
 
