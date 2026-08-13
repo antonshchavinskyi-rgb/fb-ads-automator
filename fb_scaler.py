@@ -23,9 +23,7 @@ from fb_config import (
     SCALER_CAMPAIGN_CAP,
     SCALER_COST_GOAL_DUPLICATE_MULTIPLIER,
     SCALER_OFFER_TIERS,
-    SCALER_SOURCE_MAX_CPL_FACTOR,
-    SCALER_SOURCE_ONE_LEAD_CPL_FACTOR,
-    SCALER_SOURCE_TIERS,
+    SCALER_SOURCE_MATRIX,
     SCALER_START_HOUR,
     SCALER_START_MINUTE_FROM,
     SCALER_START_MINUTE_TO,
@@ -39,8 +37,8 @@ from fb_config import (
 import fb_duplicate_test as stable_duplicate
 
 
-SCALER_VERSION = "v1.0-test"
-BUILD_ID = "2026-08-13-scaler-plan-and-one-paused-duplicate-r1"
+SCALER_VERSION = "v1.1-test"
+BUILD_ID = "2026-08-13-scaler-profit-first-matrix-r2"
 API_VER = stable_duplicate.API_VER
 
 ACCESS_TOKEN = os.environ.get("FB_SCALER_ACCESS_TOKEN")
@@ -146,23 +144,19 @@ def strategy_info(bid_strategy):
     return SUPPORTED_STRATEGIES.get(str(bid_strategy or "").upper())
 
 
-def source_base_duplicates(cpl_ratio):
-    if cpl_ratio is None:
-        return 0
-    for upper_bound, count in SCALER_SOURCE_TIERS:
-        if cpl_ratio <= upper_bound + 1e-12:
-            return count
-    return 0
-
-
-def source_lead_cap(leads, cpl_ratio):
+def source_duplicates(leads, cpl_ratio):
     if leads <= 0 or cpl_ratio is None:
         return 0
-    if leads == 1:
-        return 6 if cpl_ratio <= SCALER_SOURCE_ONE_LEAD_CPL_FACTOR + 1e-12 else 0
-    if 2 <= leads <= 3:
-        return 12 if cpl_ratio <= SCALER_SOURCE_MAX_CPL_FACTOR + 1e-12 else 0
-    return math.inf if cpl_ratio <= SCALER_SOURCE_MAX_CPL_FACTOR + 1e-12 else 0
+    for min_leads, max_leads, cpl_tiers in SCALER_SOURCE_MATRIX:
+        if leads < min_leads:
+            continue
+        if max_leads is not None and leads > max_leads:
+            continue
+        for upper_bound, count in cpl_tiers:
+            if cpl_ratio <= upper_bound + 1e-12:
+                return count
+        return 0
+    return 0
 
 
 def offer_scale(cpl_ratio):
@@ -171,7 +165,7 @@ def offer_scale(cpl_ratio):
     for upper_bound, multiplier, alert in SCALER_OFFER_TIERS:
         if cpl_ratio <= upper_bound + 1e-12:
             return multiplier, alert
-    return 0.0, False
+    return 0.0, True
 
 
 def calculate_requested_duplicates(
@@ -186,46 +180,49 @@ def calculate_requested_duplicates(
             "eligible": False,
             "reason": f"unsupported bid strategy: {bid_strategy or 'EMPTY'}",
             "base": 0,
-            "lead_cap": 0,
+            "lead_cap": None,
             "strategy_multiplier": 0.0,
             "offer_multiplier": 0.0,
             "offer_alert": False,
+            "offer_blocked": False,
+            "blocked_duplicates": 0,
             "requested": 0,
         }
 
-    base = source_base_duplicates(source_cpl_ratio)
-    lead_cap = source_lead_cap(source_leads, source_cpl_ratio)
+    base = source_duplicates(source_leads, source_cpl_ratio)
     offer_multiplier, offer_alert = offer_scale(offer_cpl_ratio)
-    capped_base = min(base, lead_cap)
     strategy_multiplier = info[2]
+    before_offer = math.floor(base * strategy_multiplier + 1e-12)
 
     # Floor is deliberate: multipliers and caps must never be exceeded by
     # rounding. This is a conservative technical rounding rule.
     requested = math.floor(
-        capped_base * strategy_multiplier * offer_multiplier + 1e-12
+        base * strategy_multiplier * offer_multiplier + 1e-12
     )
+    offer_blocked = bool(offer_alert and before_offer > 0)
 
     reasons = []
     if source_leads <= 0:
         reasons.append("source has no leads")
-    if base == 0:
-        reasons.append("source CPL is above 0.90×BE")
-    if lead_cap == 0 and source_leads > 0:
-        reasons.append("source failed lead-count CPL threshold")
-    if offer_multiplier == 0:
-        reasons.append("offer CPL is above 1.10×BE")
+    elif base == 0:
+        reasons.append("source failed the approved lead/CPL matrix")
+    if offer_blocked:
+        reasons.append("offer CPL is above 1.00×BE")
+    elif before_offer > 0 and requested == 0:
+        reasons.append("result rounded to zero after multipliers")
 
     return {
         "eligible": requested > 0,
         "reason": "; ".join(reasons),
         "base": base,
-        "lead_cap": None if math.isinf(lead_cap) else int(lead_cap),
+        "lead_cap": None,
         "strategy_multiplier": strategy_multiplier,
         "offer_multiplier": offer_multiplier,
         "offer_alert": offer_alert,
+        "offer_blocked": offer_blocked,
+        "blocked_duplicates": before_offer if offer_blocked else 0,
         "requested": requested,
     }
-
 
 def allocate_caps(candidates):
     account_used = defaultdict(int)
@@ -234,6 +231,7 @@ def allocate_caps(candidates):
         candidates,
         key=lambda row: (
             row["account_id"],
+            row["offer_cpl_ratio"],
             -row["source_leads"],
             row["source_cpl_ratio"],
             row["source_adset_id"],
@@ -460,6 +458,7 @@ def build_offer_totals(snapshots):
 def build_plan(snapshots, run_date):
     offer_totals = build_offer_totals(snapshots)
     candidates = []
+    blocked_sources = []
     skipped = []
     mismatches = []
 
@@ -534,6 +533,19 @@ def build_plan(snapshots, run_date):
                 adset.get("bid_strategy"),
             )
             if not calc["eligible"]:
+                if calc["offer_blocked"]:
+                    blocked_sources.append({
+                        **base,
+                        "offer_id": parsed["offer_id"],
+                        "category": parsed["category"],
+                        "be_usd": offer["be_usd"],
+                        "source_leads": stats["leads"],
+                        "source_cpl_ratio": source_ratio,
+                        "offer_cpl_usd": offer["cpl_usd"],
+                        "offer_cpl_ratio": offer["cpl_ratio"],
+                        "bid_strategy": adset.get("bid_strategy"),
+                        "blocked_duplicates": calc["blocked_duplicates"],
+                    })
                 skipped.append({**base, "reason": calc["reason"] or "not eligible"})
                 continue
 
@@ -575,6 +587,24 @@ def build_plan(snapshots, run_date):
                 "existing_production_sequences": existing_sequences,
             })
 
+    blocked_by_offer = {}
+    for row in blocked_sources:
+        item = blocked_by_offer.setdefault(row["offer_id"], {
+            "offer_id": row["offer_id"],
+            "offer_cpl_usd": row["offer_cpl_usd"],
+            "offer_cpl_ratio": row["offer_cpl_ratio"],
+            "be_usd": row["be_usd"],
+            "source_candidates": 0,
+            "blocked_duplicates": 0,
+        })
+        item["source_candidates"] += 1
+        item["blocked_duplicates"] += row["blocked_duplicates"]
+
+    blocked_offers = sorted(
+        blocked_by_offer.values(),
+        key=lambda row: (row["offer_cpl_ratio"], row["offer_id"]),
+    )
+
     allocated = allocate_caps(candidates)
     for row in allocated:
         existing = set(row["existing_production_sequences"])
@@ -589,6 +619,7 @@ def build_plan(snapshots, run_date):
         "run_date": run_date,
         "offer_totals": offer_totals,
         "candidates": allocated,
+        "blocked_offers": blocked_offers,
         "skipped": skipped,
         "bid_name_mismatches": mismatches,
         "planned_new_duplicates": sum(x["create_count"] for x in allocated),
@@ -779,6 +810,7 @@ def plan_summary(plan, mode, execution=None):
         f"Date: <code>{esc(plan['run_date'])}</code>",
         f"Eligible source adsets: <b>{len(plan['candidates'])}</b>",
         f"Planned new duplicates: <b>{plan['planned_new_duplicates']}</b>",
+        f"Blocked offers: <b>{len(plan['blocked_offers'])}</b>",
         f"Campaign cap: {'⚠️ HIT' if plan['campaign_cap_triggered'] else 'not hit'}",
         f"Account cap: {'⚠️ HIT' if plan['account_cap_triggered'] else 'not hit'}",
         f"Bid/name mismatches: <b>{len(plan['bid_name_mismatches'])}</b>",
@@ -795,8 +827,16 @@ def plan_summary(plan, mode, execution=None):
             f"requested {row['requested']} → allocated {row['allocated']} → "
             f"missing {row['create_count']}"
         )
-        if row["offer_alert"]:
-            lines.append("⚠️ Офер загалом вище BE — перевір кампанію вручну")
+    for item in plan["blocked_offers"]:
+        lines.append(
+            "\n"
+            f"🚫 <b>{esc(item['offer_id'])}</b> • offer "
+            f"{item['offer_cpl_ratio']:.3f}×BE\n"
+            f"CPL ${item['offer_cpl_usd']:.2f} • BE ${item['be_usd']:.2f}\n"
+            f"sources {item['source_candidates']} • "
+            f"blocked duplicates {item['blocked_duplicates']}\n"
+            "Офер загалом вище BE — дублювання заблоковано"
+        )
     if execution:
         lines.extend([
             "",
@@ -910,3 +950,4 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
