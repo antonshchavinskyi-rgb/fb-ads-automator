@@ -38,7 +38,7 @@ import fb_duplicate_test as stable_duplicate
 
 
 SCALER_VERSION = "v1.1-test"
-BUILD_ID = "2026-08-13-scaler-profit-first-matrix-r2"
+BUILD_ID = "2026-08-13-scaler-account-labels-r3"
 API_VER = stable_duplicate.API_VER
 
 ACCESS_TOKEN = os.environ.get("FB_SCALER_ACCESS_TOKEN")
@@ -356,6 +356,19 @@ def parse_marker_sequences(names, run_date, source_adset_id, test=False):
 
 
 def load_account_snapshot(account_id, currency, run_date):
+    try:
+        account = stable_duplicate.get_node(
+            f"act_{account_id}",
+            ["id", "name", "account_id", "currency"],
+            stage=f"scaler_account:{account_id}",
+        )
+    except Exception as exc:
+        print(
+            f"Account name lookup failed for {account_id}: {exc}",
+            flush=True,
+        )
+        account = {}
+
     adsets = stable_duplicate.graph_get_all(
         f"act_{account_id}/adsets",
         {
@@ -391,6 +404,7 @@ def load_account_snapshot(account_id, currency, run_date):
 
     return {
         "account_id": str(account_id),
+        "account_name": account.get("name") or f"Account {account_id}",
         "currency": currency,
         "rate": currency_rate(currency),
         "adsets": adsets,
@@ -478,6 +492,10 @@ def build_plan(snapshots, run_date):
 
             base = {
                 "account_id": snapshot["account_id"],
+                "account_name": (
+                    snapshot.get("account_name")
+                    or f"Account {snapshot['account_id']}"
+                ),
                 "currency": snapshot["currency"],
                 "source_adset_id": source_id,
                 "source_adset_name": adset.get("name", ""),
@@ -596,9 +614,16 @@ def build_plan(snapshots, run_date):
             "be_usd": row["be_usd"],
             "source_candidates": 0,
             "blocked_duplicates": 0,
+            "accounts": [],
         })
         item["source_candidates"] += 1
         item["blocked_duplicates"] += row["blocked_duplicates"]
+        account_ref = {
+            "account_id": row["account_id"],
+            "account_name": row["account_name"],
+        }
+        if account_ref not in item["accounts"]:
+            item["accounts"].append(account_ref)
 
     blocked_offers = sorted(
         blocked_by_offer.values(),
@@ -617,6 +642,17 @@ def build_plan(snapshots, run_date):
 
     return {
         "run_date": run_date,
+        "scanned_accounts": [
+            {
+                "account_id": snapshot["account_id"],
+                "account_name": (
+                    snapshot.get("account_name")
+                    or f"Account {snapshot['account_id']}"
+                ),
+                "currency": snapshot["currency"],
+            }
+            for snapshot in snapshots
+        ],
         "offer_totals": offer_totals,
         "candidates": allocated,
         "blocked_offers": blocked_offers,
@@ -808,6 +844,7 @@ def plan_summary(plan, mode, execution=None):
         f"Build: <code>{esc(BUILD_ID)}</code>",
         f"Mode: <b>{esc(mode)}</b>",
         f"Date: <code>{esc(plan['run_date'])}</code>",
+        f"Accounts scanned: <b>{len(plan['scanned_accounts'])}</b>",
         f"Eligible source adsets: <b>{len(plan['candidates'])}</b>",
         f"Planned new duplicates: <b>{plan['planned_new_duplicates']}</b>",
         f"Blocked offers: <b>{len(plan['blocked_offers'])}</b>",
@@ -815,11 +852,19 @@ def plan_summary(plan, mode, execution=None):
         f"Account cap: {'⚠️ HIT' if plan['account_cap_triggered'] else 'not hit'}",
         f"Bid/name mismatches: <b>{len(plan['bid_name_mismatches'])}</b>",
     ]
+    for account in plan["scanned_accounts"]:
+        lines.append(
+            f"• {esc(account['account_name'])} • "
+            f"<code>{esc(account['account_id'])}</code> • "
+            f"{esc(account['currency'])}"
+        )
     for row in plan["candidates"][:20]:
         lines.append(
             "\n"
             f"<b>{esc(row['offer_id'])}</b> • "
             f"AID <code>{esc(row['source_adset_id'])}</code>\n"
+            f"Account: {esc(row['account_name'])} • "
+            f"<code>{esc(row['account_id'])}</code>\n"
             f"Leads {row['source_leads']} • "
             f"source {row['source_cpl_ratio']:.3f}×BE • "
             f"offer {row['offer_cpl_ratio']:.3f}×BE • "
@@ -828,11 +873,16 @@ def plan_summary(plan, mode, execution=None):
             f"missing {row['create_count']}"
         )
     for item in plan["blocked_offers"]:
+        account_labels = ", ".join(
+            f"{account['account_name']} ({account['account_id']})"
+            for account in item["accounts"]
+        )
         lines.append(
             "\n"
             f"🚫 <b>{esc(item['offer_id'])}</b> • offer "
             f"{item['offer_cpl_ratio']:.3f}×BE\n"
             f"CPL ${item['offer_cpl_usd']:.2f} • BE ${item['be_usd']:.2f}\n"
+            f"Accounts: {esc(account_labels)}\n"
             f"sources {item['source_candidates']} • "
             f"blocked duplicates {item['blocked_duplicates']}\n"
             "Офер загалом вище BE — дублювання заблоковано"
@@ -950,4 +1000,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-
