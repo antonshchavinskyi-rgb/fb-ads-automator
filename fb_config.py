@@ -36,22 +36,23 @@ CURRENCY_SYMBOLS = {
 COST_GOAL_FACTOR = 0.85
 BID_CAP_FACTOR = 2.20
 DAILY_BUDGET_FACTOR = 1.70
-SCALER_CAMPAIGN_CAP = 50
+SCALER_CAMPAIGN_CAP = 20
 SCALER_ACCOUNT_CAP = 150
 SCALER_COST_GOAL_DUPLICATE_MULTIPLIER = 1.00
 SCALER_BID_DUPLICATE_MULTIPLIER = 0.50
-SCALER_SOURCE_ONE_LEAD_CPL_FACTOR = 0.70
-SCALER_SOURCE_MAX_CPL_FACTOR = 0.90
-SCALER_SOURCE_TIERS = (
-    (0.60, 18),
-    (0.75, 15),
-    (0.90, 12),
+
+# (min leads, max leads or None, ((max CPL/BE, duplicates), ...))
+SCALER_SOURCE_MATRIX = (
+    (1, 1, ((0.60, 1), (0.90, 0))),
+    (2, 3, ((0.75, 3), (0.90, 1))),
+    (4, 6, ((0.75, 6), (0.90, 3))),
+    (7, 9, ((0.75, 9), (0.90, 6))),
+    (10, None, ((0.60, 18), (0.75, 15), (0.90, 12))),
 )
 SCALER_OFFER_TIERS = (
     (0.90, 1.00, False),
     (0.95, 0.75, False),
     (1.00, 0.50, False),
-    (1.10, 0.50, True),
 )
 SCALER_BID_JITTER_MIN = 0.005
 SCALER_BID_JITTER_MAX = 0.010
@@ -166,3 +167,4 @@ def parse_campaign_name(campaign_name: str) -> dict:
         'reason': '',
         'tokens': parts,
     }
+
