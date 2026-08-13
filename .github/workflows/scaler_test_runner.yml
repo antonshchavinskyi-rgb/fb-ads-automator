@@ -1,0 +1,54 @@
+name: FB Scaler — Plan and One Paused Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'plan = no Meta writes; test_one_paused = create exactly one PAUSED duplicate'
+        required: true
+        default: plan
+        type: choice
+        options:
+          - plan
+          - test_one_paused
+      source_adset_id:
+        description: 'Required only for test_one_paused'
+        required: false
+        type: string
+      account_id:
+        description: 'Optional account filter; blank = all configured accounts'
+        required: false
+        type: string
+      create_confirmation:
+        description: 'For test_one_paused type: CREATE_ONE_PAUSED_DUPLICATE'
+        required: false
+        type: string
+
+jobs:
+  scaler-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run deterministic unit tests
+        run: python -m unittest -v test_fb_scaler.py
+
+      - name: Run Scaler plan or one paused duplicate test
+        env:
+          FB_SCALER_ACCESS_TOKEN: ${{ secrets.FB_SCALER_ACCESS_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SCALER_MODE: ${{ inputs.mode }}
+          SCALER_TEST_SOURCE_ADSET_ID: ${{ inputs.source_adset_id }}
+          SCALER_ACCOUNT_ID: ${{ inputs.account_id }}
+          SCALER_CREATE_CONFIRMATION: ${{ inputs.create_confirmation }}
+          PYTHONUNBUFFERED: "1"
+        run: python fb_scaler.py
