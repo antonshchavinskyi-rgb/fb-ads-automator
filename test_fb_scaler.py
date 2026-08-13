@@ -164,6 +164,7 @@ class ScalerBusinessLogicTests(unittest.TestCase):
         snapshots = [
             {
                 "account_id": "usd",
+                "account_name": "USD Shop",
                 "currency": "USD",
                 "rate": 1.0,
                 "adsets": [{
@@ -189,6 +190,7 @@ class ScalerBusinessLogicTests(unittest.TestCase):
             },
             {
                 "account_id": "pln",
+                "account_name": "PLN Shop",
                 "currency": "PLN",
                 "rate": 3.8,
                 "adsets": [{
@@ -220,10 +222,19 @@ class ScalerBusinessLogicTests(unittest.TestCase):
         self.assertAlmostEqual(offer["cpl_ratio"], 0.5)
         self.assertEqual(len(plan["candidates"]), 2)
         self.assertEqual(plan["planned_new_duplicates"], 6)
+        self.assertEqual(
+            [account["account_name"] for account in plan["scanned_accounts"]],
+            ["USD Shop", "PLN Shop"],
+        )
+        summary = scaler.plan_summary(plan, "plan")
+        self.assertIn("USD Shop", summary)
+        self.assertIn("PLN Shop", summary)
+        self.assertIn("<code>usd</code>", summary)
 
     def test_plan_reports_offer_above_be_as_blocked(self):
         snapshot = {
             "account_id": "1",
+            "account_name": "Blocked Shop",
             "currency": "USD",
             "rate": 1.0,
             "adsets": [{
@@ -264,6 +275,11 @@ class ScalerBusinessLogicTests(unittest.TestCase):
         self.assertEqual(blocked["offer_id"], "1537")
         self.assertEqual(blocked["source_candidates"], 1)
         self.assertEqual(blocked["blocked_duplicates"], 1)
+        self.assertEqual(blocked["accounts"], [{
+            "account_id": "1",
+            "account_name": "Blocked Shop",
+        }])
+        self.assertIn("Blocked Shop (1)", scaler.plan_summary(plan, "plan"))
 
     def test_catalog_is_excluded_from_scaler(self):
         snapshot = {
@@ -294,4 +310,3 @@ class ScalerBusinessLogicTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
