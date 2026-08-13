@@ -4,25 +4,25 @@ import fb_scaler as scaler
 
 
 class ScalerBusinessLogicTests(unittest.TestCase):
-    def test_source_tiers_and_lead_caps(self):
-        self.assertEqual(scaler.source_base_duplicates(0.60), 18)
-        self.assertEqual(scaler.source_base_duplicates(0.60001), 15)
-        self.assertEqual(scaler.source_base_duplicates(0.75), 15)
-        self.assertEqual(scaler.source_base_duplicates(0.75001), 12)
-        self.assertEqual(scaler.source_base_duplicates(0.90), 12)
-        self.assertEqual(scaler.source_base_duplicates(0.90001), 0)
-
-        self.assertEqual(scaler.source_lead_cap(1, 0.70), 6)
-        self.assertEqual(scaler.source_lead_cap(1, 0.70001), 0)
-        self.assertEqual(scaler.source_lead_cap(3, 0.90), 12)
-        self.assertEqual(scaler.source_lead_cap(3, 0.90001), 0)
+    def test_source_matrix(self):
+        cases = (
+            (1, 0.60, 1), (1, 0.60001, 0),
+            (2, 0.75, 3), (3, 0.75001, 1), (3, 0.90, 1),
+            (4, 0.75, 6), (6, 0.75001, 3),
+            (7, 0.75, 9), (9, 0.75001, 6),
+            (10, 0.60, 18), (10, 0.75, 15), (10, 0.90, 12),
+            (10, 0.90001, 0),
+        )
+        for leads, ratio, expected in cases:
+            with self.subTest(leads=leads, ratio=ratio):
+                self.assertEqual(scaler.source_duplicates(leads, ratio), expected)
 
     def test_offer_tiers(self):
         self.assertEqual(scaler.offer_scale(0.90), (1.00, False))
         self.assertEqual(scaler.offer_scale(0.95), (0.75, False))
         self.assertEqual(scaler.offer_scale(1.00), (0.50, False))
-        self.assertEqual(scaler.offer_scale(1.10), (0.50, True))
-        self.assertEqual(scaler.offer_scale(1.10001), (0.00, False))
+        self.assertEqual(scaler.offer_scale(1.00001), (0.00, True))
+        self.assertEqual(scaler.offer_scale(1.10), (0.00, True))
 
     def test_duplicate_calculation_cost_goal(self):
         result = scaler.calculate_requested_duplicates(
@@ -32,7 +32,7 @@ class ScalerBusinessLogicTests(unittest.TestCase):
             bid_strategy="COST_CAP",
         )
         self.assertTrue(result["eligible"])
-        self.assertEqual(result["requested"], 6)
+        self.assertEqual(result["requested"], 1)
 
     def test_duplicate_calculation_bid_cap_floors_once(self):
         result = scaler.calculate_requested_duplicates(
@@ -41,8 +41,20 @@ class ScalerBusinessLogicTests(unittest.TestCase):
             offer_cpl_ratio=0.94,
             bid_strategy="LOWEST_COST_WITH_BID_CAP",
         )
-        # min(15, 12) × 0.50 × 0.75 = 4.5 -> conservative floor 4
-        self.assertEqual(result["requested"], 4)
+        # 3 × 0.50 × 0.75 = 1.125 -> conservative floor 1
+        self.assertEqual(result["requested"], 1)
+
+    def test_offer_above_be_blocks_an_otherwise_strong_source(self):
+        result = scaler.calculate_requested_duplicates(
+            source_leads=7,
+            source_cpl_ratio=0.50,
+            offer_cpl_ratio=1.00001,
+            bid_strategy="COST_CAP",
+        )
+        self.assertFalse(result["eligible"])
+        self.assertTrue(result["offer_blocked"])
+        self.assertEqual(result["blocked_duplicates"], 9)
+        self.assertEqual(result["requested"], 0)
 
     def test_weak_source_never_rescued_by_offer(self):
         result = scaler.calculate_requested_duplicates(
@@ -67,6 +79,7 @@ class ScalerBusinessLogicTests(unittest.TestCase):
                     "source_adset_id": "101",
                     "source_leads": 5,
                     "source_cpl_ratio": 0.80,
+                    "offer_cpl_ratio": 0.80,
                     "requested": 7,
                 },
                 {
@@ -75,6 +88,7 @@ class ScalerBusinessLogicTests(unittest.TestCase):
                     "source_adset_id": "102",
                     "source_leads": 6,
                     "source_cpl_ratio": 0.85,
+                    "offer_cpl_ratio": 0.80,
                     "requested": 6,
                 },
                 {
@@ -83,14 +97,15 @@ class ScalerBusinessLogicTests(unittest.TestCase):
                     "source_adset_id": "103",
                     "source_leads": 2,
                     "source_cpl_ratio": 0.50,
+                    "offer_cpl_ratio": 0.70,
                     "requested": 6,
                 },
             ]
             allocated = scaler.allocate_caps(rows)
             by_id = {row["source_adset_id"]: row for row in allocated}
-            self.assertEqual(by_id["102"]["allocated"], 6)
-            self.assertEqual(by_id["101"]["allocated"], 2)
-            self.assertEqual(by_id["103"]["allocated"], 2)
+            self.assertEqual(by_id["103"]["allocated"], 6)
+            self.assertEqual(by_id["102"]["allocated"], 4)
+            self.assertEqual(by_id["101"]["allocated"], 0)
         finally:
             scaler.SCALER_ACCOUNT_CAP = old_account_cap
             scaler.SCALER_CAMPAIGN_CAP = old_campaign_cap
@@ -204,7 +219,51 @@ class ScalerBusinessLogicTests(unittest.TestCase):
         self.assertEqual(offer["leads"], 4)
         self.assertAlmostEqual(offer["cpl_ratio"], 0.5)
         self.assertEqual(len(plan["candidates"]), 2)
-        self.assertEqual(plan["planned_new_duplicates"], 24)
+        self.assertEqual(plan["planned_new_duplicates"], 6)
+
+    def test_plan_reports_offer_above_be_as_blocked(self):
+        snapshot = {
+            "account_id": "1",
+            "currency": "USD",
+            "rate": 1.0,
+            "adsets": [{
+                "id": "250",
+                "name": "creative / кос",
+                "campaign_id": "25",
+                "status": "ACTIVE",
+                "bid_strategy": "COST_CAP",
+                "campaign": {
+                    "id": "25",
+                    "name": "1537 - зал - offer",
+                    "status": "ACTIVE",
+                },
+            }],
+            "stats": {
+                "250": {"spend": 4.5, "leads": 1, "impressions": 1000},
+            },
+        }
+        snapshot["adsets"].append({
+            "id": "251",
+            "name": "weak / кос",
+            "campaign_id": "25",
+            "status": "PAUSED",
+            "bid_strategy": "COST_CAP",
+            "campaign": {
+                "id": "25",
+                "name": "1537 - зал - offer",
+                "status": "ACTIVE",
+            },
+        })
+        snapshot["stats"]["251"] = {
+            "spend": 20.0, "leads": 1, "impressions": 1000,
+        }
+        plan = scaler.build_plan([snapshot], "2026-08-13")
+        self.assertEqual(plan["planned_new_duplicates"], 0)
+        self.assertEqual(len(plan["blocked_offers"]), 1)
+        blocked = plan["blocked_offers"][0]
+        self.assertEqual(blocked["offer_id"], "1537")
+        self.assertEqual(blocked["source_candidates"], 1)
+        self.assertEqual(blocked["blocked_duplicates"], 1)
 
     def test_catalog_is_excluded_from_scaler(self):
         snapshot = {
@@ -235,3 +294,4 @@ class ScalerBusinessLogicTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
