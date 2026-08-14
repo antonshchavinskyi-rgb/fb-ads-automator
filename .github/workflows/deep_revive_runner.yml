@@ -1,0 +1,26 @@
+name: FB Ads Revive — Deep 14D to 7D
+
+on:
+  workflow_dispatch: # Для окремого зовнішнього cron; його можна незалежно вмикати/зупиняти
+
+jobs:
+  run-deep-revive:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository code
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
+
+      - name: Run DEEP 14D to 7D Revive
+        env:
+          FB_ACCESS_TOKEN: ${{ secrets.FB_ACCESS_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          PYTHONUNBUFFERED: "1"
+        run: python fb_revive_deep.py
+
