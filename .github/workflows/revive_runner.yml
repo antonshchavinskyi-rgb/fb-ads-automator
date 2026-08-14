@@ -1,10 +1,10 @@
-name: FB Ads Revive Daily
+name: FB Ads Revive — Recent 2D
 
 on:
-  workflow_dispatch: # Тригериться зовнішнім cron-job.org о 05:45 Europe/Warsaw
+  workflow_dispatch: # Чинний зовнішній cron-job.org викликає цей workflow о 05:45 Europe/Warsaw
 
 jobs:
-  run-revive:
+  run-recent-revive:
     runs-on: ubuntu-latest
 
     steps:
@@ -16,10 +16,11 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Run FB Revive Script
+      - name: Run RECENT 2D Revive
         env:
           FB_ACCESS_TOKEN: ${{ secrets.FB_ACCESS_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           PYTHONUNBUFFERED: "1"
-        run: python fb_revive.py
+        run: python fb_revive_recent.py
+
