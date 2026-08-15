@@ -76,8 +76,8 @@ HYGIENE_NO_IMPRESSIONS_DAYS = 7
 REVIVE_DRY_RUN = False
 
 # fb_revive.py — Recent Restart
-REVIVE_RECENT_TWO_PLUS_CPL_FACTOR = 1.00  # strict <
-REVIVE_RECENT_ONE_CPL_FACTOR = 0.70       # <=
+REVIVE_RECENT_TWO_PLUS_CPL_FACTOR = 0.95  # <=
+REVIVE_RECENT_ONE_CPL_FACTOR = 0.85       # <=
 
 # fb_revive.py — Deep Revive
 REVIVE_DEEP_IDLE_DAYS = 7
