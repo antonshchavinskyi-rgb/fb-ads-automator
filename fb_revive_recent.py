@@ -213,7 +213,6 @@ def get_account_state(acc_id, currency, time_ranges, errors, warnings):
         f"adsets account {acc_id}",
     )
 
-    # Спочатку збираємо тільки PAUSED адсети в ACTIVE кампаніях — без парсингу назви.
     raw_candidates = {}
     for adset in adsets_raw:
         if adset.get('status') != 'PAUSED':
@@ -238,8 +237,6 @@ def get_account_state(acc_id, currency, time_ranges, errors, warnings):
         return {}, defaultdict(list)
 
     insights_endpoint = f"https://graph.facebook.com/{API_VER}/act_{acc_id}/insights"
-
-    # Recent: 2 повні попередні дні.
     recent = fetch_data(
         insights_endpoint,
         {
@@ -269,8 +266,6 @@ def get_account_state(acc_id, currency, time_ranges, errors, warnings):
             raw['recent_spend'] > 0,
             raw['recent_leads'] > 0,
         ))
-
-        # Без активності у Recent-вікні цей PAUSED adset не стосується цього скрипта.
         if not recent_relevant:
             continue
 
@@ -308,7 +303,6 @@ def get_account_state(acc_id, currency, time_ranges, errors, warnings):
     if not candidates:
         return {}, defaultdict(list)
 
-    # Ads потрібні тільки для тих груп, які реально пройшли попередній activity-фільтр і парсер.
     ads_raw = fetch_data(
         f"https://graph.facebook.com/{API_VER}/act_{acc_id}/ads",
         {'fields': 'id,name,status,effective_status,adset_id', 'limit': 250},
@@ -333,7 +327,7 @@ def qualifies_recent(candidate):
 
     cpl = spend / leads
     if leads >= 2:
-        return cpl < be * REVIVE_RECENT_TWO_PLUS_CPL_FACTOR, cpl
+        return cpl <= be * REVIVE_RECENT_TWO_PLUS_CPL_FACTOR, cpl
     if leads == 1:
         return cpl <= be * REVIVE_RECENT_ONE_CPL_FACTOR, cpl
     return False, cpl
@@ -345,15 +339,12 @@ def activate_candidate(candidate, ads_by_adset, errors, dry_run=False):
     paused_ads = [ad for ad in ads_by_adset.get(aid, []) if ad.get('status') == 'PAUSED']
 
     if dry_run:
-        # У DRY RUN нічого не змінюємо в Meta. Лише рахуємо, скільки оголошень
-        # довелося б увімкнути разом із групою.
         print(
             f"   🧪 DRY RUN: would activate adset {aid} + {len(paused_ads)} paused ad(s)",
             flush=True,
         )
         return True, len(paused_ads)
 
-    # Спочатку вмикаємо adset. Якщо оголошення було вимкнене Hygiene — вмикаємо його після цього.
     if not change_entity_status(aid, 'ACTIVE', errors, f"adset {aid}"):
         return False, 0
 
@@ -392,7 +383,6 @@ def main():
             print(f" ❌ {msg}", flush=True)
             errors.append(msg)
 
-    # 1) Recent Restart — без cap.
     recent_selected = []
     for acc_id, candidates in account_states.items():
         for candidate in candidates.values():
