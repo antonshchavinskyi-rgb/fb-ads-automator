@@ -63,13 +63,22 @@ def send_telegram_lines(header, lines, max_chars=3800):
         send_telegram(chunk)
 
 
-def fetch_data(endpoint, params):
+def fetch_data(endpoint, params, errors=None, context=""):
+    """
+    Meta GET із контрольованими повторними спробами.
+
+    Помилка завжди записується в errors. Викликаюча логіка може відрізнити
+    успішну порожню відповідь (справжні 0 показів) від збою API.
+    """
     params = dict(params)
     params['access_token'] = ACCESS_TOKEN
     query_string = urllib.parse.urlencode(params)
     url = f"{endpoint}?{query_string}"
 
     results = []
+    rate_limit_delays = [30, 60, 120]
+    rate_limit_attempt = 0
+
     while url:
         time.sleep(0.1)
         try:
@@ -78,16 +87,57 @@ def fetch_data(endpoint, params):
                 data = json.loads(response.read().decode('utf-8'))
                 results.extend(data.get('data', []))
                 url = data.get('paging', {}).get('next') if 'paging' in data else None
+                rate_limit_attempt = 0
         except urllib.error.HTTPError as e:
             error_body = e.read().decode('utf-8')
-            if 'User request limit reached' in error_body or '"code":17' in error_body:
-                print(" ⏳ Ліміт запитів Meta (Code 17). Пауза 15 сек...", flush=True)
-                time.sleep(15)
+            try:
+                payload = json.loads(error_body)
+                meta_error = payload.get('error', {})
+            except Exception:
+                meta_error = {}
+
+            code = meta_error.get('code')
+            subcode = meta_error.get('error_subcode')
+            is_transient = bool(meta_error.get('is_transient'))
+            message = meta_error.get('message') or error_body
+            is_rate_limit = (
+                code in (4, 17)
+                or subcode == 1504022
+                or 'request limit' in str(message).lower()
+                or 'user request limit' in str(message).lower()
+            )
+
+            if is_rate_limit and rate_limit_attempt < len(rate_limit_delays):
+                delay = rate_limit_delays[rate_limit_attempt]
+                rate_limit_attempt += 1
+                print(
+                    f" ⏳ Meta rate limit ({context}) code={code} subcode={subcode}. "
+                    f"Пауза {delay} сек, спроба {rate_limit_attempt}/{len(rate_limit_delays)}...",
+                    flush=True,
+                )
+                time.sleep(delay)
                 continue
-            print(f" ❌ Помилка API Meta ({e.code}): {error_body}", flush=True)
+
+            if is_rate_limit:
+                msg = (
+                    f"Meta rate limit після {rate_limit_attempt} повторів — {context}; "
+                    f"HTTP {e.code}, code={code}, subcode={subcode}, transient={is_transient}"
+                )
+            else:
+                msg = (
+                    f"API Meta HTTP {e.code} {context}: "
+                    f"code={code}, subcode={subcode}, message={message}"
+                )
+
+            print(f" ❌ {msg}", flush=True)
+            if errors is not None:
+                errors.append(msg)
             break
         except Exception as e:
-            print(f" ⚠️ Помилка з'єднання: {e}", flush=True)
+            msg = f"Помилка з'єднання {context}: {e}"
+            print(f" ⚠️ {msg}", flush=True)
+            if errors is not None:
+                errors.append(msg)
             break
     return results
 
@@ -115,7 +165,7 @@ def parse_iso_time(time_str):
         return None
 
 
-def process_hygiene_logic(acc_id, events):
+def process_hygiene_logic(acc_id, events, errors):
     now_utc = datetime.now(timezone.utc)
     min_age_seconds = HYGIENE_MIN_AGE_DAYS * 24 * 60 * 60
     date_preset = f"last_{HYGIENE_NO_IMPRESSIONS_DAYS}d"
@@ -124,6 +174,8 @@ def process_hygiene_logic(acc_id, events):
     raw_adsets = fetch_data(
         f"https://graph.facebook.com/{API_VER}/act_{acc_id}/adsets",
         {'fields': 'id,name,effective_status,created_time,campaign_id,campaign{name}', 'limit': 250},
+        errors,
+        f"adsets account {acc_id}",
     )
 
     adset_meta = {}
@@ -143,6 +195,7 @@ def process_hygiene_logic(acc_id, events):
             active_adsets[adset['id']] = meta
 
     if active_adsets:
+        insight_errors_before = len(errors)
         insights = fetch_data(
             f"https://graph.facebook.com/{API_VER}/act_{acc_id}/insights",
             {
@@ -151,24 +204,36 @@ def process_hygiene_logic(acc_id, events):
                 'date_preset': date_preset,
                 'limit': 250,
             },
+            errors,
+            f"adset insights {date_preset} account {acc_id}",
         )
-        with_impressions = {
-            row.get('adset_id') for row in insights if int(row.get('impressions', 0)) > 0
-        }
 
-        for adset_id, meta in active_adsets.items():
-            if adset_id not in with_impressions and change_entity_status(adset_id, 'PAUSED'):
-                print(f"   🧹 Гігієна: Вимкнено неактивну групу [{meta['name']}] | ID: {adset_id}", flush=True)
-                events.append(
-                    f"🧹 <b>Групу вимкнено</b>: {esc(meta['name'])}\n"
-                    f"   Campaign: {esc(meta['campaign_name'] or '—')}\n"
-                    f"   CID: <code>{esc(meta['campaign_id'] or '—')}</code> | AID: <code>{adset_id}</code>"
-                )
+        if len(errors) > insight_errors_before:
+            print(
+                f"   🛡️ Hygiene fail-closed: AdSet-паузи для акаунта {acc_id} пропущено — "
+                f"статистику {date_preset} не підтверджено.",
+                flush=True,
+            )
+        else:
+            with_impressions = {
+                row.get('adset_id') for row in insights if int(row.get('impressions', 0)) > 0
+            }
+
+            for adset_id, meta in active_adsets.items():
+                if adset_id not in with_impressions and change_entity_status(adset_id, 'PAUSED'):
+                    print(f"   🧹 Гігієна: Вимкнено неактивну групу [{meta['name']}] | ID: {adset_id}", flush=True)
+                    events.append(
+                        f"🧹 <b>Групу вимкнено</b>: {esc(meta['name'])}\n"
+                        f"   Campaign: {esc(meta['campaign_name'] or '—')}\n"
+                        f"   CID: <code>{esc(meta['campaign_id'] or '—')}</code> | AID: <code>{adset_id}</code>"
+                    )
 
     # 2. Оголошення: активні, старші за 3 дні, 0 показів за last_7d
     raw_ads = fetch_data(
         f"https://graph.facebook.com/{API_VER}/act_{acc_id}/ads",
         {'fields': 'id,name,effective_status,created_time,adset_id', 'limit': 250},
+        errors,
+        f"ads account {acc_id}",
     )
 
     active_ads = {}
@@ -183,6 +248,7 @@ def process_hygiene_logic(acc_id, events):
             }
 
     if active_ads:
+        insight_errors_before = len(errors)
         insights = fetch_data(
             f"https://graph.facebook.com/{API_VER}/act_{acc_id}/insights",
             {
@@ -191,21 +257,31 @@ def process_hygiene_logic(acc_id, events):
                 'date_preset': date_preset,
                 'limit': 250,
             },
+            errors,
+            f"ad insights {date_preset} account {acc_id}",
         )
-        with_impressions = {
-            row.get('ad_id') for row in insights if int(row.get('impressions', 0)) > 0
-        }
 
-        for ad_id, meta in active_ads.items():
-            if ad_id not in with_impressions and change_entity_status(ad_id, 'PAUSED'):
-                parent = adset_meta.get(meta['adset_id'], {})
-                print(f"   🧹 Гігієна: Вимкнено неактивне оголошення [{meta['name']}] | ID: {ad_id}", flush=True)
-                events.append(
-                    f"🧹 <b>Оголошення вимкнено</b>: {esc(meta['name'])}\n"
-                    f"   Group: {esc(parent.get('name', '—'))}\n"
-                    f"   Campaign: {esc(parent.get('campaign_name', '—'))}\n"
-                    f"   CID: <code>{esc(parent.get('campaign_id', '—'))}</code> | AID: <code>{esc(meta['adset_id'] or '—')}</code>"
-                )
+        if len(errors) > insight_errors_before:
+            print(
+                f"   🛡️ Hygiene fail-closed: Ad-паузи для акаунта {acc_id} пропущено — "
+                f"статистику {date_preset} не підтверджено.",
+                flush=True,
+            )
+        else:
+            with_impressions = {
+                row.get('ad_id') for row in insights if int(row.get('impressions', 0)) > 0
+            }
+
+            for ad_id, meta in active_ads.items():
+                if ad_id not in with_impressions and change_entity_status(ad_id, 'PAUSED'):
+                    parent = adset_meta.get(meta['adset_id'], {})
+                    print(f"   🧹 Гігієна: Вимкнено неактивне оголошення [{meta['name']}] | ID: {ad_id}", flush=True)
+                    events.append(
+                        f"🧹 <b>Оголошення вимкнено</b>: {esc(meta['name'])}\n"
+                        f"   Group: {esc(parent.get('name', '—'))}\n"
+                        f"   Campaign: {esc(parent.get('campaign_name', '—'))}\n"
+                        f"   CID: <code>{esc(parent.get('campaign_id', '—'))}</code> | AID: <code>{esc(meta['adset_id'] or '—')}</code>"
+                    )
 
 
 def main():
@@ -222,13 +298,15 @@ def main():
     for acc_id, currency in ACCOUNTS.items():
         print(f"\n📊 Акаунт: {acc_id} ({currency})", flush=True)
         acc_events = []
+        acc_errors = []
         try:
-            process_hygiene_logic(acc_id, acc_events)
-            all_events.extend(f"Акаунт {acc_id} ({currency}): {e}" for e in acc_events)
+            process_hygiene_logic(acc_id, acc_events, acc_errors)
         except Exception as e:
             err_msg = f"Акаунт {acc_id} ({currency}): {esc(e)}"
             print(f" ❌ Помилка під час обробки гігієни акаунта {acc_id}: {e}", flush=True)
             all_errors.append(err_msg)
+        all_events.extend(f"Акаунт {acc_id} ({currency}): {e}" for e in acc_events)
+        all_errors.extend(f"Акаунт {acc_id} ({currency}): {esc(e)}" for e in acc_errors)
 
     print("\n✅ Денне чищення успішно завершено.", flush=True)
 
