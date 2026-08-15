@@ -1,0 +1,44 @@
+name: FB History Export
+
+on:
+  workflow_dispatch:
+    inputs:
+      history_days:
+        description: "How many days of history to export"
+        required: true
+        default: "365"
+      chunk_days:
+        description: "Meta Insights chunk size in days"
+        required: true
+        default: "30"
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Export Meta Ads history
+        env:
+          FB_ACCESS_TOKEN: ${{ secrets.FB_ACCESS_TOKEN }}
+          FB_SCALER_ACCESS_TOKEN: ${{ secrets.FB_SCALER_ACCESS_TOKEN }}
+          HISTORY_DAYS: ${{ inputs.history_days }}
+          HISTORY_CHUNK_DAYS: ${{ inputs.chunk_days }}
+          HISTORY_OUT_DIR: history_export
+        run: python fb_history_export.py
+
+      - name: Upload history artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fb-history-${{ github.run_id }}
+          path: history_export/
+          if-no-files-found: error
+          retention-days: 30
