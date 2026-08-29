@@ -170,10 +170,12 @@ def process_hygiene_logic(acc_id, events, errors):
     min_age_seconds = HYGIENE_MIN_AGE_DAYS * 24 * 60 * 60
     date_preset = f"last_{HYGIENE_NO_IMPRESSIONS_DAYS}d"
 
-    # 1. Адсети: активні, старші за 3 дні, 0 показів за last_7d
+    # 1. Адсети: власний status ACTIVE, старші за 3 дні, 0 показів за last_7d.
+    # effective_status не використовуємо як фільтр: Hygiene має чистити також
+    # ACTIVE-адсети всередині PAUSED кампаній.
     raw_adsets = fetch_data(
         f"https://graph.facebook.com/{API_VER}/act_{acc_id}/adsets",
-        {'fields': 'id,name,effective_status,created_time,campaign_id,campaign{name}', 'limit': 250},
+        {'fields': 'id,name,status,effective_status,created_time,campaign_id,campaign{name}', 'limit': 250},
         errors,
         f"adsets account {acc_id}",
     )
@@ -188,7 +190,7 @@ def process_hygiene_logic(acc_id, events, errors):
         }
         adset_meta[adset['id']] = meta
 
-        if adset.get('effective_status') != 'ACTIVE' or not adset.get('created_time'):
+        if adset.get('status') != 'ACTIVE' or not adset.get('created_time'):
             continue
         created = parse_iso_time(adset['created_time'])
         if created and (now_utc - created).total_seconds() > min_age_seconds:
@@ -228,17 +230,19 @@ def process_hygiene_logic(acc_id, events, errors):
                         f"   CID: <code>{esc(meta['campaign_id'] or '—')}</code> | AID: <code>{adset_id}</code>"
                     )
 
-    # 2. Оголошення: активні, старші за 3 дні, 0 показів за last_7d
+    # 2. Оголошення: власний status ACTIVE, старші за 3 дні, 0 показів за last_7d.
+    # effective_status не використовуємо як фільтр: Hygiene має чистити також
+    # ACTIVE-оголошення всередині PAUSED кампаній/адсетів.
     raw_ads = fetch_data(
         f"https://graph.facebook.com/{API_VER}/act_{acc_id}/ads",
-        {'fields': 'id,name,effective_status,created_time,adset_id', 'limit': 250},
+        {'fields': 'id,name,status,effective_status,created_time,adset_id', 'limit': 250},
         errors,
         f"ads account {acc_id}",
     )
 
     active_ads = {}
     for ad in raw_ads:
-        if ad.get('effective_status') != 'ACTIVE' or not ad.get('created_time'):
+        if ad.get('status') != 'ACTIVE' or not ad.get('created_time'):
             continue
         created = parse_iso_time(ad['created_time'])
         if created and (now_utc - created).total_seconds() > min_age_seconds:
