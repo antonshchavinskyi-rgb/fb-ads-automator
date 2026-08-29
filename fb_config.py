@@ -1,3 +1,4 @@
+import re
 from zoneinfo import ZoneInfo
 
 # Meta / accounts
@@ -95,6 +96,7 @@ def currency_rate(currency: str) -> float:
 def currency_symbol(currency: str) -> str:
     return CURRENCY_SYMBOLS.get(currency, currency + ' ')
 
+
 def parse_campaign_name(campaign_name: str) -> dict:
     """
     Єдиний толерантний парсер назв кампаній для всіх FB-скриптів.
@@ -104,7 +106,10 @@ def parse_campaign_name(campaign_name: str) -> dict:
     - зайві дефіси/пробіли та повтори того самого тегу не заважають;
     - якщо знайдено кілька РІЗНИХ BE-категорій, назва вважається неоднозначною;
     - каталог визначається маркером `ктг` або `каталог` як окремим токеном;
-    - для звичайної кампанії offer_id = перший чисто цифровий токен;
+    - для звичайної кампанії offer_id = числовий префікс на початку першої частини;
+    - після offer_id допускається технічний суфікс через пробіл або `_`:
+      `1291`, `1291 new`, `1291_new` -> offer_id `1291`;
+    - `abc1291` та `1291abc` не вважаються валідним offer_id;
     - для каталогу offer_id не потрібен.
     """
     raw = str(campaign_name or '')
@@ -148,14 +153,17 @@ def parse_campaign_name(campaign_name: str) -> dict:
             'tokens': parts,
         }
 
-    offer_id = next((p for p in parts if p.isdigit()), None)
+    first_part = parts[0] if parts else ''
+    offer_match = re.match(r'^(\d+)(?=$|[\s_])', first_part)
+    offer_id = offer_match.group(1) if offer_match else None
+
     if not offer_id:
         return {
             'offer_id': None,
             'category': category,
             'is_catalog': False,
             'valid': False,
-            'reason': 'не знайдено offer_id як окремий цифровий токен',
+            'reason': 'не знайдено offer_id як числовий префікс першої частини назви',
             'tokens': parts,
         }
 
@@ -167,4 +175,3 @@ def parse_campaign_name(campaign_name: str) -> dict:
         'reason': '',
         'tokens': parts,
     }
-
