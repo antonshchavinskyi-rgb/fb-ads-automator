@@ -72,6 +72,8 @@ MANAGER_HEARTBEAT_MINUTE_MAX = 15
 # fb_hygiene.py
 HYGIENE_MIN_AGE_DAYS = 3
 HYGIENE_NO_IMPRESSIONS_DAYS = 7
+HYGIENE_LOW_DELIVERY_DAYS = 2
+HYGIENE_LOW_DELIVERY_FACTOR = 0.40
 
 # Безпечний тестовий режим Revive: True = лише показати, що БИ увімкнули, без змін у Meta
 REVIVE_DRY_RUN = False
