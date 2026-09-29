@@ -5,14 +5,21 @@ import urllib.error
 import json
 import time
 import html
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from fb_config import (
     ACCOUNTS,
+    OFFERS,
     API_VER,
     POLAND_TZ,
+    ATTRIBUTION_WINDOW,
     HYGIENE_MIN_AGE_DAYS,
     HYGIENE_NO_IMPRESSIONS_DAYS,
+    HYGIENE_LOW_DELIVERY_DAYS,
+    HYGIENE_LOW_DELIVERY_FACTOR,
+    currency_rate,
+    currency_symbol,
+    parse_campaign_name,
 )
 
 ACCESS_TOKEN = os.environ.get('FB_ACCESS_TOKEN')
@@ -165,17 +172,36 @@ def parse_iso_time(time_str):
         return None
 
 
+def get_leads(actions_list):
+    for action in actions_list:
+        if action.get('action_type') in ['offsite_conversion.fb_pixel_lead', 'lead']:
+            return int(float(action.get('value', 0)))
+    return 0
+
+
 def process_hygiene_logic(acc_id, events, errors):
     now_utc = datetime.now(timezone.utc)
     min_age_seconds = HYGIENE_MIN_AGE_DAYS * 24 * 60 * 60
     date_preset = f"last_{HYGIENE_NO_IMPRESSIONS_DAYS}d"
+    currency = ACCOUNTS[acc_id]
+    rate = currency_rate(currency)
+    sym = currency_symbol(currency)
+
+    # LOW DELIVERY: два повні попередні календарні дні за Europe/Warsaw.
+    today_poland = datetime.now(POLAND_TZ).date()
+    low_since = today_poland - timedelta(days=HYGIENE_LOW_DELIVERY_DAYS)
+    low_until = today_poland - timedelta(days=1)
+    low_range = json.dumps({
+        'since': low_since.isoformat(),
+        'until': low_until.isoformat(),
+    })
 
     # 1. Адсети: власний status ACTIVE, старші за 3 дні, 0 показів за last_7d.
     # effective_status не використовуємо як фільтр: Hygiene має чистити також
     # ACTIVE-адсети всередині PAUSED кампаній.
     raw_adsets = fetch_data(
         f"https://graph.facebook.com/{API_VER}/act_{acc_id}/adsets",
-        {'fields': 'id,name,status,effective_status,created_time,campaign_id,campaign{name}', 'limit': 250},
+        {'fields': 'id,name,status,effective_status,created_time,start_time,campaign_id,campaign{name}', 'limit': 250},
         errors,
         f"adsets account {acc_id}",
     )
@@ -195,6 +221,8 @@ def process_hygiene_logic(acc_id, events, errors):
         created = parse_iso_time(adset['created_time'])
         if created and (now_utc - created).total_seconds() > min_age_seconds:
             active_adsets[adset['id']] = meta
+
+    paused_adset_ids = set()
 
     if active_adsets:
         insight_errors_before = len(errors)
@@ -223,12 +251,97 @@ def process_hygiene_logic(acc_id, events, errors):
 
             for adset_id, meta in active_adsets.items():
                 if adset_id not in with_impressions and change_entity_status(adset_id, 'PAUSED'):
+                    paused_adset_ids.add(adset_id)
                     print(f"   🧹 Гігієна: Вимкнено неактивну групу [{meta['name']}] | ID: {adset_id}", flush=True)
                     events.append(
                         f"🧹 <b>Групу вимкнено</b>: {esc(meta['name'])}\n"
                         f"   Campaign: {esc(meta['campaign_name'] or '—')}\n"
                         f"   CID: <code>{esc(meta['campaign_id'] or '—')}</code> | AID: <code>{adset_id}</code>"
                     )
+
+    # 1.5. LOW DELIVERY
+    # Група мала два повні попередні дні для роботи, але не набрала delivery:
+    # 0 лідів і Spend < 0.40 × BE -> PAUSED.
+    #
+    # Для цього правила вимагаємо effective_status == ACTIVE, щоб PAUSED кампанія
+    # не виглядала як low delivery лише через те, що вона вимкнена.
+    low_candidates = {}
+    for adset in raw_adsets:
+        aid = adset.get('id')
+        if (
+            not aid
+            or aid in paused_adset_ids
+            or adset.get('status') != 'ACTIVE'
+            or adset.get('effective_status') != 'ACTIVE'
+        ):
+            continue
+
+        started = parse_iso_time(adset.get('start_time') or adset.get('created_time'))
+        if not started:
+            continue
+
+        # Група повинна існувати не пізніше початку двохденного вікна.
+        if started.astimezone(POLAND_TZ).date() > low_since:
+            continue
+
+        parsed = parse_campaign_name(adset.get('campaign', {}).get('name', ''))
+        category = parsed.get('category')
+        if category not in OFFERS:
+            continue
+
+        low_candidates[aid] = {
+            'name': adset.get('name', ''),
+            'campaign_id': adset.get('campaign_id', ''),
+            'campaign_name': adset.get('campaign', {}).get('name', ''),
+            'be': OFFERS[category] * rate,
+            'spend': 0.0,
+            'leads': 0,
+        }
+
+    if low_candidates:
+        insight_errors_before = len(errors)
+        low_insights = fetch_data(
+            f"https://graph.facebook.com/{API_VER}/act_{acc_id}/insights",
+            {
+                'level': 'adset',
+                'fields': 'adset_id,spend,actions',
+                'time_range': low_range,
+                'action_attribution_windows': json.dumps(ATTRIBUTION_WINDOW),
+                'limit': 250,
+            },
+            errors,
+            f"low delivery insights {low_since.isoformat()}–{low_until.isoformat()} account {acc_id}",
+        )
+
+        if len(errors) > insight_errors_before:
+            print(
+                f"   🛡️ Hygiene fail-closed: LOW DELIVERY для акаунта {acc_id} пропущено — статистику не підтверджено.",
+                flush=True,
+            )
+        else:
+            for row in low_insights:
+                aid = row.get('adset_id')
+                if aid in low_candidates:
+                    low_candidates[aid]['spend'] = float(row.get('spend', 0))
+                    low_candidates[aid]['leads'] = get_leads(row.get('actions', []))
+
+            for aid, meta in low_candidates.items():
+                limit = meta['be'] * HYGIENE_LOW_DELIVERY_FACTOR
+                if meta['leads'] == 0 and meta['spend'] < limit:
+                    if change_entity_status(aid, 'PAUSED'):
+                        paused_adset_ids.add(aid)
+                        print(
+                            f"   🐢 LOW DELIVERY: Вимкнено групу [{meta['name']}] | "
+                            f"Spend {meta['spend']:.2f}{sym} < {limit:.2f}{sym} | ID: {aid}",
+                            flush=True,
+                        )
+                        events.append(
+                            f"🐢 <b>LOW DELIVERY — групу вимкнено</b>: {esc(meta['name'])}\n"
+                            f"   Campaign: {esc(meta['campaign_name'] or '—')}\n"
+                            f"   CID: <code>{esc(meta['campaign_id'] or '—')}</code> | AID: <code>{aid}</code>\n"
+                            f"   {low_since.isoformat()}–{low_until.isoformat()}: 0 лідів • "
+                            f"Spend {meta['spend']:.2f}{sym} < {limit:.2f}{sym} ({HYGIENE_LOW_DELIVERY_FACTOR:.2f}×BE)"
+                        )
 
     # 2. Оголошення: власний status ACTIVE, старші за 3 дні, 0 показів за last_7d.
     # effective_status не використовуємо як фільтр: Hygiene має чистити також
