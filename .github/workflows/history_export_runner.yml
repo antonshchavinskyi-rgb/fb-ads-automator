@@ -12,6 +12,11 @@ on:
         required: true
         default: "30"
 
+
+concurrency:
+  group: fb-history-export
+  cancel-in-progress: false
+
 jobs:
   export:
     runs-on: ubuntu-latest
@@ -33,7 +38,7 @@ jobs:
           HISTORY_DAYS: ${{ inputs.history_days }}
           HISTORY_CHUNK_DAYS: ${{ inputs.chunk_days }}
           HISTORY_OUT_DIR: history_export
-        run: python fb_history_export.py
+        run: timeout 55m python fb_history_export.py
 
       - name: Upload history artifact
         uses: actions/upload-artifact@v4
