@@ -4,6 +4,9 @@ on:
   workflow_dispatch: # Для окремого зовнішнього cron; його можна незалежно вмикати/зупиняти
 
 
+permissions:
+  contents: write
+
 concurrency:
   group: fb-revive-deep
   cancel-in-progress: false
@@ -25,6 +28,7 @@ jobs:
       - name: Run DEEP 14D to 7D Revive
         env:
           FB_ACCESS_TOKEN: ${{ secrets.FB_ACCESS_TOKEN }}
+          META_GITHUB_TOKEN: ${{ github.token }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           PYTHONUNBUFFERED: "1"
