@@ -72,34 +72,77 @@ def send_telegram_lines(header, lines, max_chars=3800):
         send_telegram(chunk)
 
 
-def fetch_data(endpoint, params):
+def fetch_data(endpoint, params, context=""):
+    """
+    Meta GET з обмеженими повторними спробами.
+
+    Manager не може чекати rate limit безкінечно: після 15/30/60 сек
+    повторів завершуємо поточний акаунт з помилкою. main() надішле
+    Telegram alert, а наступний cron-запуск спробує знову.
+    """
     params = dict(params)
     params['access_token'] = ACCESS_TOKEN
     query_string = urllib.parse.urlencode(params)
     url = f"{endpoint}?{query_string}"
 
     results = []
+    rate_limit_delays = [15, 30, 60]
+    rate_limit_attempt = 0
+
     while url:
         time.sleep(0.1)
         try:
             req = urllib.request.Request(url)
-            with urllib.request.urlopen(req) as response:
+            with urllib.request.urlopen(req, timeout=30) as response:
                 data = json.loads(response.read().decode('utf-8'))
                 results.extend(data.get('data', []))
                 url = data.get('paging', {}).get('next') if 'paging' in data else None
+                rate_limit_attempt = 0
         except urllib.error.HTTPError as e:
             error_body = e.read().decode('utf-8')
-            if 'User request limit reached' in error_body or '"code":17' in error_body:
-                print(" ⏳ Ліміт запитів Meta (Code 17). Пауза 15 сек...", flush=True)
-                time.sleep(15)
-                continue
-            print(f" ❌ Помилка API Meta ({e.code}): {error_body}", flush=True)
-            break
-        except Exception as e:
-            print(f" ⚠️ Помилка з'єднання: {e}", flush=True)
-            break
-    return results
+            try:
+                payload = json.loads(error_body)
+                meta_error = payload.get('error', {})
+            except Exception:
+                meta_error = {}
 
+            code = meta_error.get('code')
+            subcode = meta_error.get('error_subcode')
+            message = meta_error.get('message') or error_body
+            is_rate_limit = (
+                code in (4, 17)
+                or subcode == 1504022
+                or 'request limit' in str(message).lower()
+                or 'user request limit' in str(message).lower()
+            )
+
+            if is_rate_limit and rate_limit_attempt < len(rate_limit_delays):
+                delay = rate_limit_delays[rate_limit_attempt]
+                rate_limit_attempt += 1
+                print(
+                    f" ⏳ Meta rate limit ({context}) code={code} subcode={subcode}. "
+                    f"Пауза {delay} сек, спроба {rate_limit_attempt}/{len(rate_limit_delays)}...",
+                    flush=True,
+                )
+                time.sleep(delay)
+                continue
+
+            if is_rate_limit:
+                raise RuntimeError(
+                    f"Meta rate limit після {rate_limit_attempt} повторів — {context}; "
+                    f"HTTP {e.code}, code={code}, subcode={subcode}"
+                )
+
+            raise RuntimeError(
+                f"API Meta HTTP {e.code} {context}: "
+                f"code={code}, subcode={subcode}, message={message}"
+            )
+        except RuntimeError:
+            raise
+        except Exception as e:
+            raise RuntimeError(f"Помилка з'єднання {context}: {e}") from e
+
+    return results
 
 def get_leads(actions_list):
     for action in actions_list:
@@ -114,14 +157,13 @@ def change_entity_status(entity_id, new_status):
     data = urllib.parse.urlencode({'status': new_status, 'access_token': ACCESS_TOKEN}).encode('utf-8')
     try:
         req = urllib.request.Request(url, data=data)
-        with urllib.request.urlopen(req):
+        with urllib.request.urlopen(req, timeout=30):
             return True
     except urllib.error.HTTPError as e:
-        print(f" ❌ HTTP {e.code} при зміні статусу ID {entity_id}: {e.read().decode('utf-8')}", flush=True)
-        return False
+        body = e.read().decode('utf-8')
+        raise RuntimeError(f"HTTP {e.code} при зміні статусу ID {entity_id}: {body}")
     except Exception as e:
-        print(f" ❌ Помилка зміни статусу ID {entity_id}: {e}", flush=True)
-        return False
+        raise RuntimeError(f"Помилка зміни статусу ID {entity_id}: {e}") from e
 
 
 def process_offers_logic(acc_id, currency, events):
@@ -136,7 +178,7 @@ def process_offers_logic(acc_id, currency, events):
     raw_adsets = fetch_data(endpoint, {
         'fields': 'id,name,status,effective_status,campaign_id,campaign{name}',
         'limit': 250,
-    })
+    }, f"adsets account {acc_id}")
 
     raw_candidates = {}
     for adset in raw_adsets:
@@ -168,7 +210,7 @@ def process_offers_logic(acc_id, currency, events):
         'date_preset': 'today',
         'action_attribution_windows': json.dumps(ATTRIBUTION_WINDOW),
         'limit': 250,
-    })
+    }, f"today insights account {acc_id}")
     for row in insights_today:
         aid = row.get('adset_id')
         if aid in raw_candidates:
@@ -182,7 +224,7 @@ def process_offers_logic(acc_id, currency, events):
         'time_range': last_2d_time_range,
         'action_attribution_windows': json.dumps(ATTRIBUTION_WINDOW),
         'limit': 250,
-    })
+    }, f"today+yesterday insights account {acc_id}")
     for row in insights_2d:
         aid = row.get('adset_id')
         if aid in raw_candidates:
