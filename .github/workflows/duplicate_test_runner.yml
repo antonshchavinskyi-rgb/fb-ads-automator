@@ -8,6 +8,11 @@ on:
         required: true
         type: string
 
+
+concurrency:
+  group: fb-duplicate-test
+  cancel-in-progress: false
+
 jobs:
   duplicate-test:
     runs-on: ubuntu-latest
@@ -28,7 +33,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TEST_ADSET_ID: ${{ inputs.adset_id }}
-        run: python fb_duplicate_test.py
+        run: timeout 12m python fb_duplicate_test.py
 
       - name: Upload audit report
         if: always()
