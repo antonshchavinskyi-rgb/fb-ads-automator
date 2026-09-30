@@ -4,6 +4,9 @@ on:
   workflow_dispatch:
 
 
+permissions:
+  contents: write
+
 concurrency:
   group: fb-manager
   cancel-in-progress: false
@@ -25,6 +28,7 @@ jobs:
       - name: Run FB Manager Script
         env:
           FB_ACCESS_TOKEN: ${{ secrets.FB_ACCESS_TOKEN }}
+          META_GITHUB_TOKEN: ${{ github.token }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           PYTHONUNBUFFERED: "1" # <--- ПРИМУСОВИЙ МИТТЄВИЙ ВИВІД ЛОГІВ
