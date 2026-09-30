@@ -3,9 +3,15 @@ name: FB Ads Hygiene Daily
 on:
   workflow_dispatch: # Тепер тригериться зовнішнім cron-job.org
 
+
+concurrency:
+  group: fb-hygiene
+  cancel-in-progress: false
+
 jobs:
   run-hygiene:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository code
@@ -22,4 +28,16 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           PYTHONUNBUFFERED: "1"
-        run: python fb_hygiene.py
+        run: timeout 12m python fb_hygiene.py
+
+      - name: Alert on workflow failure
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+            curl -sS -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
+              --data-urlencode "chat_id=$TELEGRAM_CHAT_ID" \
+              --data-urlencode "text=⚠️ FB Hygiene workflow зупинено через помилку або timeout. GitHub Actions run: $GITHUB_RUN_ID" >/dev/null || true
+          fi
