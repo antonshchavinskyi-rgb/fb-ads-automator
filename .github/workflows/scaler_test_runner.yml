@@ -24,6 +24,11 @@ on:
         required: false
         type: string
 
+
+concurrency:
+  group: fb-scaler
+  cancel-in-progress: false
+
 jobs:
   scaler-test:
     runs-on: ubuntu-latest
@@ -51,4 +56,16 @@ jobs:
           SCALER_ACCOUNT_ID: ${{ inputs.account_id }}
           SCALER_CREATE_CONFIRMATION: ${{ inputs.create_confirmation }}
           PYTHONUNBUFFERED: "1"
-        run: python fb_scaler.py
+        run: timeout 20m python fb_scaler.py
+
+      - name: Alert on workflow failure
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+            curl -sS -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
+              --data-urlencode "chat_id=$TELEGRAM_CHAT_ID" \
+              --data-urlencode "text=⚠️ FB Scaler workflow зупинено через помилку або timeout. GitHub Actions run: $GITHUB_RUN_ID" >/dev/null || true
+          fi
