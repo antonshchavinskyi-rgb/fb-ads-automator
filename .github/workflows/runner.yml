@@ -3,9 +3,15 @@ name: FB Ads Manager Auto-Checker
 on:
   workflow_dispatch:
 
+
+concurrency:
+  group: fb-manager
+  cancel-in-progress: false
+
 jobs:
   run-fb-manager:
     runs-on: ubuntu-latest
+    timeout-minutes: 8
 
     steps:
       - name: Checkout repository code
@@ -22,4 +28,16 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           PYTHONUNBUFFERED: "1" # <--- ПРИМУСОВИЙ МИТТЄВИЙ ВИВІД ЛОГІВ
-        run: python fb_manager.py
+        run: timeout 6m python fb_manager.py
+
+      - name: Alert on workflow failure
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+            curl -sS -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
+              --data-urlencode "chat_id=$TELEGRAM_CHAT_ID" \
+              --data-urlencode "text=⚠️ FB Manager workflow зупинено через помилку або timeout. GitHub Actions run: $GITHUB_RUN_ID" >/dev/null || true
+          fi
