@@ -7,6 +7,8 @@ import time
 import html
 from datetime import datetime, timedelta
 
+from fb_api_guard import MetaRateLimitError, cooldown_active, set_cooldown, clear_after_success
+
 from fb_config import (
     ACCOUNTS,
     OFFERS,
@@ -128,9 +130,11 @@ def fetch_data(endpoint, params, context=""):
                 continue
 
             if is_rate_limit:
-                raise RuntimeError(
-                    f"Meta rate limit після {rate_limit_attempt} повторів — {context}; "
-                    f"HTTP {e.code}, code={code}, subcode={subcode}"
+                raise MetaRateLimitError(
+                    context=context,
+                    code=code,
+                    subcode=subcode,
+                    http_status=e.code,
                 )
 
             raise RuntimeError(
@@ -161,6 +165,21 @@ def change_entity_status(entity_id, new_status):
             return True
     except urllib.error.HTTPError as e:
         body = e.read().decode('utf-8')
+        try:
+            payload = json.loads(body)
+            meta_error = payload.get('error', {})
+        except Exception:
+            meta_error = {}
+        code = meta_error.get('code')
+        subcode = meta_error.get('error_subcode')
+        message = meta_error.get('message') or body
+        if code in (4, 17) or 'request limit' in str(message).lower() or 'user request limit' in str(message).lower():
+            raise MetaRateLimitError(
+                context=f"change status {entity_id}",
+                code=code,
+                subcode=subcode,
+                http_status=e.code,
+            )
         raise RuntimeError(f"HTTP {e.code} при зміні статусу ID {entity_id}: {body}")
     except Exception as e:
         raise RuntimeError(f"Помилка зміни статусу ID {entity_id}: {e}") from e
@@ -303,6 +322,15 @@ def main():
         print("❌ Помилка: FB_ACCESS_TOKEN не знайдено в змінних середовища!", flush=True)
         return
 
+    cooldown, cooldown_state = cooldown_active("main")
+    if cooldown:
+        print(
+            f"⏸️ FB Manager пропущено: Meta API cooldown до {cooldown_state.get('until')} "
+            f"| {cooldown_state.get('reason', '')}",
+            flush=True,
+        )
+        return
+
     now_poland = datetime.now(POLAND_TZ)
     is_heartbeat_window = (
         now_poland.hour == MANAGER_HEARTBEAT_HOUR
@@ -313,6 +341,7 @@ def main():
 
     all_events = []
     all_errors = []
+    rate_limited = False
 
     for acc_id, currency in ACCOUNTS.items():
         print(f"\n📊 Акаунт: {acc_id} ({currency})", flush=True)
@@ -320,12 +349,31 @@ def main():
         try:
             process_offers_logic(acc_id, currency, acc_events)
             all_events.extend(f"Акаунт {acc_id} ({currency}):\n{e}" for e in acc_events)
+        except MetaRateLimitError as e:
+            rate_limited = True
+            reason = f"Code {e.code}" + (f"/{e.subcode}" if e.subcode else "")
+            print(f" 🚨 {e}", flush=True)
+            try:
+                set_cooldown("main", reason, "fb_manager")
+            except Exception as guard_error:
+                print(f" ⚠️ Не вдалося зберегти API cooldown: {guard_error}", flush=True)
+            all_errors.append(f"Акаунт {acc_id} ({currency}): {esc(e)}")
         except Exception as e:
             err_msg = f"Акаунт {acc_id} ({currency}): {esc(e)}"
             print(f" ❌ Помилка під час обробки акаунта {acc_id}: {e}", flush=True)
             all_errors.append(err_msg)
 
-    print("\n✅ Моніторинг успішно завершено.", flush=True)
+        if rate_limited:
+            print("⏸️ Решту акаунтів пропущено через Meta API cooldown.", flush=True)
+            break
+
+    if not rate_limited:
+        try:
+            clear_after_success("main")
+        except Exception as guard_error:
+            print(f" ⚠️ Не вдалося очистити API cooldown: {guard_error}", flush=True)
+
+    print("\n✅ Моніторинг завершено.", flush=True)
 
     time_str = now_poland.strftime('%Y-%m-%d %H:%M')
     if all_errors:
