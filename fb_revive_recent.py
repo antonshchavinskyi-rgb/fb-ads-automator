@@ -8,6 +8,8 @@ import html
 from collections import defaultdict
 from datetime import datetime, timedelta
 
+from fb_api_guard import MetaRateLimitError, cooldown_active, set_cooldown, clear_after_success
+
 from fb_config import (
     ACCOUNTS,
     OFFERS,
@@ -83,7 +85,7 @@ def fetch_data(endpoint, params, errors=None, context=""):
     url = f"{endpoint}?{query_string}"
 
     results = []
-    rate_limit_delays = [30, 60, 120]
+    rate_limit_delays = [15, 30, 60]
     rate_limit_attempt = 0
 
     while url:
@@ -127,9 +129,11 @@ def fetch_data(endpoint, params, errors=None, context=""):
                 continue
 
             if is_rate_limit:
-                msg = (
-                    f"Meta rate limit після {rate_limit_attempt} повторів — {context}; "
-                    f"HTTP {e.code}, code={code}, subcode={subcode}, transient={is_transient}"
+                raise MetaRateLimitError(
+                    context=context,
+                    code=code,
+                    subcode=subcode,
+                    http_status=e.code,
                 )
             else:
                 msg = f"API Meta HTTP {e.code} {context}: code={code}, subcode={subcode}, message={message}"
@@ -163,6 +167,21 @@ def change_entity_status(entity_id, new_status, errors=None, context=""):
             return True
     except urllib.error.HTTPError as e:
         body = e.read().decode('utf-8')
+        try:
+            payload = json.loads(body)
+            meta_error = payload.get('error', {})
+        except Exception:
+            meta_error = {}
+        code = meta_error.get('code')
+        subcode = meta_error.get('error_subcode')
+        message = meta_error.get('message') or body
+        if code in (4, 17) or 'request limit' in str(message).lower() or 'user request limit' in str(message).lower():
+            raise MetaRateLimitError(
+                context=context or f"change status {entity_id}",
+                code=code,
+                subcode=subcode,
+                http_status=e.code,
+            )
         msg = f"HTTP {e.code} при зміні статусу {context or entity_id}: {body}"
         print(f" ❌ {msg}", flush=True)
         if errors is not None:
@@ -361,6 +380,15 @@ def main():
         print("❌ Помилка: FB_ACCESS_TOKEN не знайдено в змінних середовища!", flush=True)
         return
 
+    cooldown, cooldown_state = cooldown_active("main")
+    if cooldown:
+        print(
+            f"⏸️ FB Revive RECENT пропущено: Meta API cooldown до {cooldown_state.get('until')} "
+            f"| {cooldown_state.get('reason', '')}",
+            flush=True,
+        )
+        return
+
     now_poland = datetime.now(POLAND_TZ)
     time_ranges = build_time_ranges(now_poland)
     mode_label = 'DRY RUN' if REVIVE_DRY_RUN else 'LIVE'
@@ -378,10 +406,24 @@ def main():
             account_states[acc_id] = candidates
             ads_maps[acc_id] = ads_by_adset
             print(f"📊 Акаунт {acc_id} ({currency}): paused candidates = {len(candidates)}", flush=True)
+        except MetaRateLimitError as e:
+            reason = f"Code {e.code}" + (f"/{e.subcode}" if e.subcode else "")
+            print(f" 🚨 {e}", flush=True)
+            try:
+                set_cooldown("main", reason, "fb_revive_recent")
+            except Exception as guard_error:
+                print(f" ⚠️ Не вдалося зберегти API cooldown: {guard_error}", flush=True)
+            errors.append(f"Акаунт {acc_id} ({currency}): {e}")
+            break
         except Exception as e:
             msg = f"Акаунт {acc_id} ({currency}): {e}"
             print(f" ❌ {msg}", flush=True)
             errors.append(msg)
+
+    try:
+        clear_after_success("main")
+    except Exception as guard_error:
+        print(f" ⚠️ Не вдалося очистити API cooldown: {guard_error}", flush=True)
 
     recent_selected = []
     for acc_id, candidates in account_states.items():
