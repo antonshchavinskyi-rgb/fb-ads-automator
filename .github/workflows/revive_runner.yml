@@ -4,6 +4,9 @@ on:
   workflow_dispatch: # Чинний зовнішній cron-job.org викликає цей workflow о 05:45 Europe/Warsaw
 
 
+permissions:
+  contents: write
+
 concurrency:
   group: fb-revive-recent
   cancel-in-progress: false
@@ -25,6 +28,7 @@ jobs:
       - name: Run RECENT 2D Revive
         env:
           FB_ACCESS_TOKEN: ${{ secrets.FB_ACCESS_TOKEN }}
+          META_GITHUB_TOKEN: ${{ github.token }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           PYTHONUNBUFFERED: "1"
