@@ -1,7 +1,7 @@
 {
   "channel": "main",
-  "set_at": "2026-10-07T01:05:40.870114+00:00",
-  "until": "2026-10-07T02:05:40.870114+00:00",
-  "reason": "Code 17/2446079",
-  "triggered_by": "fb_hygiene"
+  "until": null,
+  "recovered_at": "2026-10-07T02:16:48.638816+00:00",
+  "previous_reason": "Code 17/2446079",
+  "previous_triggered_by": "fb_hygiene"
 }
