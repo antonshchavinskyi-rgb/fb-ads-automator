@@ -1,0 +1,48 @@
+name: Crypto API connectivity (isolated test)
+
+on:
+  push:
+    branches:
+      - test/bybit-api-connectivity
+
+permissions:
+  contents: read
+
+jobs:
+  network-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Public API reachability (no credentials)
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import urllib.request
+          import urllib.error
+
+          urls = {
+              "bybit": "https://api.bybit.com/v5/market/time",
+              "bytick": "https://api.bytick.com/v5/market/time",
+              "binance_futures": "https://fapi.binance.com/fapi/v1/time",
+              "binance_spot": "https://api.binance.com/api/v3/time",
+          }
+          results = {}
+          for name, url in urls.items():
+              try:
+                  with urllib.request.urlopen(
+                      urllib.request.Request(url, headers={"User-Agent": "curl/8.0"}),
+                      timeout=15,
+                  ) as response:
+                      status = response.status
+                      body = response.read(200).decode("utf-8", errors="replace")
+              except urllib.error.HTTPError as error:
+                  status = error.code
+                  body = error.read(200).decode("utf-8", errors="replace")
+              except Exception as error:
+                  status = "ERROR"
+                  body = str(error)
+              print(f"{name}: HTTP={status}, body={body}", flush=True)
+              results[name] = status
+          if results["bybit"] != 200:
+              raise SystemExit("Bybit unreachable from GitHub-hosted runner")
+          PY
