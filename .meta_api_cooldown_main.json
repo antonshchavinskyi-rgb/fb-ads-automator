@@ -1,7 +1,7 @@
 {
   "channel": "main",
-  "set_at": "2026-10-13T03:48:29.784863+00:00",
-  "until": "2026-10-13T04:48:29.784863+00:00",
+  "set_at": "2026-10-13T03:48:38.589098+00:00",
+  "until": "2026-10-13T04:48:38.589098+00:00",
   "reason": "Code 17/2446079",
-  "triggered_by": "fb_manager"
+  "triggered_by": "fb_revive_recent"
 }
