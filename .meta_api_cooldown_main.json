@@ -1,7 +1,7 @@
 {
   "channel": "main",
-  "until": null,
-  "recovered_at": "2026-11-04T03:32:43.479994+00:00",
-  "previous_reason": "Code 17/2446079",
-  "previous_triggered_by": "fb_manager"
+  "set_at": "2026-11-04T04:48:49.016157+00:00",
+  "until": "2026-11-04T05:48:49.016157+00:00",
+  "reason": "Code 17/2446079",
+  "triggered_by": "fb_manager"
 }
