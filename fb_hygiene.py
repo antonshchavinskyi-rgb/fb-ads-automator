@@ -5,6 +5,7 @@ import urllib.error
 import json
 import time
 import html
+import base64
 from datetime import datetime, timezone, timedelta
 
 from fb_api_guard import MetaRateLimitError, cooldown_active, set_cooldown, clear_after_success
@@ -27,6 +28,102 @@ from fb_config import (
 ACCESS_TOKEN = os.environ.get('FB_ACCESS_TOKEN')
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
+
+# Оголошення, для яких Meta відхилила PAUSED через недоступний creative.
+# Persist між GitHub runners, щоб не надсилати однакові невдалі POST щодня.
+HYGIENE_REJECTIONS_FILE = 'hygiene_creative_rejections.json'
+HYGIENE_REJECTION_RETRY_DAYS = 30
+HYGIENE_TIME_BUDGET_SECONDS = 9 * 60
+HYGIENE_MAX_STATUS_CALLS = 120
+_hygiene_started_monotonic = time.monotonic()
+_hygiene_status_calls = 0
+_hygiene_rejections = {}
+_hygiene_rejections_dirty = False
+
+
+class HygieneTimeBudgetExceeded(RuntimeError):
+    pass
+
+
+def check_execution_budget():
+    if time.monotonic() - _hygiene_started_monotonic > HYGIENE_TIME_BUDGET_SECONDS:
+        raise HygieneTimeBudgetExceeded("Досягнуто безпечного 9-хвилинного ліміту Hygiene")
+
+
+def load_rejections():
+    global _hygiene_rejections, _hygiene_rejections_dirty
+    try:
+        with open(HYGIENE_REJECTIONS_FILE, encoding='utf-8') as f:
+            payload = json.load(f)
+        _hygiene_rejections = payload.get('failures', {})
+    except FileNotFoundError:
+        _hygiene_rejections = {}
+    except Exception as e:
+        # Fail-closed: помилка завантаження виключень не повинна породити
+        # шторм повторних POST до десятків відомих проблемних оголошень.
+        raise RuntimeError(f"Не вдалося завантажити Hygiene rejection cache: {e}") from e
+    _hygiene_rejections_dirty = False
+
+
+def cached_rejection(ad_id, updated_time=None):
+    record = _hygiene_rejections.get(str(ad_id))
+    if not record:
+        return False
+    # Нове редагування оголошення може виправити creative: повторний PAUSED дозволений.
+    if updated_time and record.get('updated_time') and updated_time != record['updated_time']:
+        return False
+    retry_at = record.get('retry_after')
+    try:
+        return bool(retry_at and datetime.now(timezone.utc) < datetime.fromisoformat(retry_at))
+    except Exception:
+        return False
+
+
+def record_rejection(ad_id, updated_time, subcode):
+    global _hygiene_rejections_dirty
+    now = datetime.now(timezone.utc)
+    _hygiene_rejections[str(ad_id)] = {
+        'error_subcode': subcode,
+        'recorded_at': now.isoformat(),
+        'retry_after': (now + timedelta(days=HYGIENE_REJECTION_RETRY_DAYS)).isoformat(),
+        'updated_time': updated_time or None,
+    }
+    _hygiene_rejections_dirty = True
+
+
+def save_rejections():
+    global _hygiene_rejections_dirty
+    if not _hygiene_rejections_dirty:
+        return
+
+    content = json.dumps({'failures': _hygiene_rejections}, ensure_ascii=False, indent=2) + '\\n'
+    repo = os.getenv('GITHUB_REPOSITORY')
+    token = os.getenv('META_GITHUB_TOKEN')
+    if not repo or not token:
+        print("⚠️ Карантин нових проблемних оголошень не збережено між запусками: немає GitHub token.", flush=True)
+        return
+
+    path = HYGIENE_REJECTIONS_FILE
+    url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Accept': 'application/vnd.github+json',
+        'Content-Type': 'application/json',
+        'User-Agent': 'fb-hygiene-rejections',
+    }
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=20) as response:
+        current = json.load(response)
+    payload = json.dumps({
+        'message': 'Update Hygiene rejected creative cache',
+        'branch': 'main',
+        'sha': current['sha'],
+        'content': base64.b64encode(content.encode('utf-8')).decode('ascii'),
+    }).encode('utf-8')
+    req = urllib.request.Request(url, data=payload, headers=headers, method='PUT')
+    with urllib.request.urlopen(req, timeout=20):
+        pass
+    _hygiene_rejections_dirty = False
 
 
 def esc(text):
@@ -89,10 +186,11 @@ def fetch_data(endpoint, params, errors=None, context=""):
     rate_limit_attempt = 0
 
     while url:
+        check_execution_budget()
         time.sleep(0.1)
         try:
             req = urllib.request.Request(url)
-            with urllib.request.urlopen(req) as response:
+            with urllib.request.urlopen(req, timeout=30) as response:
                 data = json.loads(response.read().decode('utf-8'))
                 results.extend(data.get('data', []))
                 url = data.get('paging', {}).get('next') if 'paging' in data else None
@@ -153,13 +251,18 @@ def fetch_data(endpoint, params, errors=None, context=""):
     return results
 
 
-def change_entity_status(entity_id, new_status):
+def change_entity_status(entity_id, new_status, updated_time=None):
+    global _hygiene_status_calls
+    check_execution_budget()
+    if _hygiene_status_calls >= HYGIENE_MAX_STATUS_CALLS:
+        raise HygieneTimeBudgetExceeded("Досягнуто обмеження кількості status-запитів за запуск")
+    _hygiene_status_calls += 1
     time.sleep(0.1)
     url = f"https://graph.facebook.com/{API_VER}/{entity_id}"
     data = urllib.parse.urlencode({'status': new_status, 'access_token': ACCESS_TOKEN}).encode('utf-8')
     try:
         req = urllib.request.Request(url, data=data)
-        with urllib.request.urlopen(req):
+        with urllib.request.urlopen(req, timeout=30):
             return True
     except urllib.error.HTTPError as e:
         body = e.read().decode('utf-8')
@@ -183,7 +286,11 @@ def change_entity_status(entity_id, new_status):
                 subcode=subcode,
                 http_status=e.code,
             )
-        print(f" ❌ HTTP {e.code} при зміні статусу ID {entity_id}: {body}", flush=True)
+        if code == 100 and subcode == 2446289:
+            record_rejection(entity_id, updated_time, subcode)
+            print(f" ⚠️ Creative недоступний: оголошення {entity_id} у карантині на {HYGIENE_REJECTION_RETRY_DAYS} днів.", flush=True)
+            return False
+        print(f" ❌ HTTP {e.code} при зміні статусу ID {entity_id}: {body[:1000]}", flush=True)
         return False
     except Exception as e:
         print(f" ❌ Помилка зміни статусу ID {entity_id}: {e}", flush=True)
@@ -373,7 +480,7 @@ def process_hygiene_logic(acc_id, events, errors):
     # ACTIVE-оголошення всередині PAUSED кампаній/адсетів.
     raw_ads = fetch_data(
         f"https://graph.facebook.com/{API_VER}/act_{acc_id}/ads",
-        {'fields': 'id,name,status,effective_status,created_time,adset_id', 'limit': 250},
+        {'fields': 'id,name,status,effective_status,created_time,updated_time,adset_id', 'limit': 250},
         errors,
         f"ads account {acc_id}",
     )
@@ -414,8 +521,15 @@ def process_hygiene_logic(acc_id, events, errors):
                 row.get('ad_id') for row in insights if int(row.get('impressions', 0)) > 0
             }
 
+            skipped_creatives = 0
             for ad_id, meta in active_ads.items():
-                if ad_id not in with_impressions and change_entity_status(ad_id, 'PAUSED'):
+                check_execution_budget()
+                if ad_id in with_impressions:
+                    continue
+                if cached_rejection(ad_id, meta.get('updated_time')):
+                    skipped_creatives += 1
+                    continue
+                if change_entity_status(ad_id, 'PAUSED', meta.get('updated_time')):
                     parent = adset_meta.get(meta['adset_id'], {})
                     print(f"   🧹 Гігієна: Вимкнено неактивне оголошення [{meta['name']}] | ID: {ad_id}", flush=True)
                     events.append(
@@ -424,6 +538,8 @@ def process_hygiene_logic(acc_id, events, errors):
                         f"   Campaign: {esc(parent.get('campaign_name', '—'))}\n"
                         f"   CID: <code>{esc(parent.get('campaign_id', '—'))}</code> | AID: <code>{esc(meta['adset_id'] or '—')}</code>"
                     )
+\n            if skipped_creatives:
+                print(f"🛡️ Пропущено {skipped_creatives} оголошень з відомою помилкою creative.", flush=True)
 
 
 def main():
@@ -439,6 +555,11 @@ def main():
             flush=True,
         )
         return
+
+    global _hygiene_started_monotonic, _hygiene_status_calls
+    _hygiene_started_monotonic = time.monotonic()
+    _hygiene_status_calls = 0
+    load_rejections()
 
     now_poland = datetime.now(POLAND_TZ)
     print(f"🧹 [FB Ads Hygiene Start] {now_poland.strftime('%Y-%m-%d %H:%M:%S')} (Poland Time)", flush=True)
@@ -462,6 +583,10 @@ def main():
             except Exception as guard_error:
                 print(f" ⚠️ Не вдалося зберегти API cooldown: {guard_error}", flush=True)
             all_errors.append(f"Акаунт {acc_id} ({currency}): {esc(e)}")
+        except HygieneTimeBudgetExceeded as e:
+            all_errors.append(f"Акаунт {acc_id} ({currency}): {esc(e)}")
+            print(f"⏱️ Hygiene зупинив операції безпечно: {e}", flush=True)
+            break
         except Exception as e:
             err_msg = f"Акаунт {acc_id} ({currency}): {esc(e)}"
             print(f" ❌ Помилка під час обробки гігієни акаунта {acc_id}: {e}", flush=True)
@@ -473,6 +598,12 @@ def main():
         if rate_limited:
             print("⏸️ Решту акаунтів пропущено через Meta API cooldown.", flush=True)
             break
+
+    try:
+        save_rejections()
+    except Exception as e:
+        all_errors.append(f"Не вдалося зберегти Hygiene creative exclusions: {esc(e)}")
+        print(f"⚠️ Помилка збереження creative exclusions: {e}", flush=True)
 
     if not rate_limited:
         try:
