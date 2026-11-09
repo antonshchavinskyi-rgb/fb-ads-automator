@@ -96,7 +96,7 @@ def save_rejections():
     if not _hygiene_rejections_dirty:
         return
 
-    content = json.dumps({'failures': _hygiene_rejections}, ensure_ascii=False, indent=2) + '\\n'
+    content = json.dumps({'failures': _hygiene_rejections}, ensure_ascii=False, indent=2) + '\n'
     repo = os.getenv('GITHUB_REPOSITORY')
     token = os.getenv('META_GITHUB_TOKEN')
     if not repo or not token:
