@@ -494,6 +494,7 @@ def process_hygiene_logic(acc_id, events, errors):
             active_ads[ad['id']] = {
                 'name': ad.get('name', ''),
                 'adset_id': ad.get('adset_id', ''),
+                'updated_time': ad.get('updated_time'),
             }
 
     if active_ads:
