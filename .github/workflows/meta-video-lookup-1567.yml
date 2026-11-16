@@ -1,119 +1,82 @@
-name: Verify the videos used by the created ads
+name: Verify newly uploaded account videos for offer 1567
 on:
   push:
     branches: [codex/meta-video-lookup-20261116]
     paths: [.github/workflows/meta-video-lookup-1567.yml]
 permissions: {}
 jobs:
-  verify:
+  lookup:
     runs-on: ubuntu-latest
-    timeout-minutes: 6
+    timeout-minutes: 5
     steps:
-      - name: Check ad creative video identity
+      - name: Read account video names and processing status
         env:
           META_ACCESS_TOKEN: ${{ secrets.FB_SCALER_ACCESS_TOKEN }}
         run: |
           python - <<'PY'
-          plan = [["786ff14fa7419716d1b922e286ed8acf4ebcfc66905daa5cdedfc0fb3874d419","6d7c53f6fc11d322441e111a490d94e5798f26a2d1a87ce302ff77bd66ae852d","a8dfa1243123b20034bc6c7fbe171b05795a0adf329eb10827be3419dea145bd","687328c659421c3686532d280eb3ac33c3a787ac194b4a017a7bc4e6eeeaafb1","b63d26509801281800cd7e5ad4afdc6ede75d6d4f19c21d5a677bc905b1ba1d4","be5c1247e1beb34d040e6cf3d4a614df125e5339fa4febbc623783b568a34da2"],["bbbd4a8fdf485b06bf9a664d4f15fc02df11bcd9a331b0aa265ff2c3463d158d","301f95dcaeccbb65a0786ee75a282b46d99d972ea4a52d8527d22a1f3bfe55b6","12b694c9862fd9af37937d4cfeabef000bd52ffbbc9d2aafd4d551f90ecc325d","ddbef068d57cef829cccd387746a9770786f052c95d02434458700aaaaa1818b","defc0ddf5b5937ece8770892610d5d273bd708bd0f8d145673932d76fe493a20","5419b740608ce5659dcf3819fe094023a42f5bc3cae8b5e425b2789ee5d969dc"],["ec061e5cfdfe07fb47046374ae55b7f3936af43f6274cfe7f5001013be588137","f447fa9dfcc8164bdad449c63a004f59efe69f7fd19a3283c6f7f29e5dc6c6e6","8f4024da0b16e63995ab3e59f83992a346ecd4a10b6cfdb48191440c905aa601","bb278fb1e96367cead086e7354bcda3c7f4281fdcdeb801b2ec400f83800d8da","9869432f0c1255ae4b0a4b9d8664e9e92df07c0ab93211e650f6972f6dd1a7ea","cbd30d1f6d96f42784171b2f0ffc2744036ba010b0c7b2c9722f4863fa5ee60e"],["005690143e22172a26b184417995a8b09e787e852f04f78d3ff68c60ac831175","2a02afdebfa4617407d59ae93f27dec9ed13f7e6c1f80463b7a05536114b28ee","81974aab989705dc5ba16efd1d06ca88425d17ca606f8e4497fb930253837c10","ffe8c1f586e88d08c4cd656a1991e8ed5d364f0028c5e3bc7e87319d06dcea71","47fba9d3c4f3d102b33b1a7bf23996528701181ea781e7a243bb5f9eae804e47","2f0c211336f2709ac7c4fc7dbebed106c8a1b489df2e58066ccec5786efc94ba"],["d49b43b280832c816220a288fe186e4e0cde271949b06a2bd08685b330c78ca5","3c05f67eadddba00e32b31c45b56bcad367df1274bb59ff22bc3400414f16f69","4cbe0cb79eb80f50bda8106cc8e6f6ae344ac69a277a1d46af50fa25150c13b3","ce6ca1e5bf58d9b81dda75f1e9af0d893bbc6ce8d6373ca49b78049c18ec5d33","9395b7cdc3876a99fa9ec70bc1fee517dca7e378cc8b428971ad1984890fbc8b","c0fc9886fbbb551e3f4507da3899bb4ce8e68abb9e683e4518b97fe01f49354a"],["1efe239b3ba815653e66ba12a2e3e98ab05d89f0cc7569a63876a5e9346a9e0d","3a5c6917eae13b788c38012e49f210a36bd77338839ac0d31523a2cdbb425839","6e10abf87d2c34233cfaf80ea758bbdf5bbde187c1b19b7df1e5c2bf855aad81","fda2d823aa2c7459e7f99db0d75242af10ed30c3c6b8cc94e21464f9c8e450b8","eb766525b94cf0ef51bf76b06dba8c411c809c3e685375a74434087799c12f68","aa31a2d3b732ab90eb2da813599b228e4ac6696116453fa9e1cf8fff6a425600"],["99f5a1d849763f127ae4463cb7a9ae854d756ac6acee958b03a36f44af4cd8e2","6d9f7ae40b61ecf3189b3ecf14705aff267fffe03137790d004ec26c4aecd24b","3058ef32538e9777f61bb973b1e79f13272e413f9dde8f95b6f9553aaada38d8","4988c4e086136c567001c67ee189fc6b296be2a6392f0117aa7c435a51ed9552","fef2ff57faa9a8731d48613bfcce70d664dff92a222554b59ea2bcf67e1bca25","33b31da56793925864b21852cada0a0ba9edc2c5e3be629a1661f83eaa00f654"],["da3574d3950022384cc6abdfc7a2f15b85ff40e02dc757d9e3b08c67e386e072","fafa46dc3a0dc8560c5bb0c14a88191a4a07e97099a417c03da9e4fbfe8c0025","f9c1c72e3e12f7a15cb06ab38cfcd775bbc69dd5d5f2aef912ebdc646304c090","4486f09db13d64566457ed047a7c145711ea62fdcef34786c72c328f7d93b961","7b32bf0d964ea189015ad0dfb68ad2eed9b5ee5ed586de789c157388f1b72254","fa4896688e16f0032a8877c3ccebddfe46e161d63e39773d53f687460658068a"]]
-          
-          import hashlib
           import json
           import os
-          import time
           from urllib.error import HTTPError
           from urllib.parse import urlencode
           from urllib.request import Request, urlopen
-          
-          account = "act_1732457457319086"
-          graph = "https://graph.facebook.com/v25.0/"
+
           token = os.environ["META_ACCESS_TOKEN"]
-          ad_fields = "id,name,adset_id,configured_status,creative{id,effective_object_story_id,asset_feed_spec}"
-          
-          def call(path, query=None, form=None):
-              url = graph + path + ("?" + urlencode(query) if query else "")
-              data = urlencode(form).encode("utf-8") if form is not None else None
-              request = Request(url, data=data, headers={"Authorization": "Bearer " + token})
-              with urlopen(request, timeout=15) as response:
-                  return json.load(response)
-          
-          def sha(value):
-              return hashlib.sha256(str(value).encode("ascii")).hexdigest()
-          
-          def find_objects(path, wanted, fields):
-              found = {}
-              query = {"fields": fields, "limit": 250}
-              for _ in range(35):
-                  page = call(path, query)
-                  for row in page.get("data", []):
-                      fingerprint = sha(row["id"])
-                      if fingerprint in wanted:
-                          found[fingerprint] = row
-                  if set(found) == wanted:
-                      break
-                  paging = page.get("paging", {})
-                  cursor = paging.get("cursors", {}).get("after")
-                  if not paging.get("next") or not cursor or cursor == query.get("after"):
-                      break
-                  query["after"] = cursor
-              return found
-          
-          def get_ads(ids):
-              if not ids:
-                  return {}
+          account = "act_1732457457319086"
+          markers = [
+              ("1121570050694411", "53s"),
+              ("1521290343162951", "154s"),
+              ("1635063941431588", "61s-a"),
+              ("1642160670297957", "41s"),
+              ("1766520411070794", "155s"),
+              ("1785101992719160", "45s"),
+              ("1837989767473642", "66s"),
+              ("1934340758012535", "46s"),
+              ("1552400246633057", "61s-b"),
+          ]
+          graph = "https://graph.facebook.com/v25.0/"
+          def read(path, **params):
+              request = Request(graph + path + "?" + urlencode(params), headers={
+                  "Authorization": f"Bearer {token}",
+              })
               try:
-                  return call("", {"ids": ",".join(ids), "fields": ad_fields})
-              except HTTPError:
-                  return {value: call(value, {"fields": ad_fields}) for value in ids}
-          
-          
-          def collect_video_ids(value):
-              if isinstance(value, list):
-                  return set().union(*(collect_video_ids(v) for v in value))
-              if not isinstance(value, dict):
-                  return set()
-              result = set()
-              for key, child in value.items():
-                  if key in ("video_id", "source_video_id", "object_video_id") and str(child).isdecimal():
-                      result.add(str(child))
-                  elif isinstance(child, (dict, list)):
-                      result.update(collect_video_ids(child))
-              return result
-          
-          def inspect(ad, expected, creative_cache):
-              c = ad.get("creative") or {}
-              cid = str(c.get("id", ""))
-              if not cid:
-                  return "UNAVAILABLE"
-              if cid in creative_cache:
-                  candidates = creative_cache[cid]
-              else:
-                  candidates = collect_video_ids(c)
-                  try:
-                      obj = call(cid, {"fields": "video_id,object_story_spec,asset_feed_spec"})
-                      candidates.update(collect_video_ids(obj))
-                  except Exception:
-                      pass
-                  creative_cache[cid] = candidates
-              if expected in {sha(value) for value in candidates}:
-                  return "MATCH"
-              return "DIFFERENT" if candidates else "UNAVAILABLE"
-          
-          try:
-              groups = find_objects(account + "/adsets", {row[4] for row in plan}, "id")
-              ad_ids = find_objects(account + "/ads", {row[k] for row in plan for k in (1, 3)}, "id")
-              ads = get_ads([str(row["id"]) for row in ad_ids.values()])
-          except Exception:
-              raise SystemExit("BATCH_VIDEO_LOOKUP=FAILED")
-          
-          cache = {}
-          for index, row in enumerate(plan, start=1):
-              try:
-                  src, sep = [ads.get(str(ad_ids.get(row[k], {}).get("id", "")), {}) for k in (1, 3)]
-                  gid = str(groups.get(row[4], {}).get("id", ""))
-                  entries = call(gid + "/ads", {"fields": ad_fields, "limit": 2}).get("data", []) if gid else []
-                  both = entries[0] if len(entries) == 1 else {}
-                  results = [inspect(a, row[5], cache) for a in (src, sep, both)]
-                  print(f"BATCH_VIDEO_RESULT row={index} base={results[0]} separate={results[1]} shared={results[2]}", flush=True)
-              except Exception:
-                  print(f"BATCH_VIDEO_RESULT row={index} base=UNAVAILABLE separate=UNAVAILABLE shared=UNAVAILABLE", flush=True)
+                  with urlopen(request, timeout=12) as response:
+                      return json.load(response)
+              except HTTPError as error:
+                  detail = json.load(error).get("error", {})
+                  return {"failure": f"HTTP={error.code} code={detail.get('code')} subcode={detail.get('error_subcode')}"}
+
+          identity = read("me", fields="id,name")
+          print(f"PROBE scaler_identity_matches={identity.get('id') == '61593290271041' or identity.get('name') == 'for_scaler'}", flush=True)
+          query = {"fields": "id,title,created_time", "limit": 100}
+          count = named = recent = 0
+          matches = {}
+          complete = False
+          for _ in range(40):
+              result = read(account + "/advideos", **query)
+              if "failure" in result:
+                  raise SystemExit("Account video list failed: " + result["failure"])
+              for row in result.get("data", []):
+                  title = row.get("title") or ""
+                  count += 1
+                  named += bool(title)
+                  recent += (row.get("created_time") or "").startswith("2026-11-16")
+                  for marker, label in markers:
+                      if marker in title and (label not in matches or (row.get("created_time") or "") > (matches[label].get("created_time") or "")):
+                          matches[label] = row
+              paging = result.get("paging", {})
+              after = paging.get("cursors", {}).get("after")
+              if not paging.get("next"):
+                  complete = True
+                  break
+              if not after or after == query.get("after"):
+                  break
+              query["after"] = after
+          print(f"PROBE checked={count} named={named} created_today={recent} matched={len(matches)} complete={complete}", flush=True)
+          for _, label in markers:
+              if label not in matches:
+                  print(f"PROBE clip={label} found=False", flush=True)
+                  continue
+              result = read(matches[label]["id"], fields="status")
+              status = result.get("status", {}).get("video_status", "unverified")
+              print(f"PROBE clip={label} found=True status={status}", flush=True)
           PY
