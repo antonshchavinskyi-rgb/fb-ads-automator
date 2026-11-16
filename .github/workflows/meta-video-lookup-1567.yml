@@ -16,63 +16,74 @@ jobs:
           python - <<'PY'
           import json
           import os
-          import sys
           from urllib.error import HTTPError
           from urllib.parse import urlencode
           from urllib.request import Request, urlopen
 
-          token = os.environ.get("META_ACCESS_TOKEN")
-          if not token:
-              sys.exit("The existing FB_ACCESS_TOKEN secret is unavailable to this job.")
+          token = os.environ["META_ACCESS_TOKEN"]
+          account = "act_1732457457319086"
+          marker = "1766520411070794"
 
-          endpoint = "https://graph.facebook.com/v25.0/act_1732457457319086/advideos"
-          expected = {
-              "1121570050694411", "1521290343162951", "1635063941431588",
-              "1642160670297957", "1766520411070794", "1785101992719160",
-              "1837989767473642", "1934340758012535", "1552400246633057"
-          }
-          after = None
-          total = 0
-          complete = False
-          found = set()
-          for page in range(40):
-              params = {"fields": "id,title,created_time", "limit": 100}
-              if after:
-                  params["after"] = after
-              request = Request(
-                  f"{endpoint}?{urlencode(params)}",
-                  headers={"Authorization": f"Bearer {token}"},
-              )
+          def read(path, label, **params):
+              url = "https://graph.facebook.com/v25.0/" + path + "?" + urlencode(params)
+              request = Request(url, headers={"Authorization": f"Bearer {token}"})
               try:
                   with urlopen(request, timeout=12) as response:
-                      result = json.load(response)
+                      return json.load(response)
               except HTTPError as error:
                   details = json.load(error).get("error", {})
-                  sys.exit(
-                      f"Meta API HTTP {error.code}; code={details.get('code')}, "
-                      f"subcode={details.get('error_subcode')}, type={details.get('type')}"
-                  )
-              rows = result.get("data", [])
-              total += len(rows)
-              for row in rows:
-                  title = row.get("title") or ""
-                  matches = {key for key in expected if f"meta-{key}_" in title}
-                  if matches or title.startswith(("1567-", "1567_")):
-                      print(json.dumps({
-                          "id": row.get("id"), "title": title,
-                          "created_time": row.get("created_time"),
-                          "matches_filename": bool(matches),
-                      }), flush=True)
-                  found.update(matches)
-              paging = result.get("paging", {})
-              if not paging.get("next"):
-                  complete = True
-                  break
-              next_after = paging.get("cursors", {}).get("after")
-              if not next_after or next_after == after:
-                  break
-              after = next_after
-              if found == expected:
-                  break
-          print(f"SUMMARY checked={total} exact_matches={len(found)} complete_scan={complete}")
+                  message = (details.get("message") or "").replace(token, "[redacted]")
+                  print(f"ERROR {label} HTTP={error.code} code={details.get('code')} subcode={details.get('error_subcode')} message={message[:220]}", flush=True)
+                  return {}
+
+          def rows(path, label, fields=None, max_pages=10):
+              params = {"limit": 100}
+              if fields:
+                  params["fields"] = fields
+              count = 0
+              for page in range(max_pages):
+                  result = read(path, label, **params)
+                  if not result:
+                      break
+                  data = result.get("data", [])
+                  count += len(data)
+                  yield from data
+                  paging = result.get("paging", {})
+                  after = paging.get("cursors", {}).get("after")
+                  if not paging.get("next") or not after or after == params.get("after"):
+                      break
+                  params["after"] = after
+              print(f"CHECK {label} rows={count}", flush=True)
+
+          control = "1869310394502322"
+          account_videos = list(rows(account + "/advideos", "account-videos", "id,title,created_time"))
+          print(f"CONTROL account_contains_known_ad_video={any(row.get('id') == control for row in account_videos)}", flush=True)
+
+          owner = read(account, "account-business", fields="business{id,name}").get("business") or {}
+          businesses = {owner["id"]: owner} if owner.get("id") else {}
+          for item in rows("me/businesses", "available-businesses", "id,name"):
+              if "soulpath" in (item.get("name") or "").replace(" ", "").casefold():
+                  businesses[item["id"]] = item
+          print(f"BUSINESS candidates={len(businesses)}", flush=True)
+
+          def is_offer(item):
+              title = " ".join(str(item.get(key) or "") for key in ("name", "title", "filename"))
+              return "1567" in title or marker in title
+
+          def show(item, label):
+              keys = ("id", "name", "title", "filename", "business_video_id", "video_id")
+              payload = {k: item[k] for k in keys if isinstance(item.get(k), (str, int))}
+              print(f"MATCH {label} {json.dumps(payload)}", flush=True)
+
+          for business_id in businesses:
+              for folder in rows(business_id + "/creative_folders", "business-folders", "id,name"):
+                  name = folder.get("name") or ""
+                  if is_offer(folder) or name.replace(" ", "").casefold() == "soulpath":
+                      show(folder, "folder")
+                      for child in rows(folder["id"] + "/subfolders", "subfolders", "id,name"):
+                          if is_offer(child):
+                              show(child, "subfolder")
+              for asset in rows(business_id + "/creatives", "business-creatives", max_pages=16):
+                  if is_offer(asset):
+                      show(asset, "business-creative")
           PY
