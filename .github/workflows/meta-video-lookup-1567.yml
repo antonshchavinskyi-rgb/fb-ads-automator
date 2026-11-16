@@ -65,16 +65,18 @@ jobs:
               except HTTPError:
                   return {value: call(value, {"fields": ad_fields}) for value in ids}
           
-          def verify_video(ad, expected_group_id, video_digest):
+          def verify_ad(ad, expected_group_id):
               if str(ad.get("adset_id")) != expected_group_id or ad.get("configured_status") != "PAUSED":
                   return None
               creative = ad.get("creative") or {}
-              assets = creative.get("asset_feed_spec") or {}
-              if {sha(v["video_id"]) for v in assets.get("videos", []) if v.get("video_id")} != {video_digest}:
-                  return None
               if not creative.get("id") or not creative.get("effective_object_story_id"):
                   return None
               return creative
+          
+          def video_confirmed(creative, video_digest):
+              assets = creative.get("asset_feed_spec") or {}
+              videos = assets.get("videos", []) if isinstance(assets, dict) else []
+              return {sha(v["video_id"]) for v in videos if v.get("video_id")} == {video_digest}
           
           def verify_group(group):
               return (
@@ -86,6 +88,7 @@ jobs:
               groups = find_objects(account + "/adsets", {row[k] for row in plan for k in (0, 2, 4)}, "id,campaign_id,configured_status,daily_budget,bid_amount,bid_strategy")
               ad_ids = find_objects(account + "/ads", {row[k] for row in plan for k in (1, 3)}, "id")
               ads = get_ads([str(row["id"]) for row in ad_ids.values()])
+              print(f"BATCH_LOOKUP_DETAILS groups={len(groups)} ads={len(ad_ids)} read={len(ads)}", flush=True)
           except Exception:
               raise SystemExit("BATCH_POST_LOOKUP=FAILED")
           
@@ -96,8 +99,27 @@ jobs:
           for index, row in enumerate(plan, start=1):
               base_group, sep_group, shared_group = (groups.get(row[k], {}) for k in (0, 2, 4))
               base_ad, sep_ad = (ads.get(str(ad_ids.get(row[k], {}).get("id", "")), {}) for k in (1, 3))
-              base_creative = verify_video(base_ad, str(base_group.get("id", "")), row[5]) if verify_group(base_group) else None
-              sep_creative = verify_video(sep_ad, str(sep_group.get("id", "")), row[5]) if verify_group(sep_group) else None
+              group_nodes = []
+              for group in (base_group, sep_group, shared_group):
+                  if group.get("id") and not verify_group(group):
+                      try:
+                          group = call(str(group["id"]), {"fields": "id,campaign_id,configured_status,daily_budget,bid_amount,bid_strategy"})
+                      except Exception:
+                          pass
+                  group_nodes.append(group)
+              base_group, sep_group, shared_group = group_nodes
+              candidates = []
+              for group, ad, key in ((base_group, base_ad, 1), (sep_group, sep_ad, 3)):
+                  if group.get("id") and not verify_ad(ad, str(group["id"])) and row[key] in ad_ids:
+                      try:
+                          ad = call(str(ad_ids[row[key]]["id"]), {"fields": ad_fields})
+                      except Exception:
+                          pass
+                  candidates.append(ad)
+              base_ad, sep_ad = candidates
+              base_creative = verify_ad(base_ad, str(base_group.get("id", ""))) if verify_group(base_group) else None
+              sep_creative = verify_ad(sep_ad, str(sep_group.get("id", ""))) if verify_group(sep_group) else None
+              print(f"BATCH_ROW_DETAILS row={index} base_group={bool(verify_group(base_group))} sep_group={bool(verify_group(sep_group))} shared_group={bool(verify_group(shared_group))} base_ad={bool(base_creative)} sep_ad={bool(sep_creative)} base_video={bool(base_creative and video_confirmed(base_creative, row[5]))} sep_video={bool(sep_creative and video_confirmed(sep_creative, row[5]))}", flush=True)
               base = "OK" if base_creative else "UNVERIFIED"
               separate = (
                   "DIFFERENT" if base_creative["effective_object_story_id"] != sep_creative["effective_object_story_id"] else "SAME"
@@ -142,10 +164,15 @@ jobs:
               except Exception:
                   by_id = {}
               for index, (ad_id, group_id, video_digest, expected_post) in list(created.items()):
-                  actual = verify_video(by_id.get(ad_id, {}), group_id, video_digest)
+                  actual = verify_ad(by_id.get(ad_id, {}), group_id)
+                  if not actual:
+                      try:
+                          actual = verify_ad(call(ad_id, {"fields": ad_fields}), group_id)
+                      except Exception:
+                          pass
                   if actual:
                       status = "SAME" if actual["effective_object_story_id"] == expected_post else "DIFFERENT"
-                      print(f"BATCH_SHARED_VERIFICATION row={index} result={status}", flush=True)
+                      print(f"BATCH_SHARED_VERIFICATION row={index} result={status} video={video_confirmed(actual, video_digest)}", flush=True)
                       del created[index]
               if created:
                   time.sleep(3)
