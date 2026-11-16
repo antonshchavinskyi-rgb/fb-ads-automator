@@ -1,132 +1,82 @@
-name: Read progress of the scheduled bid campaign
+name: Verify newly uploaded account videos for offer 1567
 on:
   push:
     branches: [codex/meta-video-lookup-20261116]
     paths: [.github/workflows/meta-video-lookup-1567.yml]
 permissions: {}
 jobs:
-  bid:
+  lookup:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
     steps:
-      - name: Read campaign counts only
+      - name: Read account video names and processing status
         env:
           META_ACCESS_TOKEN: ${{ secrets.FB_SCALER_ACCESS_TOKEN }}
         run: |
           python - <<'PY'
-          run_rows = 9
-          plan = {"campaign":"0dfda0efa508139db52eea80b1e5eabd80406e4cd125380b3fe4e183542c0491","clips":[["ba0cfe9d0743aec566820d95851787ef0ba1014ea5cff5312bbcbfc47adc4bcb","e4ae8be409de47160599f68c59c64844cdbc6a6ca6421476fbd16ce1cf7d63f1","b9e6065e7e315e5bf70cf49802bdbf9aa8144af572c4b0f7f8f66c2f522c574d"],["786ff14fa7419716d1b922e286ed8acf4ebcfc66905daa5cdedfc0fb3874d419","6d7c53f6fc11d322441e111a490d94e5798f26a2d1a87ce302ff77bd66ae852d","be5c1247e1beb34d040e6cf3d4a614df125e5339fa4febbc623783b568a34da2"],["bbbd4a8fdf485b06bf9a664d4f15fc02df11bcd9a331b0aa265ff2c3463d158d","301f95dcaeccbb65a0786ee75a282b46d99d972ea4a52d8527d22a1f3bfe55b6","5419b740608ce5659dcf3819fe094023a42f5bc3cae8b5e425b2789ee5d969dc"],["ec061e5cfdfe07fb47046374ae55b7f3936af43f6274cfe7f5001013be588137","f447fa9dfcc8164bdad449c63a004f59efe69f7fd19a3283c6f7f29e5dc6c6e6","cbd30d1f6d96f42784171b2f0ffc2744036ba010b0c7b2c9722f4863fa5ee60e"],["005690143e22172a26b184417995a8b09e787e852f04f78d3ff68c60ac831175","2a02afdebfa4617407d59ae93f27dec9ed13f7e6c1f80463b7a05536114b28ee","2f0c211336f2709ac7c4fc7dbebed106c8a1b489df2e58066ccec5786efc94ba"],["d49b43b280832c816220a288fe186e4e0cde271949b06a2bd08685b330c78ca5","3c05f67eadddba00e32b31c45b56bcad367df1274bb59ff22bc3400414f16f69","c0fc9886fbbb551e3f4507da3899bb4ce8e68abb9e683e4518b97fe01f49354a"],["1efe239b3ba815653e66ba12a2e3e98ab05d89f0cc7569a63876a5e9346a9e0d","3a5c6917eae13b788c38012e49f210a36bd77338839ac0d31523a2cdbb425839","aa31a2d3b732ab90eb2da813599b228e4ac6696116453fa9e1cf8fff6a425600"],["99f5a1d849763f127ae4463cb7a9ae854d756ac6acee958b03a36f44af4cd8e2","6d9f7ae40b61ecf3189b3ecf14705aff267fffe03137790d004ec26c4aecd24b","33b31da56793925864b21852cada0a0ba9edc2c5e3be629a1661f83eaa00f654"],["da3574d3950022384cc6abdfc7a2f15b85ff40e02dc757d9e3b08c67e386e072","fafa46dc3a0dc8560c5bb0c14a88191a4a07e97099a417c03da9e4fbfe8c0025","fa4896688e16f0032a8877c3ccebddfe46e161d63e39773d53f687460658068a"]]}
-          
-          import hashlib
           import json
           import os
-          import time
-          from datetime import datetime, timezone
           from urllib.error import HTTPError
           from urllib.parse import urlencode
           from urllib.request import Request, urlopen
-          
-          account = "act_1732457457319086"
-          graph = "https://graph.facebook.com/v25.0/"
+
           token = os.environ["META_ACCESS_TOKEN"]
-          start = datetime.fromisoformat("2026-11-17T05:42:00+01:00")
-          budget, bid = "18000", "5500"
-          strategy = "LOWEST_COST_WITH_BID_CAP"
-          campaign_fields = "id,objective,configured_status,daily_budget,lifetime_budget"
-          group_fields = "id,name,campaign_id,configured_status,start_time,daily_budget,bid_amount,bid_strategy,source_adset_id"
-          source_group_fields = "id,name,campaign_id,targeting,promoted_object,optimization_goal,billing_event,attribution_spec"
-          ad_fields = "id,name,adset_id,configured_status,effective_status,creative{id,effective_object_story_id}"
-          max_rows = min(run_rows, len(plan["clips"]))
-          
-          class MetaError(Exception):
-              pass
-          
-          class RateLimited(MetaError):
-              def __init__(self, delay):
-                  self.delay = delay
-                  super().__init__("RATE_LIMIT")
-          
-          def graph_call(path, query=None, form=None):
-              url = graph + path + ("?" + urlencode(query) if query else "")
-              payload = None if form is None else urlencode(form).encode("utf-8")
-              if form is not None:
-                  time.sleep(1.15)
-              req = Request(url, data=payload, headers={"Authorization": "Bearer " + token})
+          account = "act_1732457457319086"
+          markers = [
+              ("1121570050694411", "53s"),
+              ("1521290343162951", "154s"),
+              ("1635063941431588", "61s-a"),
+              ("1642160670297957", "41s"),
+              ("1766520411070794", "155s"),
+              ("1785101992719160", "45s"),
+              ("1837989767473642", "66s"),
+              ("1934340758012535", "46s"),
+              ("1552400246633057", "61s-b"),
+          ]
+          graph = "https://graph.facebook.com/v25.0/"
+          def read(path, **params):
+              request = Request(graph + path + "?" + urlencode(params), headers={
+                  "Authorization": f"Bearer {token}",
+              })
               try:
-                  with urlopen(req, timeout=20) as r:
-                      return json.load(r)
-              except HTTPError as e:
-                  try:
-                      data = json.load(e).get("error") or {}
-                      code = int(data.get("code") or 0)
-                      sub = int(data.get("error_subcode") or 0)
-                  except (ValueError, TypeError, AttributeError):
-                      code, sub = 0, 0
-                  if code in (4, 17, 32, 613, 80000, 80001, 80002, 80003, 80004, 80005) or e.code == 429:
-                      waits = [300]
-                      retry = e.headers.get("Retry-After", "")
-                      if retry.isdecimal():
-                          waits.append(int(retry) + 15)
-                      try:
-                          usage = json.loads(e.headers.get("X-Business-Use-Case-Usage", "{}"))
-                          waits.extend(int(item.get("estimated_time_to_regain_access", 0)) * 60 + 20 for scopes in usage.values() for item in scopes if isinstance(item, dict))
-                      except (ValueError, AttributeError, TypeError):
-                          pass
-                      raise RateLimited(max(waits)) from None
-                  raise MetaError(f"{e.code}_{code}_{sub}") from None
-          
-          def digest(value):
-              return hashlib.sha256(str(value).encode("ascii")).hexdigest()
-          
-          def paged(path, fields, wanted=None, max_pages=40):
-              saved = {}
-              query = {"fields": fields, "limit": 100}
-              for _ in range(max_pages):
-                  reply = graph_call(path, query)
-                  for row in reply.get("data", []):
-                      key = digest(row["id"])
-                      if wanted is None or key in wanted:
-                          saved[key] = row
-                  if wanted is not None and set(saved) == wanted:
-                      return saved
-                  paging = reply.get("paging", {})
-                  cursor = paging.get("cursors", {}).get("after")
-                  if not paging.get("next"):
-                      return saved
-                  if not cursor or cursor == query.get("after"):
-                      raise MetaError("PAGINATION_STALLED")
-                  query["after"] = cursor
-              if wanted is None:
-                  raise MetaError("PAGINATION_INCOMPLETE")
-              return saved
-          
-          def node(identifier, fields):
-              return graph_call(str(identifier), {"fields": fields})
-          
-          def ad_post(ad):
-              return (ad.get("creative") or {}).get("effective_object_story_id")
-          
-          def verify_group(value, destination, expected_status="PAUSED"):
-              return (
-                  str(value.get("campaign_id")) == destination
-                  and value.get("configured_status") == expected_status
-                  and str(value.get("daily_budget")) == budget
-                  and str(value.get("bid_amount")) == bid
-                  and value.get("bid_strategy") == strategy
-                  and bool(value.get("start_time"))
-                  and datetime.fromisoformat(value["start_time"]) == start
-              )
-          
-          
-          try:
-              tgt = paged(account + "/campaigns", "id,configured_status", {plan["campaign"]})[plan["campaign"]]
-              aid = str(tgt["id"])
-              groups = list(paged(aid + "/adsets", group_fields).values())
-              ads = list(paged(aid + "/ads", "id,configured_status").values())
-              valid = sum(verify_group(g, aid, (g.get("configured_status") or "PAUSED")) for g in groups)
-              print(f"BID_LIVE_STATE groups={len(groups)} ads={len(ads)} valid_schedule={valid} campaign={tgt.get('configured_status')} utc={datetime.now(timezone.utc).isoformat()}", flush=True)
-          except RateLimited as error:
-              print(f"BID_LIVE_STATE rate_limit_seconds={error.delay} utc={datetime.now(timezone.utc).isoformat()}", flush=True)
-          except (MetaError, KeyError) as error:
-              print(f"BID_LIVE_STATE read_error={error}", flush=True)
+                  with urlopen(request, timeout=12) as response:
+                      return json.load(response)
+              except HTTPError as error:
+                  detail = json.load(error).get("error", {})
+                  return {"failure": f"HTTP={error.code} code={detail.get('code')} subcode={detail.get('error_subcode')}"}
+
+          identity = read("me", fields="id,name")
+          print(f"PROBE scaler_identity_matches={identity.get('id') == '61593290271041' or identity.get('name') == 'for_scaler'}", flush=True)
+          query = {"fields": "id,title,created_time", "limit": 100}
+          count = named = recent = 0
+          matches = {}
+          complete = False
+          for _ in range(40):
+              result = read(account + "/advideos", **query)
+              if "failure" in result:
+                  raise SystemExit("Account video list failed: " + result["failure"])
+              for row in result.get("data", []):
+                  title = row.get("title") or ""
+                  count += 1
+                  named += bool(title)
+                  recent += (row.get("created_time") or "").startswith("2026-11-16")
+                  for marker, label in markers:
+                      if marker in title and (label not in matches or (row.get("created_time") or "") > (matches[label].get("created_time") or "")):
+                          matches[label] = row
+              paging = result.get("paging", {})
+              after = paging.get("cursors", {}).get("after")
+              if not paging.get("next"):
+                  complete = True
+                  break
+              if not after or after == query.get("after"):
+                  break
+              query["after"] = after
+          print(f"PROBE checked={count} named={named} created_today={recent} matched={len(matches)} complete={complete}", flush=True)
+          for _, label in markers:
+              if label not in matches:
+                  print(f"PROBE clip={label} found=False", flush=True)
+                  continue
+              result = read(matches[label]["id"], fields="status")
+              status = result.get("status", {}).get("video_status", "unverified")
+              print(f"PROBE clip={label} found=True status={status}", flush=True)
           PY
