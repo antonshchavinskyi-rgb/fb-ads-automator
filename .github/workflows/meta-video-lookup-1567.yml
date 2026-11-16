@@ -1,4 +1,4 @@
-name: Meta video lookup for offer 1567
+name: Recheck Meta creative folder access with scaler
 on:
   push:
     branches: [codex/meta-video-lookup-20261116]
@@ -9,9 +9,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Read ad account videos from Meta
+      - name: Read creative folder and video access
         env:
-          META_ACCESS_TOKEN: ${{ secrets.FB_ACCESS_TOKEN }}
+          META_ACCESS_TOKEN: ${{ secrets.FB_SCALER_ACCESS_TOKEN }}
         run: |
           python - <<'PY'
           import json
@@ -21,69 +21,98 @@ jobs:
           from urllib.request import Request, urlopen
 
           token = os.environ["META_ACCESS_TOKEN"]
+          if not token:
+              raise SystemExit("Scaler secret is unavailable.")
           account = "act_1732457457319086"
-          marker = "1766520411070794"
+          expected = {
+              "1121570050694411", "1521290343162951", "1635063941431588",
+              "1642160670297957", "1766520411070794", "1785101992719160",
+              "1837989767473642", "1934340758012535", "1552400246633057",
+          }
 
-          def read(path, label, **params):
-              url = "https://graph.facebook.com/v25.0/" + path + "?" + urlencode(params)
-              request = Request(url, headers={"Authorization": f"Bearer {token}"})
+          def read(version, path, label, **params):
+              url = f"https://graph.facebook.com/{version}/{path}?" + urlencode(params)
+              req = Request(url, headers={"Authorization": f"Bearer {token}"})
               try:
-                  with urlopen(request, timeout=12) as response:
-                      return json.load(response)
+                  with urlopen(req, timeout=12) as res:
+                      return json.load(res)
               except HTTPError as error:
-                  details = json.load(error).get("error", {})
-                  message = (details.get("message") or "").replace(token, "[redacted]")
-                  print(f"ERROR {label} HTTP={error.code} code={details.get('code')} subcode={details.get('error_subcode')} message={message[:220]}", flush=True)
-                  return {}
+                  detail = json.load(error).get("error", {})
+                  message = (detail.get("message") or "").replace(token, "[redacted]")
+                  known = {
+                      "Tried accessing nonexisting field": "field_unavailable",
+                      "Permissions error": "permission_denied",
+                      "Unsupported get request": "object_or_edge_unavailable",
+                      "application does not have permission": "app_permission_denied",
+                  }
+                  note = next((tag for prefix, tag in known.items() if prefix.lower() in message.lower()), "other")
+                  print(f"PROBE {version} {label} HTTP={error.code} code={detail.get('code')} subcode={detail.get('error_subcode')} reason={note}", flush=True)
+                  return None
 
-          def rows(path, label, fields=None, max_pages=10):
-              params = {"limit": 100}
+          def list_rows(version, path, label, fields=None, max_pages=12):
+              query = {"limit": 100}
               if fields:
-                  params["fields"] = fields
-              count = 0
-              for page in range(max_pages):
-                  result = read(path, label, **params)
-                  if not result:
-                      break
-                  data = result.get("data", [])
-                  count += len(data)
-                  yield from data
+                  query["fields"] = fields
+              rows = []
+              complete = False
+              for _ in range(max_pages):
+                  result = read(version, path, label, **query)
+                  if result is None:
+                      return None
+                  rows.extend(result.get("data", []))
                   paging = result.get("paging", {})
                   after = paging.get("cursors", {}).get("after")
-                  if not paging.get("next") or not after or after == params.get("after"):
+                  if not paging.get("next"):
+                      complete = True
                       break
-                  params["after"] = after
-              print(f"CHECK {label} rows={count}", flush=True)
+                  if not after or after == query.get("after"):
+                      break
+                  query["after"] = after
+              print(f"PROBE {version} {label} rows={len(rows)} complete={complete}", flush=True)
+              return rows
 
-          control = "1869310394502322"
-          account_videos = list(rows(account + "/advideos", "account-videos", "id,title,created_time"))
-          print(f"CONTROL account_contains_known_ad_video={any(row.get('id') == control for row in account_videos)}", flush=True)
+          def video_matches(rows):
+              matched = set()
+              for row in rows:
+                  title = " ".join(str(row.get(key) or "") for key in ("name", "title", "filename"))
+                  matched.update(key for key in expected if key in title)
+              return len(matched)
 
-          owner = read(account, "account-business", fields="business{id,name}").get("business") or {}
+          identity = read("v25.0", "me", "identity", fields="id,name") or {}
+          print(f"PROBE scaler_identity_matches={identity.get('id') == '61593290271041' or identity.get('name') == 'for_scaler'}", flush=True)
+          permissions = list_rows("v25.0", "me/permissions", "token-permissions")
+          if permissions is not None:
+              granted = {entry.get("permission") for entry in permissions if entry.get("status") == "granted"}
+              print(f"PROBE token_business_creative_management={'business_creative_management' in granted} token_ads_management={'ads_management' in granted}", flush=True)
+
+          ad_account = read("v25.0", account, "account", fields="business{id,name}") or {}
+          owner = ad_account.get("business") or {}
           businesses = {owner["id"]: owner} if owner.get("id") else {}
-          for item in rows("me/businesses", "available-businesses", "id,name"):
+          available = list_rows("v25.0", "me/businesses", "business-list", "id,name") or []
+          for item in available:
               if "soulpath" in (item.get("name") or "").replace(" ", "").casefold():
                   businesses[item["id"]] = item
-          print(f"BUSINESS candidates={len(businesses)}", flush=True)
+          print(f"PROBE account_business_resolved={bool(owner.get('id'))} owner_name_matches_soulpath={'soulpath' in (owner.get('name') or '').replace(' ', '').casefold()} business_candidates={len(businesses)}", flush=True)
 
-          def is_offer(item):
-              title = " ".join(str(item.get(key) or "") for key in ("name", "title", "filename"))
-              return "1567" in title or marker in title
+          for version in ("v25.0", "v26.0", "v27.0"):
+              for index, business_id in enumerate(businesses, 1):
+                  mark = f"business-{index}"
+                  folders = list_rows(version, business_id + "/creative_folders", mark + "-folders", "id,name")
+                  if folders is not None:
+                      matches = [folder for folder in folders if folder.get("name", "").strip() == "1567"]
+                      for folder in folders:
+                          if "soulpath" in folder.get("name", "").replace(" ", "").casefold():
+                              children = list_rows(version, folder["id"] + "/subfolders", mark + "-soulpath-subfolders", "id,name") or []
+                              matches.extend(child for child in children if child.get("name", "").strip() == "1567")
+                      print(f"PROBE {version} {mark} offer_1567_folders={len(matches)}", flush=True)
+                      for match in matches:
+                          detail = read(version, match["id"], "folder-1567-details", fields="id,name")
+                          print(f"PROBE {version} folder_1567_readable={bool(detail and detail.get('id'))}", flush=True)
+                  creatives = list_rows(version, business_id + "/creatives", mark + "-creatives")
+                  if creatives is not None:
+                      print(f"PROBE {version} {mark} matching_filenames={video_matches(creatives)}", flush=True)
 
-          def show(item, label):
-              keys = ("id", "name", "title", "filename", "business_video_id", "video_id")
-              payload = {k: item[k] for k in keys if isinstance(item.get(k), (str, int))}
-              print(f"MATCH {label} {json.dumps(payload)}", flush=True)
-
-          for business_id in businesses:
-              for folder in rows(business_id + "/creative_folders", "business-folders", "id,name"):
-                  name = folder.get("name") or ""
-                  if is_offer(folder) or name.replace(" ", "").casefold() == "soulpath":
-                      show(folder, "folder")
-                      for child in rows(folder["id"] + "/subfolders", "subfolders", "id,name"):
-                          if is_offer(child):
-                              show(child, "subfolder")
-              for asset in rows(business_id + "/creatives", "business-creatives", max_pages=16):
-                  if is_offer(asset):
-                      show(asset, "business-creative")
+          videos = list_rows("v25.0", account + "/advideos", "ad-account-videos", "id,title,created_time", max_pages=40)
+          if videos is not None:
+              print(f"PROBE ad_account_matching_filenames={video_matches(videos)}", flush=True)
           PY
