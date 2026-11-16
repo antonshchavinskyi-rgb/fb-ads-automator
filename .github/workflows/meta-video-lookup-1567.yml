@@ -1,82 +1,64 @@
-name: Verify newly uploaded account videos for offer 1567
+name: Compare publication identity for two Meta ads
 on:
   push:
     branches: [codex/meta-video-lookup-20261116]
     paths: [.github/workflows/meta-video-lookup-1567.yml]
 permissions: {}
 jobs:
-  lookup:
+  check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 3
     steps:
-      - name: Read account video names and processing status
+      - name: Read and compare publication identity
         env:
           META_ACCESS_TOKEN: ${{ secrets.FB_SCALER_ACCESS_TOKEN }}
         run: |
           python - <<'PY'
+          import hashlib
           import json
           import os
-          from urllib.error import HTTPError
           from urllib.parse import urlencode
           from urllib.request import Request, urlopen
 
-          token = os.environ["META_ACCESS_TOKEN"]
-          account = "act_1732457457319086"
-          markers = [
-              ("1121570050694411", "53s"),
-              ("1521290343162951", "154s"),
-              ("1635063941431588", "61s-a"),
-              ("1642160670297957", "41s"),
-              ("1766520411070794", "155s"),
-              ("1785101992719160", "45s"),
-              ("1837989767473642", "66s"),
-              ("1934340758012535", "46s"),
-              ("1552400246633057", "61s-b"),
-          ]
+          wanted = set(["e4ae8be409de47160599f68c59c64844cdbc6a6ca6421476fbd16ce1cf7d63f1","853055a3a472b80c4860c161b8449e05287638393eacb8a565d0c47b0fbd48df"])
           graph = "https://graph.facebook.com/v25.0/"
-          def read(path, **params):
-              request = Request(graph + path + "?" + urlencode(params), headers={
-                  "Authorization": f"Bearer {token}",
-              })
-              try:
-                  with urlopen(request, timeout=12) as response:
-                      return json.load(response)
-              except HTTPError as error:
-                  detail = json.load(error).get("error", {})
-                  return {"failure": f"HTTP={error.code} code={detail.get('code')} subcode={detail.get('error_subcode')}"}
+          account = "act_1732457457319086"
+          token = os.environ["META_ACCESS_TOKEN"]
 
-          identity = read("me", fields="id,name")
-          print(f"PROBE scaler_identity_matches={identity.get('id') == '61593290271041' or identity.get('name') == 'for_scaler'}", flush=True)
-          query = {"fields": "id,title,created_time", "limit": 100}
-          count = named = recent = 0
-          matches = {}
-          complete = False
-          for _ in range(40):
-              result = read(account + "/advideos", **query)
-              if "failure" in result:
-                  raise SystemExit("Account video list failed: " + result["failure"])
-              for row in result.get("data", []):
-                  title = row.get("title") or ""
-                  count += 1
-                  named += bool(title)
-                  recent += (row.get("created_time") or "").startswith("2026-11-16")
-                  for marker, label in markers:
-                      if marker in title and (label not in matches or (row.get("created_time") or "") > (matches[label].get("created_time") or "")):
-                          matches[label] = row
-              paging = result.get("paging", {})
-              after = paging.get("cursors", {}).get("after")
-              if not paging.get("next"):
-                  complete = True
-                  break
-              if not after or after == query.get("after"):
-                  break
-              query["after"] = after
-          print(f"PROBE checked={count} named={named} created_today={recent} matched={len(matches)} complete={complete}", flush=True)
-          for _, label in markers:
-              if label not in matches:
-                  print(f"PROBE clip={label} found=False", flush=True)
-                  continue
-              result = read(matches[label]["id"], fields="status")
-              status = result.get("status", {}).get("video_status", "unverified")
-              print(f"PROBE clip={label} found=True status={status}", flush=True)
+          def read(path, **query):
+              request = Request(graph + path + "?" + urlencode(query), headers={"Authorization": "Bearer " + token})
+              with urlopen(request, timeout=12) as response:
+                  return json.load(response)
+
+          def compare():
+              matches = {}
+              query = {"fields": "id", "limit": 250}
+              for _ in range(35):
+                  page = read(account + "/ads", **query)
+                  for row in page.get("data", []):
+                      ad_id = str(row["id"])
+                      digest = hashlib.sha256(ad_id.encode("ascii")).hexdigest()
+                      if digest in wanted:
+                          matches[digest] = ad_id
+                  if len(matches) == len(wanted):
+                      break
+                  paging = page.get("paging", {})
+                  cursor = paging.get("cursors", {}).get("after")
+                  if not paging.get("next") or not cursor or cursor == query.get("after"):
+                      break
+                  query["after"] = cursor
+
+              if len(matches) != len(wanted):
+                  return "AD_NOT_FOUND"
+              ads = [read(ad_id, fields="creative{effective_object_story_id}") for ad_id in matches.values()]
+              post_ids = [(ad.get("creative") or {}).get("effective_object_story_id") for ad in ads]
+              if not all(post_ids):
+                  return "POST_NOT_AVAILABLE"
+              return "SAME" if post_ids[0] == post_ids[1] else "DIFFERENT"
+
+          try:
+              result = compare()
+          except Exception:
+              result = "REQUEST_FAILED"
+          print("POST_COMPARISON_RESULT=" + result)
           PY
