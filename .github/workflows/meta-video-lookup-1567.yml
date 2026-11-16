@@ -79,31 +79,4 @@ jobs:
               result = read(matches[label]["id"], fields="status")
               status = result.get("status", {}).get("video_status", "unverified")
               print(f"PROBE clip={label} found=True status={status}", flush=True)
-          import subprocess
-          if not complete or len(matches) != len(markers):
-              raise SystemExit("Offer video lookup incomplete")
-          ids = [str(matches[label]["id"]) for _, label in markers]
-          if not all(item.isascii() and item.isdecimal() for item in ids):
-              raise SystemExit("Invalid video ID")
-          encrypt = r"""
-          const c = require('node:crypto');
-          const data = require('node:fs').readFileSync(0);
-          const key = c.createPublicKey({key:Buffer.from(process.argv[1],'base64'),format:'der',type:'spki'});
-          console.log('VIDEO_IDS ' + c.publicEncrypt({key,oaepHash:'sha256'},data).toString('base64'));
-          """
-          subprocess.run(["node", "-e", encrypt, "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArDX7qQwKR115p8O4959GmB22PmIksb1WVNXSOwaoKa/N+xJJpE9g7FdSM+suytrG43y4ohNd9c73GAsybkCEImkRWt3gd+ToFh2xAyWadKdrjxkBSJw2vAyZDiMPdJd1TdgQzdGj62fbwRa1USXDy7cJ47UckLLBLk6w49rrhsUVBkKVOZLMm9FDCnAsbpTeWiHEGgkAtoBp9oWOC9dkqxlehWkiXPhDGUk2e4L2jAQcB77YbDIBJpOfrH3PX48biJdIG6GvohERbJt9KiGC94iaocdPhnr2hibAU6jHpKcbLjTNXc6u7PGrEzxwpH0yvahAg89KwFtsPpg2v1QU/wIDAQAB"], input=",".join(ids).encode("ascii"), check=True)
           PY
-  cleanup:
-    needs: lookup
-    if: always()
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      actions: write
-    steps:
-      - name: Delete logs for this one-time lookup
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          sleep 120
-          gh api --method DELETE "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/logs" --silent
