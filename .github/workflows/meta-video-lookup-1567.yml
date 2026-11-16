@@ -1,533 +1,82 @@
-name: Build requested scheduled Meta Ads campaign
+name: Verify newly uploaded account videos for offer 1567
 on:
   push:
     branches: [codex/meta-video-lookup-20261116]
     paths: [.github/workflows/meta-video-lookup-1567.yml]
 permissions: {}
 jobs:
-  bid:
+  lookup:
     runs-on: ubuntu-latest
-    timeout-minutes: 115
+    timeout-minutes: 5
     steps:
-      - name: Copy scheduled ad sets and verify their post IDs
+      - name: Read account video names and processing status
         env:
           META_ACCESS_TOKEN: ${{ secrets.FB_SCALER_ACCESS_TOKEN }}
         run: |
           python - <<'PY'
-          run_rows = 9
-          plan = {"campaign":"0dfda0efa508139db52eea80b1e5eabd80406e4cd125380b3fe4e183542c0491","clips":[["ba0cfe9d0743aec566820d95851787ef0ba1014ea5cff5312bbcbfc47adc4bcb","e4ae8be409de47160599f68c59c64844cdbc6a6ca6421476fbd16ce1cf7d63f1","b9e6065e7e315e5bf70cf49802bdbf9aa8144af572c4b0f7f8f66c2f522c574d"],["786ff14fa7419716d1b922e286ed8acf4ebcfc66905daa5cdedfc0fb3874d419","6d7c53f6fc11d322441e111a490d94e5798f26a2d1a87ce302ff77bd66ae852d","be5c1247e1beb34d040e6cf3d4a614df125e5339fa4febbc623783b568a34da2"],["bbbd4a8fdf485b06bf9a664d4f15fc02df11bcd9a331b0aa265ff2c3463d158d","301f95dcaeccbb65a0786ee75a282b46d99d972ea4a52d8527d22a1f3bfe55b6","5419b740608ce5659dcf3819fe094023a42f5bc3cae8b5e425b2789ee5d969dc"],["ec061e5cfdfe07fb47046374ae55b7f3936af43f6274cfe7f5001013be588137","f447fa9dfcc8164bdad449c63a004f59efe69f7fd19a3283c6f7f29e5dc6c6e6","cbd30d1f6d96f42784171b2f0ffc2744036ba010b0c7b2c9722f4863fa5ee60e"],["005690143e22172a26b184417995a8b09e787e852f04f78d3ff68c60ac831175","2a02afdebfa4617407d59ae93f27dec9ed13f7e6c1f80463b7a05536114b28ee","2f0c211336f2709ac7c4fc7dbebed106c8a1b489df2e58066ccec5786efc94ba"],["d49b43b280832c816220a288fe186e4e0cde271949b06a2bd08685b330c78ca5","3c05f67eadddba00e32b31c45b56bcad367df1274bb59ff22bc3400414f16f69","c0fc9886fbbb551e3f4507da3899bb4ce8e68abb9e683e4518b97fe01f49354a"],["1efe239b3ba815653e66ba12a2e3e98ab05d89f0cc7569a63876a5e9346a9e0d","3a5c6917eae13b788c38012e49f210a36bd77338839ac0d31523a2cdbb425839","aa31a2d3b732ab90eb2da813599b228e4ac6696116453fa9e1cf8fff6a425600"],["99f5a1d849763f127ae4463cb7a9ae854d756ac6acee958b03a36f44af4cd8e2","6d9f7ae40b61ecf3189b3ecf14705aff267fffe03137790d004ec26c4aecd24b","33b31da56793925864b21852cada0a0ba9edc2c5e3be629a1661f83eaa00f654"],["da3574d3950022384cc6abdfc7a2f15b85ff40e02dc757d9e3b08c67e386e072","fafa46dc3a0dc8560c5bb0c14a88191a4a07e97099a417c03da9e4fbfe8c0025","fa4896688e16f0032a8877c3ccebddfe46e161d63e39773d53f687460658068a"]]}
-          
-          import hashlib
           import json
           import os
-          import time
-          from datetime import datetime, timezone
           from urllib.error import HTTPError
           from urllib.parse import urlencode
           from urllib.request import Request, urlopen
-          
-          account = "act_1732457457319086"
-          graph = "https://graph.facebook.com/v25.0/"
+
           token = os.environ["META_ACCESS_TOKEN"]
-          start = datetime.fromisoformat("2026-11-17T05:42:00+01:00")
-          budget, bid = "18000", "5500"
-          strategy = "LOWEST_COST_WITH_BID_CAP"
-          campaign_fields = "id,objective,configured_status,daily_budget,lifetime_budget"
-          group_fields = "id,name,campaign_id,configured_status,start_time,daily_budget,bid_amount,bid_strategy,source_adset_id"
-          source_group_fields = "id,name,campaign_id,targeting,promoted_object,optimization_goal,billing_event,attribution_spec"
-          ad_fields = "id,name,adset_id,configured_status,effective_status,creative{id,effective_object_story_id}"
-          max_rows = min(run_rows, len(plan["clips"]))
-          
-          class MetaError(Exception):
-              pass
-          
-          class RateLimited(MetaError):
-              def __init__(self, delay):
-                  self.delay = delay
-                  super().__init__("RATE_LIMIT")
-          
-          def graph_call(path, query=None, form=None):
-              url = graph + path + ("?" + urlencode(query) if query else "")
-              payload = None if form is None else urlencode(form).encode("utf-8")
-              if form is not None:
-                  time.sleep(1.15)
-              req = Request(url, data=payload, headers={"Authorization": "Bearer " + token})
-              try:
-                  with urlopen(req, timeout=20) as r:
-                      return json.load(r)
-              except HTTPError as e:
-                  try:
-                      data = json.load(e).get("error") or {}
-                      code = int(data.get("code") or 0)
-                      sub = int(data.get("error_subcode") or 0)
-                  except (ValueError, TypeError, AttributeError):
-                      code, sub = 0, 0
-                  if code in (4, 17, 32, 613, 80000, 80001, 80002, 80003, 80004, 80005) or e.code == 429:
-                      waits = [300]
-                      retry = e.headers.get("Retry-After", "")
-                      if retry.isdecimal():
-                          waits.append(int(retry) + 15)
-                      try:
-                          usage = json.loads(e.headers.get("X-Business-Use-Case-Usage", "{}"))
-                          waits.extend(int(item.get("estimated_time_to_regain_access", 0)) * 60 + 20 for scopes in usage.values() for item in scopes if isinstance(item, dict))
-                      except (ValueError, AttributeError, TypeError):
-                          pass
-                      raise RateLimited(max(waits)) from None
-                  raise MetaError(f"{e.code}_{code}_{sub}") from None
-          
-          def digest(value):
-              return hashlib.sha256(str(value).encode("ascii")).hexdigest()
-          
-          def paged(path, fields, wanted=None, max_pages=40):
-              saved = {}
-              query = {"fields": fields, "limit": 100}
-              for _ in range(max_pages):
-                  reply = graph_call(path, query)
-                  for row in reply.get("data", []):
-                      key = digest(row["id"])
-                      if wanted is None or key in wanted:
-                          saved[key] = row
-                  if wanted is not None and set(saved) == wanted:
-                      return saved
-                  paging = reply.get("paging", {})
-                  cursor = paging.get("cursors", {}).get("after")
-                  if not paging.get("next"):
-                      return saved
-                  if not cursor or cursor == query.get("after"):
-                      raise MetaError("PAGINATION_STALLED")
-                  query["after"] = cursor
-              if wanted is None:
-                  raise MetaError("PAGINATION_INCOMPLETE")
-              return saved
-          
-          def node(identifier, fields):
-              return graph_call(str(identifier), {"fields": fields})
-          
-          def ad_post(ad):
-              return (ad.get("creative") or {}).get("effective_object_story_id")
-          
-          def verify_group(value, destination, expected_status="PAUSED"):
-              return (
-                  str(value.get("campaign_id")) == destination
-                  and value.get("configured_status") == expected_status
-                  and str(value.get("daily_budget")) == budget
-                  and str(value.get("bid_amount")) == bid
-                  and value.get("bid_strategy") == strategy
-                  and bool(value.get("start_time"))
-                  and datetime.fromisoformat(value["start_time"]) == start
-              )
-          
-          def assets_from_source(creative_id, post_id, file_id, name):
-              fields = "asset_feed_spec,object_story_spec,url_tags"
-              source = node(creative_id, fields)
-              asset = source.get("asset_feed_spec") or {}
-              story = source.get("object_story_spec") or {}
-              page_id = story.get("page_id") or str(post_id).partition("_")[0]
-              if not str(page_id).isdecimal():
-                  return None
-              allowed = {"bodies": ("text",), "titles": ("text",), "descriptions": ("text",),
-                         "link_urls": ("website_url", "display_url")}
-              out = {}
-              for k, keys in allowed.items():
-                  out[k] = [{p: item[p] for p in keys if item.get(p)} for item in asset.get(k, [])]
-                  out[k] = [item for item in out[k] if item]
-              cta = asset.get("call_to_action_types") or []
-              if not all(out.values()) or not cta:
-                  return None
-              out.update({
-                  "ad_formats": ["SINGLE_VIDEO"],
-                  "optimization_type": "PLACEMENT",
-                  "call_to_action_types": cta,
-                  "videos": [{"video_id": int(file_id), "adlabels": [{"name": "facebook_feed"}, {"name": "facebook_story_reels"}]}],
-                  "asset_customization_rules": [
-                      {"customization_spec": {"publisher_platforms": ["facebook"], "facebook_positions": ["feed", "marketplace", "profile_feed"]}, "video_label": {"name": "facebook_feed"}, "priority": 1},
-                      {"customization_spec": {"publisher_platforms": ["facebook"], "facebook_positions": ["story", "facebook_reels"]}, "video_label": {"name": "facebook_story_reels"}, "priority": 2},
-                  ],
+          account = "act_1732457457319086"
+          markers = [
+              ("1121570050694411", "53s"),
+              ("1521290343162951", "154s"),
+              ("1635063941431588", "61s-a"),
+              ("1642160670297957", "41s"),
+              ("1766520411070794", "155s"),
+              ("1785101992719160", "45s"),
+              ("1837989767473642", "66s"),
+              ("1934340758012535", "46s"),
+              ("1552400246633057", "61s-b"),
+          ]
+          graph = "https://graph.facebook.com/v25.0/"
+          def read(path, **params):
+              request = Request(graph + path + "?" + urlencode(params), headers={
+                  "Authorization": f"Bearer {token}",
               })
-              names = ("ads_with_benefits", "advantage_plus_creative", "enhance_cta", "inline_comment",
-                       "product_extensions", "video_auto_crop", "video_filtering", "video_uncrop",
-                       "creative_stickers", "reveal_details_over_time", "show_summary",
-                       "show_destination_blurbs", "text_translation")
-              features = {k: {"enroll_status": "OPT_OUT"} for k in names}
-              features["text_optimizations"] = {"enroll_status": "OPT_OUT", "customizations": {"text_extraction": {"enroll_status": "OPT_OUT"}}}
-              result = {
-                  "name": name + " — окремий пост",
-                  "object_story_spec": {"page_id": str(page_id)},
-                  "asset_feed_spec": out,
-                  "contextual_multi_ads": {"enroll_status": "OPT_OUT"},
-                  "degrees_of_freedom_spec": {"creative_features_spec": features},
-              }
-              if source.get("url_tags"):
-                  result["url_tags"] = source["url_tags"]
-              return result
-          
-          def create_one_group(source, source_ad, video_id, destination, kind, destination_groups):
-              suffix = {"base": "", "shared": " — спільний пост", "separate": " — окремий пост"}[kind]
-              target_name = source["name"].removesuffix("кос") + "бід" + suffix
-              staged_suffix = {"base": " — BID base", "shared": " — BID shared", "separate": " — BID separate"}[kind]
-              staged_name = source["name"] + staged_suffix
-              matches = [g for g in destination_groups if g.get("name") in (target_name, staged_name)]
-              if len(matches) > 1:
-                  raise MetaError("DUPLICATE_GROUP_NAMES")
-              if matches:
-                  gid = str(matches[0]["id"])
-              else:
-                  res = graph_call(str(source["id"]) + "/copies", form={
-                      "campaign_id": destination, "deep_copy": "false", "status_option": "PAUSED",
-                      "start_time": str(int(start.timestamp())),
-                      "rename_options": json.dumps({"rename_strategy": "ONLY_TOP_LEVEL_RENAME", "rename_suffix": staged_suffix}),
-                  })
-                  gid = str(res["copied_adset_id"])
-              value = node(gid, group_fields)
-              if not verify_group(value, destination) or value.get("name") != target_name:
-                  graph_call(gid, form={
-                      "name": target_name, "bid_strategy": strategy, "bid_amount": bid,
-                      "daily_budget": budget,
-                      **({"start_time": start.isoformat()} if not value.get("start_time") or datetime.fromisoformat(value["start_time"]) != start else {}),
-                  })
-                  for attempt in range(8):
-                      value = node(gid, group_fields)
-                      if verify_group(value, destination) and value.get("name") == target_name:
-                          break
-                      time.sleep(3)
-              if not verify_group(value, destination) or value.get("name") != target_name:
-                  raise MetaError("GROUP_SETTINGS_UNVERIFIED")
-          
-              ads = graph_call(gid + "/ads", {"fields": ad_fields, "limit": 2}).get("data", [])
-              if len(ads) > 1:
-                  raise MetaError("GROUP_HAS_MULTIPLE_ADS")
-              source_creative = source_ad["creative"]
-              post_id = source_creative["effective_object_story_id"]
-              if ads:
-                  aid = str(ads[0]["id"])
-              elif kind in ("base", "shared"):
-                  reply = graph_call(account + "/ads", form={
-                      "name": source_ad["name"], "adset_id": gid, "status": "PAUSED",
-                      "creative": json.dumps({"creative_id": str(source_creative["id"])}),
-                  })
-                  aid = str(reply["id"])
-              else:
-                  try:
-                      fresh = assets_from_source(str(source_creative["id"]), post_id, video_id, source_ad["name"])
-                  except RateLimited:
-                      raise
-                  except MetaError:
-                      fresh = None
-                  if fresh:
-                      reply = graph_call(account + "/ads", form={
-                          "name": source_ad["name"], "adset_id": gid, "status": "PAUSED",
-                          "creative": json.dumps(fresh),
-                      })
-                      aid = str(reply["id"])
-                  else:
-                      reply = graph_call(str(source_ad["id"]) + "/copies", form={
-                          "adset_id": gid, "status_option": "PAUSED",
-                          "rename_options": json.dumps({"rename_strategy": "NO_RENAME"}),
-                      })
-                      aid = str(reply["copied_ad_id"])
-              target_ad = {}
-              for retry in range(5):
-                  target_ad = node(aid, ad_fields)
-                  if ad_post(target_ad):
-                      break
-                  time.sleep(2)
-              if str(target_ad.get("adset_id")) != gid or target_ad.get("configured_status") != "PAUSED" or not ad_post(target_ad):
-                  raise MetaError("AD_SETTINGS_UNVERIFIED")
-              same = ad_post(target_ad) == post_id
-              if same == (kind == "separate"):
-                  raise MetaError("POST_ID_WRONG_FOR_" + kind.upper())
-              return gid, aid, ad_post(target_ad), kind
-          
-          def preflight():
-              target = paged(account + "/campaigns", campaign_fields, {plan["campaign"]})[plan["campaign"]]
-              target_id = str(target["id"])
-              if target.get("configured_status") != "PAUSED" or target.get("objective") != "OUTCOME_LEADS" or int(target.get("daily_budget") or 0) or int(target.get("lifetime_budget") or 0):
-                  raise MetaError("TARGET_CAMPAIGN_SETTINGS")
-              source_groups = paged(account + "/adsets", source_group_fields, {row[0] for row in plan["clips"]})
-              source_ads = paged(account + "/ads", ad_fields, {row[1] for row in plan["clips"]})
-              source_media = paged(account + "/advideos", "id,title", {row[2] for row in plan["clips"]})
-              return target_id, source_groups, source_ads, source_media
-          
-          since_limit = (datetime.now(timezone.utc) - datetime.fromisoformat("2026-11-16T16:09:29Z")).total_seconds()
-          initial_delay = int(max(0, min(300, 300 - since_limit)))
-          print(f"BID_COOLDOWN reason=ACCOUNT_RATE_LIMIT seconds={initial_delay}", flush=True)
-          time.sleep(initial_delay)
-          deadline = time.monotonic() + 2800
-          
-          def cooldown(error, stage):
-              delay = int(error.delay)
-              if time.monotonic() + delay >= deadline or (start - datetime.now(timezone.utc)).total_seconds() < delay + 300:
-                  raise SystemExit("BID_BATCH_ERROR=RATE_LIMIT_WINDOW")
-              print(f"BID_COOLDOWN stage={stage} seconds={delay}", flush=True)
-              time.sleep(delay)
-          
-          while True:
-              if datetime.now(timezone.utc) >= start:
-                  raise SystemExit("BID_BATCH_ERROR=START_NOT_FUTURE")
               try:
-                  target_id, source_groups, source_ads, source_media = preflight()
+                  with urlopen(request, timeout=12) as response:
+                      return json.load(response)
+              except HTTPError as error:
+                  detail = json.load(error).get("error", {})
+                  return {"failure": f"HTTP={error.code} code={detail.get('code')} subcode={detail.get('error_subcode')}"}
+
+          identity = read("me", fields="id,name")
+          print(f"PROBE scaler_identity_matches={identity.get('id') == '61593290271041' or identity.get('name') == 'for_scaler'}", flush=True)
+          query = {"fields": "id,title,created_time", "limit": 100}
+          count = named = recent = 0
+          matches = {}
+          complete = False
+          for _ in range(40):
+              result = read(account + "/advideos", **query)
+              if "failure" in result:
+                  raise SystemExit("Account video list failed: " + result["failure"])
+              for row in result.get("data", []):
+                  title = row.get("title") or ""
+                  count += 1
+                  named += bool(title)
+                  recent += (row.get("created_time") or "").startswith("2026-11-16")
+                  for marker, label in markers:
+                      if marker in title and (label not in matches or (row.get("created_time") or "") > (matches[label].get("created_time") or "")):
+                          matches[label] = row
+              paging = result.get("paging", {})
+              after = paging.get("cursors", {}).get("after")
+              if not paging.get("next"):
+                  complete = True
                   break
-              except RateLimited as error:
-                  cooldown(error, "preflight")
-              except (KeyError, MetaError) as error:
-                  raise SystemExit(f"BID_BATCH_ERROR=PREFLIGHT_{error}")
-              except Exception:
-                  raise SystemExit("BID_BATCH_ERROR=PREFLIGHT_REQUEST_FAILED")
-          
-          all_results = []
-          groups = None
-          for index, row in enumerate(plan["clips"][8:], start=9):
-              try:
-                  group, ad, media = source_groups[row[0]], source_ads[row[1]], source_media[row[2]]
-                  if not group["name"].endswith(" / фб моб воп кос") or str(ad.get("adset_id")) != str(group["id"]) or not ad_post(ad) or not (ad.get("creative") or {}).get("id"):
-                      raise MetaError("SOURCE_INVALID")
-              except (KeyError, MetaError) as error:
-                  raise SystemExit(f"BID_BATCH_ERROR=ROW_{index}_{error}")
-              for kind in ("base", "shared", "separate"):
-                  while True:
-                      try:
-                          if groups is None:
-                              groups = list(paged(target_id + "/adsets", group_fields).values())
-                          result = create_one_group(group, ad, str(media["id"]), target_id, kind, groups)
-                          all_results.append(result)
-                          print(f"BID_ROW row={index} role={kind} result=VERIFIED", flush=True)
-                          break
-                      except RateLimited as error:
-                          groups = None
-                          cooldown(error, f"{index}_{kind}")
-                      except MetaError as error:
-                          raise SystemExit(f"BID_BATCH_ERROR=ROW_{index}_{kind}_{error}")
-                      except Exception:
-                          raise SystemExit(f"BID_BATCH_ERROR=ROW_{index}_{kind}_REQUEST_OR_DATA_ERROR")
-          print(f"BID_BATCH_READY count={len(all_results)} expected=3", flush=True)
-          PY
-      - name: Enable only the verified campaign and its scheduled groups
-        env:
-          META_ACCESS_TOKEN: ${{ secrets.FB_SCALER_ACCESS_TOKEN }}
-        run: |
-          python - <<'PY'
-          run_rows = 9
-          plan = {"campaign":"0dfda0efa508139db52eea80b1e5eabd80406e4cd125380b3fe4e183542c0491","clips":[["ba0cfe9d0743aec566820d95851787ef0ba1014ea5cff5312bbcbfc47adc4bcb","e4ae8be409de47160599f68c59c64844cdbc6a6ca6421476fbd16ce1cf7d63f1","b9e6065e7e315e5bf70cf49802bdbf9aa8144af572c4b0f7f8f66c2f522c574d"],["786ff14fa7419716d1b922e286ed8acf4ebcfc66905daa5cdedfc0fb3874d419","6d7c53f6fc11d322441e111a490d94e5798f26a2d1a87ce302ff77bd66ae852d","be5c1247e1beb34d040e6cf3d4a614df125e5339fa4febbc623783b568a34da2"],["bbbd4a8fdf485b06bf9a664d4f15fc02df11bcd9a331b0aa265ff2c3463d158d","301f95dcaeccbb65a0786ee75a282b46d99d972ea4a52d8527d22a1f3bfe55b6","5419b740608ce5659dcf3819fe094023a42f5bc3cae8b5e425b2789ee5d969dc"],["ec061e5cfdfe07fb47046374ae55b7f3936af43f6274cfe7f5001013be588137","f447fa9dfcc8164bdad449c63a004f59efe69f7fd19a3283c6f7f29e5dc6c6e6","cbd30d1f6d96f42784171b2f0ffc2744036ba010b0c7b2c9722f4863fa5ee60e"],["005690143e22172a26b184417995a8b09e787e852f04f78d3ff68c60ac831175","2a02afdebfa4617407d59ae93f27dec9ed13f7e6c1f80463b7a05536114b28ee","2f0c211336f2709ac7c4fc7dbebed106c8a1b489df2e58066ccec5786efc94ba"],["d49b43b280832c816220a288fe186e4e0cde271949b06a2bd08685b330c78ca5","3c05f67eadddba00e32b31c45b56bcad367df1274bb59ff22bc3400414f16f69","c0fc9886fbbb551e3f4507da3899bb4ce8e68abb9e683e4518b97fe01f49354a"],["1efe239b3ba815653e66ba12a2e3e98ab05d89f0cc7569a63876a5e9346a9e0d","3a5c6917eae13b788c38012e49f210a36bd77338839ac0d31523a2cdbb425839","aa31a2d3b732ab90eb2da813599b228e4ac6696116453fa9e1cf8fff6a425600"],["99f5a1d849763f127ae4463cb7a9ae854d756ac6acee958b03a36f44af4cd8e2","6d9f7ae40b61ecf3189b3ecf14705aff267fffe03137790d004ec26c4aecd24b","33b31da56793925864b21852cada0a0ba9edc2c5e3be629a1661f83eaa00f654"],["da3574d3950022384cc6abdfc7a2f15b85ff40e02dc757d9e3b08c67e386e072","fafa46dc3a0dc8560c5bb0c14a88191a4a07e97099a417c03da9e4fbfe8c0025","fa4896688e16f0032a8877c3ccebddfe46e161d63e39773d53f687460658068a"]]}
-          
-          import hashlib
-          import json
-          import os
-          import time
-          from datetime import datetime, timezone
-          from urllib.error import HTTPError
-          from urllib.parse import urlencode
-          from urllib.request import Request, urlopen
-          
-          account = "act_1732457457319086"
-          graph = "https://graph.facebook.com/v25.0/"
-          token = os.environ["META_ACCESS_TOKEN"]
-          start = datetime.fromisoformat("2026-11-17T05:42:00+01:00")
-          budget, bid = "18000", "5500"
-          strategy = "LOWEST_COST_WITH_BID_CAP"
-          campaign_fields = "id,objective,configured_status,daily_budget,lifetime_budget"
-          group_fields = "id,name,campaign_id,configured_status,start_time,daily_budget,bid_amount,bid_strategy,source_adset_id"
-          source_group_fields = "id,name,campaign_id,targeting,promoted_object,optimization_goal,billing_event,attribution_spec"
-          ad_fields = "id,name,adset_id,configured_status,effective_status,creative{id,effective_object_story_id}"
-          max_rows = min(run_rows, len(plan["clips"]))
-          
-          class MetaError(Exception):
-              pass
-          
-          class RateLimited(MetaError):
-              def __init__(self, delay):
-                  self.delay = delay
-                  super().__init__("RATE_LIMIT")
-          
-          def graph_call(path, query=None, form=None):
-              url = graph + path + ("?" + urlencode(query) if query else "")
-              payload = None if form is None else urlencode(form).encode("utf-8")
-              if form is not None:
-                  time.sleep(1.15)
-              req = Request(url, data=payload, headers={"Authorization": "Bearer " + token})
-              try:
-                  with urlopen(req, timeout=20) as r:
-                      return json.load(r)
-              except HTTPError as e:
-                  try:
-                      data = json.load(e).get("error") or {}
-                      code = int(data.get("code") or 0)
-                      sub = int(data.get("error_subcode") or 0)
-                  except (ValueError, TypeError, AttributeError):
-                      code, sub = 0, 0
-                  if code in (4, 17, 32, 613, 80000, 80001, 80002, 80003, 80004, 80005) or e.code == 429:
-                      waits = [300]
-                      retry = e.headers.get("Retry-After", "")
-                      if retry.isdecimal():
-                          waits.append(int(retry) + 15)
-                      try:
-                          usage = json.loads(e.headers.get("X-Business-Use-Case-Usage", "{}"))
-                          waits.extend(int(item.get("estimated_time_to_regain_access", 0)) * 60 + 20 for scopes in usage.values() for item in scopes if isinstance(item, dict))
-                      except (ValueError, AttributeError, TypeError):
-                          pass
-                      raise RateLimited(max(waits)) from None
-                  raise MetaError(f"{e.code}_{code}_{sub}") from None
-          
-          def digest(value):
-              return hashlib.sha256(str(value).encode("ascii")).hexdigest()
-          
-          def paged(path, fields, wanted=None, max_pages=40):
-              saved = {}
-              query = {"fields": fields, "limit": 100}
-              for _ in range(max_pages):
-                  reply = graph_call(path, query)
-                  for row in reply.get("data", []):
-                      key = digest(row["id"])
-                      if wanted is None or key in wanted:
-                          saved[key] = row
-                  if wanted is not None and set(saved) == wanted:
-                      return saved
-                  paging = reply.get("paging", {})
-                  cursor = paging.get("cursors", {}).get("after")
-                  if not paging.get("next"):
-                      return saved
-                  if not cursor or cursor == query.get("after"):
-                      raise MetaError("PAGINATION_STALLED")
-                  query["after"] = cursor
-              if wanted is None:
-                  raise MetaError("PAGINATION_INCOMPLETE")
-              return saved
-          
-          def node(identifier, fields):
-              return graph_call(str(identifier), {"fields": fields})
-          
-          def ad_post(ad):
-              return (ad.get("creative") or {}).get("effective_object_story_id")
-          
-          def verify_group(value, destination, expected_status="PAUSED"):
-              return (
-                  str(value.get("campaign_id")) == destination
-                  and value.get("configured_status") == expected_status
-                  and str(value.get("daily_budget")) == budget
-                  and str(value.get("bid_amount")) == bid
-                  and value.get("bid_strategy") == strategy
-                  and bool(value.get("start_time"))
-                  and datetime.fromisoformat(value["start_time"]) == start
-              )
-          
-          def batch_activate(ids):
-              for offset in range(0, len(ids), 25):
-                  chunk = ids[offset:offset+25]
-                  ops = [{"method": "POST", "relative_url": identifier, "body": "status=ACTIVE"} for identifier in chunk]
-                  try:
-                      response = graph_call("", form={"batch": json.dumps(ops)})
-                  except RateLimited:
-                      raise
-                  except (MetaError, OSError, ValueError):
-                      response = None
-                  if isinstance(response, list) and len(response) == len(ops):
-                      for item in response:
-                          if isinstance(item, dict) and item.get("code") != 200:
-                              try:
-                                  failure = json.loads(item.get("body") or "{}").get("error") or {}
-                              except (ValueError, AttributeError, TypeError):
-                                  continue
-                              if failure.get("code") in (4, 17, 32, 613, 80000, 80001, 80002, 80003, 80004, 80005) or item.get("code") == 429:
-                                  raise RateLimited(300)
-                      failed = [identifier for identifier, item in zip(chunk, response) if not isinstance(item, dict) or item.get("code") != 200]
-                  else:
-                      failed = chunk
-                  for identifier in failed:
-                      state = node(identifier, "configured_status").get("configured_status")
-                      if state == "ACTIVE":
-                          continue
-                      if state != "PAUSED":
-                          raise MetaError("ACTIVATION_OBJECT_NOT_PAUSED")
-                      graph_call(identifier, form={"status": "ACTIVE"})
-          
-          def activate():
-              if datetime.now(timezone.utc) >= start:
-                  raise SystemExit("BID_ACTIVATION_ERROR=START_NOT_FUTURE")
-              source_names = ("", " — спільний пост", " — окремий пост")
-              try:
-                  phase = "scope"
-                  target_id = str(paged(account + "/campaigns", "id", {plan["campaign"]})[plan["campaign"]]["id"])
-                  target = node(target_id, campaign_fields)
-                  if target.get("configured_status") not in ("PAUSED", "ACTIVE") or target.get("objective") != "OUTCOME_LEADS" or int(target.get("daily_budget") or 0) or int(target.get("lifetime_budget") or 0):
-                      raise MetaError("CAMPAIGN_INVALID")
-                  source_groups = paged(account + "/adsets", "id,name", {r[0] for r in plan["clips"]})
-                  source_ads = paged(account + "/ads", ad_fields, {r[1] for r in plan["clips"]})
-                  groups = list(paged(target_id + "/adsets", group_fields).values())
-                  named = {g["name"]: g for g in groups}
-                  if len(groups) != 27 or len(named) != 27 or len(source_groups) != 9 or len(source_ads) != 9:
-                      raise MetaError("WRONG_SCOPE_COUNT")
-                  pairs = []
-                  pending_groups, pending_ads = [], []
-                  phase = "validate"
-                  for source in plan["clips"]:
-                      if str(source_ads[source[1]].get("adset_id")) != str(source_groups[source[0]]["id"]):
-                          raise MetaError("SOURCE_SCOPE_INVALID")
-                      post = ad_post(source_ads[source[1]])
-                      root_name = source_groups[source[0]]["name"].removesuffix("кос") + "бід"
-                      for role, suffix in enumerate(source_names):
-                          group = named.get(root_name + suffix, {})
-                          status = group.get("configured_status")
-                          if status not in ("PAUSED", "ACTIVE") or not verify_group(group, target_id, status):
-                              raise MetaError("GROUP_SCHEDULE_OR_BID_INVALID")
-                          gid = str(group["id"])
-                          ads = graph_call(gid + "/ads", {"fields": ad_fields, "limit": 2})
-                          if len(ads.get("data", [])) != 1 or ads.get("paging", {}).get("next"):
-                              raise MetaError("GROUP_AD_COUNT_INVALID")
-                          ad = ads["data"][0]
-                          adstatus = ad.get("configured_status")
-                          if adstatus not in ("PAUSED", "ACTIVE") or not post or not ad_post(ad) or str(ad.get("adset_id")) != gid:
-                              raise MetaError("AD_OR_POST_INVALID")
-                          if (ad_post(ad) == post) != (role in (0, 1)):
-                              raise MetaError("WRONG_POST_ID")
-                          if ad.get("effective_status") in ("DISAPPROVED", "WITH_ISSUES"):
-                              raise MetaError("AD_REJECTED")
-                          aid = str(ad["id"])
-                          pairs.append((gid, aid))
-                          if status == "PAUSED":
-                              pending_groups.append(gid)
-                          if adstatus == "PAUSED":
-                              pending_ads.append(aid)
-                  if target.get("configured_status") == "ACTIVE" and (pending_ads or pending_groups):
-                      raise MetaError("PARTIALLY_ACTIVE_CAMPAIGN")
-          
-                  phase = "activate_ads"
-                  batch_activate(pending_ads)
-                  phase = "activate_groups"
-                  batch_activate(pending_groups)
-                  phase = "verify_children"
-                  after = list(paged(target_id + "/adsets", group_fields).values())
-                  if len(after) != 27 or not all(verify_group(g, target_id, "ACTIVE") for g in after):
-                      raise MetaError("GROUP_FINAL_STATUS_INVALID")
-                  expected_ads = {digest(ad_id) for _, ad_id in pairs}
-                  final_ads = paged(target_id + "/ads", ad_fields, expected_ads)
-                  if len(final_ads) != 27 or any(ad.get("configured_status") != "ACTIVE" for ad in final_ads.values()):
-                      raise MetaError("ADS_FINAL_STATUS_INVALID")
-                  if any(ad.get("effective_status") in ("DISAPPROVED", "WITH_ISSUES") for ad in final_ads.values()):
-                      raise MetaError("ADS_REJECTED_AFTER_ACTIVATION")
-                  phase = "activate_campaign"
-                  if datetime.now(timezone.utc) >= start:
-                      raise MetaError("START_NOT_FUTURE")
-                  if target.get("configured_status") == "PAUSED":
-                      graph_call(target_id, form={"status": "ACTIVE"})
-                  if node(target_id, campaign_fields).get("configured_status") != "ACTIVE":
-                      raise MetaError("CAMPAIGN_FINAL_STATUS_INVALID")
-                  print("BID_SCHEDULE_VERIFIED groups=27 ads=27 same_posts=18 separate_posts=9 active_campaign=True warsaw=2026-11-17T05:42:00+01:00", flush=True)
-              except RateLimited:
-                  raise
-              except (MetaError, KeyError) as error:
-                  raise SystemExit(f"BID_ACTIVATION_ERROR={phase}_{str(error)}")
-              except Exception:
-                  raise SystemExit(f"BID_ACTIVATION_ERROR={phase}_REQUEST_FAILED")
-          
-          
-          deadline = time.monotonic() + 2800
-          while True:
-              try:
-                  activate()
+              if not after or after == query.get("after"):
                   break
-              except RateLimited as error:
-                  delay = error.delay
-                  if time.monotonic() + delay >= deadline or (start - datetime.now(timezone.utc)).total_seconds() < delay + 300:
-                      raise SystemExit("BID_ACTIVATION_ERROR=RATE_LIMIT_WINDOW")
-                  print(f"BID_COOLDOWN stage=activation seconds={delay}", flush=True)
-                  time.sleep(delay)
+              query["after"] = after
+          print(f"PROBE checked={count} named={named} created_today={recent} matched={len(matches)} complete={complete}", flush=True)
+          for _, label in markers:
+              if label not in matches:
+                  print(f"PROBE clip={label} found=False", flush=True)
+                  continue
+              result = read(matches[label]["id"], fields="status")
+              status = result.get("status", {}).get("video_status", "unverified")
+              print(f"PROBE clip={label} found=True status={status}", flush=True)
           PY
