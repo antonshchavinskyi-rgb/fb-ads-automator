@@ -1,112 +1,82 @@
-name: Attach one paused ad to the original publication
+name: Verify newly uploaded account videos for offer 1567
 on:
   push:
     branches: [codex/meta-video-lookup-20261116]
     paths: [.github/workflows/meta-video-lookup-1567.yml]
 permissions: {}
 jobs:
-  attach:
+  lookup:
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 5
     steps:
-      - name: Reuse source creative and verify the publication
+      - name: Read account video names and processing status
         env:
           META_ACCESS_TOKEN: ${{ secrets.FB_SCALER_ACCESS_TOKEN }}
         run: |
           python - <<'PY'
-          import hashlib
           import json
           import os
-          import time
           from urllib.error import HTTPError
           from urllib.parse import urlencode
           from urllib.request import Request, urlopen
 
-          source_digest, group_digest = ["e4ae8be409de47160599f68c59c64844cdbc6a6ca6421476fbd16ce1cf7d63f1","f80c11569bb7ca1308f7b769136d99d8c13a6de49d5b86f3a6567aa0e1c973a2"]
-          account = "act_1732457457319086"
-          graph = "https://graph.facebook.com/v25.0/"
           token = os.environ["META_ACCESS_TOKEN"]
-
-          def call(path, query=None, form=None):
-              url = graph + path + ("?" + urlencode(query) if query else "")
-              data = urlencode(form).encode("utf-8") if form is not None else None
-              request = Request(url, data=data, headers={"Authorization": "Bearer " + token})
-              with urlopen(request, timeout=15) as response:
-                  return json.load(response)
-
-          def find(path, digest):
-              query = {"fields": "id", "limit": 250}
-              for _ in range(35):
-                  page = call(path, query)
-                  for row in page.get("data", []):
-                      value = str(row["id"])
-                      if hashlib.sha256(value.encode("ascii")).hexdigest() == digest:
-                          return value
-                  paging = page.get("paging", {})
-                  cursor = paging.get("cursors", {}).get("after")
-                  if not paging.get("next") or not cursor or cursor == query.get("after"):
-                      break
-                  query["after"] = cursor
-              return None
-
-          phase = "lookup"
-          try:
-              ad_id = find(account + "/ads", source_digest)
-              group_id = find(account + "/adsets", group_digest)
-              if not ad_id or not group_id:
-                  raise SystemExit("SHARED_POST_RESULT=OBJECT_NOT_FOUND")
-
-              phase = "read"
-              source = call(ad_id, {"fields": "name,adset_id,campaign_id,creative{id,effective_object_story_id}"})
-              target = call(group_id, {"fields": "id,campaign_id,configured_status"})
-              creative = source.get("creative") or {}
-              post = creative.get("effective_object_story_id")
-              if (
-                  str(source.get("adset_id")) == group_id
-                  or not source.get("campaign_id")
-                  or source["campaign_id"] != target.get("campaign_id")
-                  or target.get("configured_status") != "PAUSED"
-                  or not creative.get("id")
-                  or not post
-                  or not source.get("name")
-              ):
-                  raise SystemExit("SHARED_POST_RESULT=SOURCE_OR_GROUP_INVALID")
-
-              phase = "check_existing"
-              existing = call(group_id + "/ads", {"fields": "id,configured_status,creative{id,effective_object_story_id}", "limit": 5})
-              candidates = existing.get("data", [])
-              if candidates:
-                  if len(candidates) == 1 and not existing.get("paging", {}).get("next") and candidates[0].get("configured_status") == "PAUSED" and (candidates[0].get("creative") or {}).get("effective_object_story_id") == post:
-                      print("SHARED_POST_RESULT=ALREADY_VERIFIED"); raise SystemExit(0)
-                  raise SystemExit("SHARED_POST_RESULT=GROUP_HAS_OTHER_AD")
-
-              phase = "create"
-              new_ad = call(account + "/ads", form={
-                  "name": source["name"],
-                  "adset_id": group_id,
-                  "creative": json.dumps({"creative_id": str(creative["id"])}),
-                  "status": "PAUSED",
+          account = "act_1732457457319086"
+          markers = [
+              ("1121570050694411", "53s"),
+              ("1521290343162951", "154s"),
+              ("1635063941431588", "61s-a"),
+              ("1642160670297957", "41s"),
+              ("1766520411070794", "155s"),
+              ("1785101992719160", "45s"),
+              ("1837989767473642", "66s"),
+              ("1934340758012535", "46s"),
+              ("1552400246633057", "61s-b"),
+          ]
+          graph = "https://graph.facebook.com/v25.0/"
+          def read(path, **params):
+              request = Request(graph + path + "?" + urlencode(params), headers={
+                  "Authorization": f"Bearer {token}",
               })
-              created = str(new_ad["id"])
-
-              phase = "verify"
-              for attempt in range(6):
-                  actual = call(created, {"fields": "adset_id,configured_status,creative{id,effective_object_story_id}"})
-                  actual_post = (actual.get("creative") or {}).get("effective_object_story_id")
-                  if actual_post:
-                      if actual_post == post and str(actual.get("adset_id")) == group_id and actual.get("configured_status") == "PAUSED":
-                          print("SHARED_POST_RESULT=CREATED_AND_VERIFIED"); raise SystemExit(0)
-                      raise SystemExit("SHARED_POST_RESULT=CREATED_BUT_MISMATCH")
-                  time.sleep(3)
-              raise SystemExit("SHARED_POST_RESULT=CREATED_POST_UNAVAILABLE")
-          except HTTPError as exc:
               try:
-                  error = json.load(exc).get("error", {})
-                  code = error.get("code")
-                  subcode = error.get("error_subcode")
-              except (ValueError, AttributeError):
-                  code = subcode = None
-              print(f"SHARED_POST_RESULT=META_ERROR PHASE={phase} HTTP={exc.code} CODE={code} SUBCODE={subcode}")
-          except Exception:
-              print(f"SHARED_POST_RESULT=REQUEST_FAILED PHASE={phase}")
+                  with urlopen(request, timeout=12) as response:
+                      return json.load(response)
+              except HTTPError as error:
+                  detail = json.load(error).get("error", {})
+                  return {"failure": f"HTTP={error.code} code={detail.get('code')} subcode={detail.get('error_subcode')}"}
+
+          identity = read("me", fields="id,name")
+          print(f"PROBE scaler_identity_matches={identity.get('id') == '61593290271041' or identity.get('name') == 'for_scaler'}", flush=True)
+          query = {"fields": "id,title,created_time", "limit": 100}
+          count = named = recent = 0
+          matches = {}
+          complete = False
+          for _ in range(40):
+              result = read(account + "/advideos", **query)
+              if "failure" in result:
+                  raise SystemExit("Account video list failed: " + result["failure"])
+              for row in result.get("data", []):
+                  title = row.get("title") or ""
+                  count += 1
+                  named += bool(title)
+                  recent += (row.get("created_time") or "").startswith("2026-11-16")
+                  for marker, label in markers:
+                      if marker in title and (label not in matches or (row.get("created_time") or "") > (matches[label].get("created_time") or "")):
+                          matches[label] = row
+              paging = result.get("paging", {})
+              after = paging.get("cursors", {}).get("after")
+              if not paging.get("next"):
+                  complete = True
+                  break
+              if not after or after == query.get("after"):
+                  break
+              query["after"] = after
+          print(f"PROBE checked={count} named={named} created_today={recent} matched={len(matches)} complete={complete}", flush=True)
+          for _, label in markers:
+              if label not in matches:
+                  print(f"PROBE clip={label} found=False", flush=True)
+                  continue
+              result = read(matches[label]["id"], fields="status")
+              status = result.get("status", {}).get("video_status", "unverified")
+              print(f"PROBE clip={label} found=True status={status}", flush=True)
           PY
