@@ -1,0 +1,78 @@
+name: Meta video lookup for offer 1567
+on:
+  push:
+    branches: [codex/meta-video-lookup-20261116]
+    paths: [.github/workflows/meta-video-lookup-1567.yml]
+permissions: {}
+jobs:
+  lookup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Read ad account videos from Meta
+        env:
+          META_ACCESS_TOKEN: ${{ secrets.FB_ACCESS_TOKEN }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import sys
+          from urllib.error import HTTPError
+          from urllib.parse import urlencode
+          from urllib.request import Request, urlopen
+
+          token = os.environ.get("META_ACCESS_TOKEN")
+          if not token:
+              sys.exit("The existing FB_ACCESS_TOKEN secret is unavailable to this job.")
+
+          endpoint = "https://graph.facebook.com/v25.0/act_1732457457319086/advideos"
+          expected = {
+              "1121570050694411", "1521290343162951", "1635063941431588",
+              "1642160670297957", "1766520411070794", "1785101992719160",
+              "1837989767473642", "1934340758012535", "1552400246633057"
+          }
+          after = None
+          total = 0
+          complete = False
+          found = set()
+          for page in range(40):
+              params = {"fields": "id,title,created_time", "limit": 100}
+              if after:
+                  params["after"] = after
+              request = Request(
+                  f"{endpoint}?{urlencode(params)}",
+                  headers={"Authorization": f"Bearer {token}"},
+              )
+              try:
+                  with urlopen(request, timeout=12) as response:
+                      result = json.load(response)
+              except HTTPError as error:
+                  details = json.load(error).get("error", {})
+                  sys.exit(
+                      f"Meta API HTTP {error.code}; code={details.get('code')}, "
+                      f"subcode={details.get('error_subcode')}, type={details.get('type')}"
+                  )
+              rows = result.get("data", [])
+              total += len(rows)
+              for row in rows:
+                  title = row.get("title") or ""
+                  matches = {key for key in expected if f"meta-{key}_" in title}
+                  if matches or title.startswith(("1567-", "1567_")):
+                      print(json.dumps({
+                          "id": row.get("id"), "title": title,
+                          "created_time": row.get("created_time"),
+                          "matches_filename": bool(matches),
+                      }), flush=True)
+                  found.update(matches)
+              paging = result.get("paging", {})
+              if not paging.get("next"):
+                  complete = True
+                  break
+              next_after = paging.get("cursors", {}).get("after")
+              if not next_after or next_after == after:
+                  break
+              after = next_after
+              if found == expected:
+                  break
+          print(f"SUMMARY checked={total} exact_matches={len(found)} complete_scan={complete}")
+          PY
